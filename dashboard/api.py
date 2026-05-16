@@ -243,15 +243,22 @@ async def get_open_trades():
         pair = t.get("pair", "")
         mark = float(r.get(redis_keys.MARK_PRICE.replace("{pair}", pair)) or t.get("entry_price") or 0)
         entry = float(t.get("average_entry") or t.get("entry_price") or 0)
-        qty = float(t.get("quantity") or 0)
         direction_sign = 1.0 if t.get("direction") == "long" else -1.0
         capital = float(t.get("capital_usdt") or 0)
         leverage = int(t.get("leverage") or 1)
-        current_pnl = round((mark - entry) * qty * direction_sign, 4) if entry > 0 else 0.0
-        fees_estimate = round(capital * leverage * 0.0004, 4)
+        # Binance USDT-M PnL formula: capital × leverage × price_change_pct × direction
+        # This correctly handles tiny-priced altcoins regardless of qty
+        if entry > 0 and mark > 0:
+            pct_change = (mark - entry) / entry
+            position_size = capital * leverage
+            current_pnl = round(position_size * pct_change * direction_sign, 4)
+        else:
+            current_pnl = 0.0
+        fees = round(capital * leverage * 0.0004, 4)  # 0.04% taker fee estimate
         t["current_mark_price"] = mark
         t["current_pnl_usdt"] = current_pnl
-        t["net_current_pnl"] = round(current_pnl - fees_estimate, 4)
+        t["net_current_pnl"] = round(current_pnl - fees, 4)
+        t["pct_change"] = round((mark - entry) / entry * 100, 4) if entry > 0 else 0
         enriched.append(t)
     return enriched
 

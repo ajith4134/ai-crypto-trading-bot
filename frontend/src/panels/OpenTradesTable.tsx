@@ -18,14 +18,15 @@ const OpenTradesTable: React.FC = () => {
   const sorted = [...trades].sort((a,b) => (b[sort]||0) > (a[sort]||0) ? 1 : -1);
 
   const rows = sorted.map(t => {
-    const pnl = +(t.current_pnl_usdt ?? t.net_pnl_usdt ?? 0);
+    const pnl = +(t.net_current_pnl ?? t.current_pnl_usdt ?? t.net_pnl_usdt ?? 0);
+    const pct = +(t.pct_change ?? 0);
     const mark = +(t.current_mark_price ?? t.entry_price ?? 0);
     return [
     t.pair, t.direction?.toUpperCase(),
     `$${(+t.entry_price||0).toLocaleString(undefined,{maximumFractionDigits:6})}`,
     `$${(+(t.average_entry||t.entry_price)||0).toLocaleString(undefined,{maximumFractionDigits:6})}`,
     <span style={{color:'#00d4ff'}}>${mark.toLocaleString(undefined,{maximumFractionDigits:6})}</span>,
-    <span style={{color:pnl>=0?'#00ff88':'#ff4444'}}>${pnl.toFixed(4)}</span>,
+    <span style={{color:pnl>=0?'#00ff88':'#ff4444'}}>${pnl.toFixed(2)} <small style={{fontSize:10}}>({pct>=0?'+':''}{pct.toFixed(3)}%)</small></span>,
     `$${(+t.peak_pnl_usdt||0).toFixed(4)}`,
     `$${(+t.trailing_sl_level||0).toLocaleString()}`,
     (() => { const d = typeof t.dca_status === 'string' ? JSON.parse(t.dca_status || '{}') : (t.dca_status || {}); return d.round_1_triggered ? (d.round_2_triggered ? 'R1+R2' : 'R1') : 'None'; })(),
