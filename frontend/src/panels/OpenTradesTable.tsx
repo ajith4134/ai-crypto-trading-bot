@@ -10,20 +10,23 @@ const OpenTradesTable: React.FC = () => {
   const evt = useContext(WsContext);
 
   const refresh = () => getOpenTrades().then(setTrades).catch(()=>{});
-  useEffect(() => { refresh(); }, []);
+  useEffect(() => { refresh(); const t = setInterval(refresh, 5000); return () => clearInterval(t); }, []);
   useEffect(() => {
     if (evt && ['trade_opened','trade_closed','sl_moved','dca_triggered','price_update'].includes(evt.channel)) refresh();
   }, [evt]);
 
   const sorted = [...trades].sort((a,b) => (b[sort]||0) > (a[sort]||0) ? 1 : -1);
 
-  const rows = sorted.map(t => [
+  const rows = sorted.map(t => {
+    const pnl = +(t.current_pnl_usdt ?? t.net_pnl_usdt ?? 0);
+    const mark = +(t.current_mark_price ?? t.entry_price ?? 0);
+    return [
     t.pair, t.direction?.toUpperCase(),
-    `$${(+t.entry_price||0).toLocaleString()}`,
-    `$${(+t.average_entry||t.entry_price||0).toLocaleString()}`,
-    `$${(+t.entry_price||0).toLocaleString()}`,
-    <span style={{color:(+t.net_pnl_usdt||0)>=0?'#00ff88':'#ff4444'}}>${(+t.net_pnl_usdt||0).toFixed(2)}</span>,
-    `$${(+t.peak_pnl_usdt||0).toFixed(2)}`,
+    `$${(+t.entry_price||0).toLocaleString(undefined,{maximumFractionDigits:6})}`,
+    `$${(+(t.average_entry||t.entry_price)||0).toLocaleString(undefined,{maximumFractionDigits:6})}`,
+    <span style={{color:'#00d4ff'}}>${mark.toLocaleString(undefined,{maximumFractionDigits:6})}</span>,
+    <span style={{color:pnl>=0?'#00ff88':'#ff4444'}}>${pnl.toFixed(4)}</span>,
+    `$${(+t.peak_pnl_usdt||0).toFixed(4)}`,
     `$${(+t.trailing_sl_level||0).toLocaleString()}`,
     (() => { const d = typeof t.dca_status === 'string' ? JSON.parse(t.dca_status || '{}') : (t.dca_status || {}); return d.round_1_triggered ? (d.round_2_triggered ? 'R1+R2' : 'R1') : 'None'; })(),
     `$${(+t.capital_usdt||0).toFixed(0)}`,
@@ -32,7 +35,7 @@ const OpenTradesTable: React.FC = () => {
     t.direction_confidence||'—',
     t.entry_time ? `${Math.floor((Date.now()-new Date(t.entry_time).getTime())/3600000)}h` : '—',
     <span style={{background:'#00443a',color:'#00ff88',padding:'1px 6px',borderRadius:3,fontSize:11}}>OPEN</span>,
-  ]);
+  ]});
 
   return (
     <div style={card}>

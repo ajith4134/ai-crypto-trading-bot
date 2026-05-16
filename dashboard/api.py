@@ -235,7 +235,25 @@ async def bot_settings(settings: dict):
 @app.get("/trades/open", dependencies=[Depends(_verify_token)])
 async def get_open_trades():
     from memory.query import get_open_trades as _get
-    return _get()
+    import redis_client, redis_keys
+    trades = _get()
+    r = redis_client.get()
+    enriched = []
+    for t in trades:
+        pair = t.get("pair", "")
+        mark = float(r.get(redis_keys.MARK_PRICE.replace("{pair}", pair)) or t.get("entry_price") or 0)
+        entry = float(t.get("average_entry") or t.get("entry_price") or 0)
+        qty = float(t.get("quantity") or 0)
+        direction_sign = 1.0 if t.get("direction") == "long" else -1.0
+        capital = float(t.get("capital_usdt") or 0)
+        leverage = int(t.get("leverage") or 1)
+        current_pnl = round((mark - entry) * qty * direction_sign, 4) if entry > 0 else 0.0
+        fees_estimate = round(capital * leverage * 0.0004, 4)
+        t["current_mark_price"] = mark
+        t["current_pnl_usdt"] = current_pnl
+        t["net_current_pnl"] = round(current_pnl - fees_estimate, 4)
+        enriched.append(t)
+    return enriched
 
 
 @app.get("/trades/closed", dependencies=[Depends(_verify_token)])
