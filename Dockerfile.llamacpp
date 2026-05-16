@@ -1,0 +1,17 @@
+FROM python:3.11-slim
+
+RUN apt-get update -qq && apt-get install -y -qq build-essential cmake && rm -rf /var/lib/apt/lists/*
+
+# Install llama-cpp-python with server support (CPU-only, no GPU)
+RUN CMAKE_ARGS="-DLLAMA_BLAS=ON -DLLAMA_BLAS_VENDOR=OpenBLAS" \
+    pip install --no-cache-dir llama-cpp-python[server]
+
+EXPOSE 8080
+
+CMD ["python", "-m", "llama_cpp.server", \
+     "--model", "/models/llama-3.1-70b-gguf/Meta-Llama-3.1-70B-Instruct-Q4_K_M.gguf", \
+     "--host", "0.0.0.0", \
+     "--port", "8080", \
+     "--n_ctx", "4096", \
+     "--n_threads", "4", \
+     "--n_gpu_layers", "0"]

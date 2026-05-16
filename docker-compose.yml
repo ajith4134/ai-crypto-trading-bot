@@ -35,15 +35,10 @@ services:
   # ALTERNATIVE: llama.cpp server with pre-quantized Q4_K_M GGUF.
   # Same goal: CPU-only local 70B inference, ~4-8 GB peak RAM via memory-mapped GGUF.
   llama_cpp:
-    image: ghcr.io/ggerganov/llama.cpp:server
+    build:
+      context: .
+      dockerfile: Dockerfile.llamacpp
     restart: unless-stopped
-    command: >
-      -m /models/llama-3.1-70b-gguf/Meta-Llama-3.1-70B-Instruct-Q4_K_M.gguf
-      --host 0.0.0.0
-      --port 8080
-      --ctx-size 4096
-      --threads 4
-      --n-predict 512
     volumes:
       - /models:/models
     networks:
