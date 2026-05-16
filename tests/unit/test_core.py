@@ -167,3 +167,62 @@ class TestEngineInterfaceParity:
 
         assert base_methods.issubset(paper_methods), f"PaperEngine missing: {base_methods - paper_methods}"
         assert base_methods.issubset(live_methods), f"LiveEngine missing: {base_methods - live_methods}"
+
+
+# AK-11: Strategy dual-save transaction
+class TestStrategyDualSave:
+    def test_save_writes_both_db_and_file(self, tmp_path):
+        import unittest.mock as mock
+        from strategy import save as s_mod
+
+        original_dirs = s_mod._STRATEGY_DIRS.copy()
+        s_mod._STRATEGY_DIRS["experimental"] = tmp_path
+
+        strategy = {
+            "status": "experimental",
+            "source": "brain",
+            "code": "def entry(): return True",
+            "name": "test_strategy",
+        }
+
+        inserted = []
+
+        def fake_execute(sql, params):
+            if "INSERT" in sql:
+                inserted.append(params)
+
+        with mock.patch("strategy.save.db_conn") as mock_db:
+            ctx = mock_db.return_value.__enter__.return_value
+            ctx.cursor.return_value.__enter__.return_value.execute = fake_execute
+
+            sid = s_mod.save_strategy(strategy)
+
+        assert len(inserted) > 0, "DB INSERT not called"
+        written_files = list(tmp_path.glob("*.py"))
+        assert len(written_files) == 1, f"Expected 1 .py file, got {len(written_files)}"
+        assert written_files[0].read_text() == "def entry(): return True"
+
+        s_mod._STRATEGY_DIRS.update(original_dirs)
+
+    def test_filesystem_failure_rolls_back(self, tmp_path):
+        import unittest.mock as mock
+        from strategy import save as s_mod
+
+        original_dirs = s_mod._STRATEGY_DIRS.copy()
+        read_only = tmp_path / "readonly"
+        read_only.mkdir(mode=0o444)
+        s_mod._STRATEGY_DIRS["experimental"] = read_only
+
+        strategy = {"status": "experimental", "source": "brain", "code": "x=1", "name": "t"}
+
+        with mock.patch("strategy.save.db_conn") as mock_db:
+            ctx = mock_db.return_value.__enter__.return_value
+            ctx.cursor.return_value.__enter__.return_value.execute = lambda *a: None
+
+            try:
+                s_mod.save_strategy(strategy)
+                assert False, "Should have raised on filesystem failure"
+            except (PermissionError, RuntimeError, OSError):
+                pass
+
+        s_mod._STRATEGY_DIRS.update(original_dirs)
