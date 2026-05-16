@@ -19,6 +19,16 @@ log = structlog.get_logger()
 
 app = FastAPI(title="Trading Bot Dashboard", version="1.0.0")
 
+
+@app.on_event("startup")
+async def startup():
+    """Initialize DB pool and Redis on dashboard startup."""
+    import db
+    import redis_client
+    db.init_pool()
+    redis_client.init()
+    log.info("dashboard_startup_complete")
+
 # CORS — restrict to VPS domain only (AP-19)
 app.add_middleware(
     CORSMiddleware,
