@@ -202,4 +202,13 @@ if __name__ == "__main__":
     redis_client.init()
     client = BinanceClient()
     ws = BinanceWSManager(client)
-    asyncio.run(ws.connect())
+
+    async def _run():
+        await ws.connect()
+        await asyncio.gather(
+            update_microstructure_loop(),
+            _silence_detector("mark_price"),
+            _silence_detector("kline"),
+        )
+
+    asyncio.run(_run())
