@@ -53,14 +53,8 @@ def _startup_checks() -> None:
         log.error("llamacpp_model_missing", path=str(llamacpp_path))
         sys.exit(1)
 
-    # Virtual balance init (paper mode)
-    if config.TRADING_MODE == "paper":
-        r = redis_client.get()
-        import redis_keys
-        if not r.get(redis_keys.VIRTUAL_BALANCE):
-            r.set(redis_keys.VIRTUAL_BALANCE, 10000.0)
-            log.info("virtual_balance_initialised", amount=10000.0)
-
+    # Virtual balance is set by the user via dashboard before pressing Start Trading.
+    # It is NOT hardcoded here. POST /bot/start initialises it from bot:starting_capital_usdt.
     log.info("all_startup_checks_passed")
 
 
