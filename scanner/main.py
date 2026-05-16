@@ -161,7 +161,9 @@ async def run_scan(exchange_client) -> list[str]:
     winrate_s = score_win_rate(syms)
     pnl_s = score_pnl(syms)
 
-    max_pairs = config.trading.max_active_pairs if brain_stage <= 2 else max(20, config.trading.max_active_pairs // 2)
+    # Stage 1-2: use full max_active_pairs (200) to maximise data generation speed
+    # Stage 3-4: tighten to top half for quality over quantity
+    max_pairs = config.trading.max_active_pairs if brain_stage <= 2 else max(60, config.trading.max_active_pairs // 2)
     composite = compute_composite(syms, vol_s, volatility_s, spread_s, winrate_s, pnl_s, weights)
     return update_active_pairs(composite, max_pairs)
 
