@@ -34,3 +34,22 @@ export const getStrategies     = () => api.get('/strategies').then(r => r.data);
 export const getActivePairs    = () => api.get('/pairs/active').then(r => r.data);
 export const getWebIntelFeed   = () => api.get('/web_intel/feed').then(r => r.data);
 export const exportClosedCSV   = () => api.get('/trades/closed/export', { responseType: 'blob' });
+
+export const getSummary = async () => {
+  const [open, closed, balance] = await Promise.all([
+    api.get('/trades/open').then(r => r.data),
+    api.get('/trades/closed?limit=500').then(r => r.data),
+    api.get('/bot/status').then(r => r.data),
+  ]);
+  const totalUnrealised = (open as any[]).reduce((s:number, t:any) => s + +(t.current_pnl_usdt||0), 0);
+  const totalClosed = (closed as any[]).reduce((s:number, t:any) => s + +(t.net_pnl_usdt||0), 0);
+  const wins = (closed as any[]).filter((t:any) => +(t.net_pnl_usdt||0) > 0).length;
+  return {
+    open_count: (open as any[]).length,
+    closed_count: (closed as any[]).length,
+    unrealised_pnl: totalUnrealised,
+    realised_pnl: totalClosed,
+    win_rate: (closed as any[]).length > 0 ? (wins / (closed as any[]).length * 100) : 0,
+    virtual_balance: +(balance?.virtual_balance || 0),
+  };
+};

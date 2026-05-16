@@ -19,6 +19,7 @@ import MLModelsPanel from './panels/MLModelsPanel';
 import IntelligencePanel from './panels/IntelligencePanel';
 
 import { WsEvent, WsContext } from './context';
+import SummaryBar from './panels/SummaryBar';
 
 class ErrorBoundary extends React.Component<{children: React.ReactNode}, {error: string|null}> {
   constructor(props: any) { super(props); this.state = {error: null}; }
