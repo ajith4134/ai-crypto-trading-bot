@@ -119,22 +119,46 @@ class MasterBrain:
             return
 
         r = redis_client.get()
+
+        # Read user-configured limits from Redis (set via dashboard before Start)
+        max_open = r.get("bot:max_open_trades")
+        min_open = r.get("bot:min_open_trades")
+        max_pos_usdt = r.get("bot:max_position_usdt")
+
+        if max_open is None or max_pos_usdt is None:
+            # User hasn't configured settings yet — do not trade
+            log.warning("brain_waiting_for_settings",
+                        msg="Set min/max trades and max_position_usdt in dashboard first")
+            return
+
+        max_open = int(max_open)
+        min_open = int(min_open) if min_open else 1
+        max_pos_usdt = float(max_pos_usdt)
+
         balance = float(r.get(redis_keys.VIRTUAL_BALANCE) or r.get(redis_keys.ACCOUNT_BALANCE) or 0)
         if balance <= 0:
             return
 
         open_trades = get_open_trades()
-        if len(open_trades) >= config.trading.max_open_trades:
+        if len(open_trades) >= max_open:
             return
 
         total_deployed_pct = sum(
             float(t.get("capital_usdt", 0)) / balance * 100 for t in open_trades
         ) if balance > 0 else 0
 
+        # Capital per trade = min(max_position_usdt, per_trade_min_pct% of balance)
+        # Both limits apply — the smaller one wins
+        pct_based = balance * config.capital.per_trade_min_pct / 100
+        capital_per_trade = min(pct_based, max_pos_usdt)
+
         brain_state = {
             "stage": observation["brain_stage"],
             "active_strategy_id": None,
-            "default_capital_usdt": balance * config.capital.per_trade_min_pct / 100,
+            "default_capital_usdt": capital_per_trade,
+            "max_position_usdt": max_pos_usdt,
+            "min_open_trades": min_open,
+            "max_open_trades": max_open,
             "default_qty": 0.01,
         }
 

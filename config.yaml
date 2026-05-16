@@ -2,8 +2,9 @@ trading:
   mode: paper                    # paper | live — controlled via dashboard or .env
   paper_trade_threshold: 2000    # minimum closed paper trades before live is unlocked
   max_active_pairs: 200
-  min_open_trades: 3
-  max_open_trades: 15
+  min_open_trades: null          # SET BY USER IN DASHBOARD before starting — bot will not trade until set
+  max_open_trades: null          # SET BY USER IN DASHBOARD before starting — bot will not trade until set
+  max_position_usdt: null        # SET BY USER IN DASHBOARD before starting — absolute USDT cap per trade
   max_total_capital_pct: 80      # never deploy more than 80% of account capital at once
 
 capital:

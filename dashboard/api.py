@@ -92,16 +92,50 @@ async def login(req: LoginRequest):
 
 # --- AH-04: Bot control ---
 
+def _settings_configured(r) -> bool:
+    """Return True only if user has set all required pre-start values."""
+    return (
+        r.get("bot:min_open_trades") is not None and
+        r.get("bot:max_open_trades") is not None and
+        r.get("bot:max_position_usdt") is not None
+    )
+
+
 @app.get("/bot/status", dependencies=[Depends(_verify_token)])
 async def bot_status():
     import redis_client, redis_keys
     r = redis_client.get()
+    configured = _settings_configured(r)
     return {
         "stage": int(r.get(redis_keys.BRAIN_STAGE) or 1),
-        "mode": "paper",
-        "running": True,
+        "mode": r.get("bot:mode") or "paper",
+        "running": r.get("bot:running") == "1",
         "paper_closed": int(r.get("brain:paper_closed") or 0),
+        "settings_configured": configured,
+        "min_open_trades": r.get("bot:min_open_trades"),
+        "max_open_trades": r.get("bot:max_open_trades"),
+        "max_position_usdt": r.get("bot:max_position_usdt"),
     }
+
+
+@app.post("/bot/start", dependencies=[Depends(_verify_token)])
+async def bot_start():
+    import redis_client
+    r = redis_client.get()
+    if not _settings_configured(r):
+        raise HTTPException(
+            status_code=400,
+            detail="Cannot start: set min_open_trades, max_open_trades, and max_position_usdt first via PUT /bot/settings"
+        )
+    r.set("bot:running", "1")
+    return {"started": True}
+
+
+@app.post("/bot/stop", dependencies=[Depends(_verify_token)])
+async def bot_stop():
+    import redis_client
+    redis_client.get().set("bot:running", "0")
+    return {"stopped": True}
 
 
 @app.post("/bot/mode", dependencies=[Depends(_verify_token)])
@@ -111,7 +145,47 @@ async def set_mode(mode: str):
     paper_closed = int(r.get("brain:paper_closed") or 0)
     if mode == "live" and paper_closed < 2000:
         raise HTTPException(status_code=403, detail=f"Need 2000 paper trades, have {paper_closed}")
+    r.set("bot:mode", mode)
     return {"mode": mode, "accepted": True}
+
+
+@app.put("/bot/settings", dependencies=[Depends(_verify_token)])
+async def bot_settings(settings: dict):
+    """
+    Required before Start Trading button is enabled.
+    Expects: { min_open_trades: int, max_open_trades: int, max_position_usdt: float }
+    """
+    import redis_client
+    r = redis_client.get()
+    errors = []
+
+    min_t = settings.get("min_open_trades")
+    max_t = settings.get("max_open_trades")
+    max_pos = settings.get("max_position_usdt")
+
+    if min_t is None or int(min_t) < 1:
+        errors.append("min_open_trades must be ≥ 1")
+    if max_t is None or int(max_t) < 1:
+        errors.append("max_open_trades must be ≥ 1")
+    if min_t and max_t and int(min_t) > int(max_t):
+        errors.append("min_open_trades cannot exceed max_open_trades")
+    if max_pos is None or float(max_pos) <= 0:
+        errors.append("max_position_usdt must be > 0 (e.g. 100 means max $100 per trade)")
+
+    if errors:
+        raise HTTPException(status_code=400, detail="; ".join(errors))
+
+    r.set("bot:min_open_trades", int(min_t))
+    r.set("bot:max_open_trades", int(max_t))
+    r.set("bot:max_position_usdt", float(max_pos))
+
+    return {
+        "saved": True,
+        "min_open_trades": int(min_t),
+        "max_open_trades": int(max_t),
+        "max_position_usdt": float(max_pos),
+        "ready_to_start": True,
+    }
 
 
 # --- AH-05: REST data endpoints ---
