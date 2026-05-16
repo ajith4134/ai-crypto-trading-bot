@@ -1,6 +1,6 @@
 // AI-08: Panel 6 — Signal Monitor
 import React, { useContext, useEffect, useState } from 'react';
-import { WsContext } from '../App';
+import { WsContext } from '../context';
 import { card, title } from './shared';
 
 const SignalMonitor: React.FC = () => {

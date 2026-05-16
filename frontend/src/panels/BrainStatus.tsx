@@ -1,7 +1,7 @@
 // AI-04: Panel 2 — Brain Status
 import React, { useContext, useEffect, useState } from 'react';
 import { getBrainStatus } from '../api';
-import { WsContext } from '../App';
+import { WsContext } from '../context';
 import { card, title, P } from './shared';
 
 const BrainStatus: React.FC = () => {

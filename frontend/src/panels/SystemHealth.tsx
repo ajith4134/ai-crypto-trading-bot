@@ -1,7 +1,7 @@
 // AI-18: Panel 17 — System Health
 import React, { useContext, useEffect, useState } from 'react';
 import { getSystemHealth } from '../api';
-import { WsContext } from '../App';
+import { WsContext } from '../context';
 import { card, title } from './shared';
 
 const SERVICES = ['brain','data_feed','scanner','web_intel','dashboard','celery_worker','watchdog','llama_cpp','ollama','postgres','redis'];

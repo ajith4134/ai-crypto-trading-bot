@@ -1,7 +1,7 @@
 // AI-06: Panel 4 — Intelligence → Open Trade Performance
 import React, { useContext, useEffect, useState } from 'react';
 import { getOpenTrades } from '../api';
-import { WsContext } from '../App';
+import { WsContext } from '../context';
 import { card, title, Table } from './shared';
 
 const IntelligencePanel: React.FC = () => {

@@ -1,7 +1,7 @@
 // AI-07: Panel 5 — Open Trades Table (all 15 columns, live updates)
 import React, { useContext, useEffect, useState } from 'react';
 import { getOpenTrades } from '../api';
-import { WsContext } from '../App';
+import { WsContext } from '../context';
 import { card, title, Table } from './shared';
 
 const OpenTradesTable: React.FC = () => {

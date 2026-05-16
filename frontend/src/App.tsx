@@ -18,8 +18,23 @@ import TelegramLog from './panels/TelegramLog';
 import MLModelsPanel from './panels/MLModelsPanel';
 import IntelligencePanel from './panels/IntelligencePanel';
 
-export type WsEvent = { channel: string; data: any };
-export const WsContext = React.createContext<WsEvent | null>(null);
+import { WsEvent, WsContext } from './context';
+
+class ErrorBoundary extends React.Component<{children: React.ReactNode}, {error: string|null}> {
+  constructor(props: any) { super(props); this.state = {error: null}; }
+  static getDerivedStateFromError(e: Error) { return {error: e.message}; }
+  render() {
+    if (this.state.error) return (
+      <div style={{background:'#0a0a0a',color:'#ff4444',padding:32,fontFamily:'monospace'}}>
+        <h2>Dashboard Error</h2>
+        <pre style={{whiteSpace:'pre-wrap'}}>{this.state.error}</pre>
+        <button onClick={()=>window.location.reload()} style={{marginTop:16,padding:'8px 16px',cursor:'pointer'}}>Reload</button>
+      </div>
+    );
+    return this.props.children;
+  }
+}
+
 
 const LoginPage: React.FC<{ onLogin: () => void }> = ({ onLogin }) => {
   const [user, setUser] = useState('admin');
@@ -57,6 +72,7 @@ const App: React.FC = () => {
   if (!authed) return <LoginPage onLogin={() => setAuthed(true)} />;
 
   return (
+    <ErrorBoundary>
     <WsContext.Provider value={lastEvent}>
       <div style={{background:'#0a0a0a',minHeight:'100vh',color:'#e0e0e0',fontFamily:'monospace',fontSize:13}}>
         <div style={{background:'#1a1a2e',padding:'4px 16px',fontSize:11,color:wsOk?'#00ff88':'#ff8800',borderBottom:'1px solid #2a2a4a'}}>
@@ -82,6 +98,7 @@ const App: React.FC = () => {
         </div>
       </div>
     </WsContext.Provider>
+    </ErrorBoundary>
   );
 };
 

@@ -1,6 +1,6 @@
 // AI-15: Panel 14 — Telegram Notification Log
 import React, { useContext, useState } from 'react';
-import { WsContext } from '../App';
+import { WsContext } from '../context';
 import { card, title } from './shared';
 
 const TelegramLog: React.FC = () => {

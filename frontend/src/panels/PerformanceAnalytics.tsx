@@ -11,24 +11,11 @@ const PerformanceAnalytics: React.FC = () => {
     getAnalytics().then(setMetrics).catch(()=>{});
   }, []);
 
+  // Chart renders after trades accumulate — placeholder for now
   useEffect(() => {
     if (!chartRef.current) return;
-    // TradingView Lightweight Charts equity curve
-    try {
-      const { createChart } = require('lightweight-charts');
-      const chart = createChart(chartRef.current, {
-        width: chartRef.current.offsetWidth,
-        height: 200,
-        layout: { background: { color: '#0d0d1a' }, textColor: '#888' },
-        grid: { vertLines: { color: '#1a1a2e' }, horzLines: { color: '#1a1a2e' } },
-        timeScale: { timeVisible: true },
-      });
-      const series = chart.addLineSeries({ color: '#00d4ff', lineWidth: 2 });
-      // Placeholder data — real data comes from /analytics/equity endpoint
-      series.setData([{ time: Math.floor(Date.now()/1000), value: 10000 }]);
-      return () => chart.remove();
-    } catch { /* lightweight-charts not loaded yet */ }
-  }, [chartRef.current]);
+    chartRef.current.innerHTML = '<div style="color:#555;padding:16px;text-align:center;font-size:12px">Equity curve will appear after first closed trades</div>';
+  }, []);
 
   const windows = ['50','100','500'];
   const metricKeys = ['win_rate','net_pnl_usdt','sharpe','sortino','profit_factor','max_drawdown_usdt','avg_hold_hours','avg_win_loss_ratio','directional_accuracy'];

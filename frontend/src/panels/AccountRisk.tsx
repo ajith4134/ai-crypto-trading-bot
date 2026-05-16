@@ -1,7 +1,7 @@
 // AI-17: Panel 16 — Account Risk Monitor
 import React, { useContext, useEffect, useState } from 'react';
 import { getAccountRisk } from '../api';
-import { WsContext } from '../App';
+import { WsContext } from '../context';
 import { card, title, P } from './shared';
 
 const AccountRisk: React.FC = () => {
