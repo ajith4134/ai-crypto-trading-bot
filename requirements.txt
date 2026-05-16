@@ -16,15 +16,13 @@ hmmlearn
 ruptures
 deap
 stable-baselines3
-finrl
 scikit-learn
 scipy
 numpy
 pandas
 
-# AirLLM — Llama 3.1 70B layer-by-layer inference (background tasks only)
-# Repo: https://github.com/lyogavin/airllm
-airllm
+# NOTE: airllm removed — replaced by llama.cpp GGUF (see TASKS.md H-04)
+# NOTE: finrl removed — FinRL has complex deps; MARL uses stable-baselines3 directly
 
 # Web framework & API
 fastapi
@@ -32,10 +30,14 @@ uvicorn[standard]
 python-jose[cryptography]
 passlib[bcrypt]
 pydantic
+slowapi                      # rate limiting for dashboard login endpoint
+
+# Async HTTP (Ollama calls, watchdog health checks)
+aiohttp
+httpx
 
 # Task queue
-celery
-redis
+celery[redis]
 
 # Notifications
 python-telegram-bot
@@ -45,7 +47,7 @@ praw
 feedparser
 requests
 beautifulsoup4
-serpapi
+google-search-results        # SerpAPI client (PyPI package name, imported as serpapi)
 
 # Config & utilities
 pyyaml
