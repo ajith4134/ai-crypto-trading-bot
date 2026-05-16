@@ -26,11 +26,23 @@ def generate_candidate_signals(pair: str, brain_state: dict) -> list[dict]:
     if mark <= 0:
         return []
 
-    direction = "long" if (sentiment > 0.55 and ofi > 0) else "short" if (sentiment < 0.45 and ofi < 0) else None
-    if not direction:
-        return []
-
-    signal_strength = round(abs(sentiment - 0.5) * 2 * 100, 2)
+    # Stage 1 data collection: use OFI direction (momentum-based)
+    # Stage 2+: require sentiment confirmation too
+    if brain_state.get("stage", 1) <= 1:
+        # Baby Brain: direction = momentum (positive OFI = long, negative = short)
+        # Use a tiny non-zero threshold to filter pure noise
+        if ofi > 0.0001:
+            direction = "long"
+        elif ofi < -0.0001:
+            direction = "short"
+        else:
+            return []
+        signal_strength = round(min(100, abs(ofi) * 10000), 2)
+    else:
+        direction = "long" if (sentiment > 0.55 and ofi > 0) else "short" if (sentiment < 0.45 and ofi < 0) else None
+        if not direction:
+            return []
+        signal_strength = round(abs(sentiment - 0.5) * 2 * 100, 2)
 
     return [{
         "pair": pair,
@@ -49,8 +61,12 @@ def accept_or_reject(signal: dict, brain_state: dict) -> tuple[bool, str]:
     """T-02: Apply Brain-learned criteria to accept or reject a signal."""
     strength = float(signal.get("signal_strength") or 0)
     regime = signal.get("market_regime", "unknown")
+    stage = brain_state.get("stage", 1)
 
-    if strength < 30:
+    # Stage 1: very low threshold — collect data from any non-zero signal
+    # Stage 2+: require meaningful signal strength
+    min_strength = 0.1 if stage <= 1 else 30
+    if strength < min_strength:
         return False, "signal_too_weak"
     if regime == "turbulent":
         r = redis_client.get()

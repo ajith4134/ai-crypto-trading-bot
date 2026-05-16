@@ -64,13 +64,7 @@ async def _main() -> None:
     """AJ-02: Launch all services."""
     _startup_checks()
 
-    from exchange.client import BinanceClient, BinanceWSManager
-    from scanner.main import scanner_loop
     from brain.soar import MasterBrain
-
-    client = BinanceClient()
-    ws_manager = BinanceWSManager(client)
-
     brain = MasterBrain()
 
     # AJ-03: Graceful shutdown
@@ -85,9 +79,9 @@ async def _main() -> None:
     for sig in (signal.SIGTERM, signal.SIGINT):
         loop.add_signal_handler(sig, lambda s=sig.name: _shutdown(s))
 
+    # scanner_loop runs in the separate scanner container
+    # brain runs here; data_feed runs in data_feed container
     await asyncio.gather(
-        ws_manager.connect(),
-        scanner_loop(client),
         brain.run(),
         return_exceptions=True,
     )

@@ -112,8 +112,16 @@ class MasterBrain:
 
     async def _act(self, observation: dict, decision: dict) -> None:
         """ACT phase: open trades, manage DCA, publish events."""
-        if decision.get("mode") == "ml_only" or decision.get("trade") is False:
-            return
+        brain_stage = observation.get("brain_stage", 1)
+
+        # Stage 1 override: Baby Brain always tries to trade for data collection.
+        # Blueprint: "Stage 1 = pure observation and data collection mode.
+        #  Runs paper trades using basic logic purely to generate the first raw dataset."
+        if brain_stage >= 2:
+            # Stage 2+: respect LLM decision
+            if decision.get("mode") == "ml_only" or decision.get("trade") is False:
+                return
+        # Stage 1: fall through and let signals decide (LLM decision is advisory only)
 
         if check_turbulence_circuit_breaker():
             return
