@@ -84,8 +84,21 @@ class LoginRequest(BaseModel):
 
 @app.post("/auth/login")
 async def login(req: LoginRequest):
-    HARDCODED_HASH = "$2b$12$placeholder_replace_with_real_bcrypt_hash"
-    if req.username != "admin" or not _pwd_context.verify(req.password, HARDCODED_HASH):
+    import hashlib, os
+    # Password stored as SHA-256 hash in Redis for simplicity
+    # Set via: docker exec trading-bot-redis-1 redis-cli SET dashboard:password_hash <hash>
+    import redis_client
+    r = redis_client.get()
+    stored_hash = r.get("dashboard:password_hash")
+    if not stored_hash:
+        # Default password on first run: TradingBot2026!
+        # Change it via dashboard or Redis directly
+        default_hash = hashlib.sha256("TradingBot2026!".encode()).hexdigest()
+        r.set("dashboard:password_hash", default_hash)
+        stored_hash = default_hash
+
+    input_hash = hashlib.sha256(req.password.encode()).hexdigest()
+    if req.username != "admin" or input_hash != stored_hash:
         raise HTTPException(status_code=401, detail="Invalid credentials")
     return {"access_token": _make_token(req.username), "token_type": "bearer"}
 
