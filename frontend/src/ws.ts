@@ -18,9 +18,14 @@ export const connect = () => {
 
   _ws.onmessage = (evt) => {
     try {
+      if (typeof evt.data !== 'string') return;
       const msg = JSON.parse(evt.data);
-      const data = typeof msg.data === 'string' ? JSON.parse(msg.data) : msg.data;
-      _handlers.forEach(h => h(msg.channel, data));
+      if (!msg || typeof msg !== 'object') return;
+      let data = msg.data;
+      if (typeof data === 'string') {
+        try { data = JSON.parse(data); } catch { /* keep as string */ }
+      }
+      _handlers.forEach(h => { try { h(msg.channel, data); } catch {} });
     } catch { /* ignore malformed */ }
   };
 

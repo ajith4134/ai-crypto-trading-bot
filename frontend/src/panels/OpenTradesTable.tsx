@@ -25,7 +25,7 @@ const OpenTradesTable: React.FC = () => {
     <span style={{color:(+t.net_pnl_usdt||0)>=0?'#00ff88':'#ff4444'}}>${(+t.net_pnl_usdt||0).toFixed(2)}</span>,
     `$${(+t.peak_pnl_usdt||0).toFixed(2)}`,
     `$${(+t.trailing_sl_level||0).toLocaleString()}`,
-    JSON.parse(t.dca_status||'{}').round_1_triggered ? (JSON.parse(t.dca_status||'{}').round_2_triggered?'R1+R2':'R1'):'None',
+    (() => { const d = typeof t.dca_status === 'string' ? JSON.parse(t.dca_status || '{}') : (t.dca_status || {}); return d.round_1_triggered ? (d.round_2_triggered ? 'R1+R2' : 'R1') : 'None'; })(),
     `$${(+t.capital_usdt||0).toFixed(0)}`,
     `${t.leverage||0}x`,
     t.trade_potential_score||'—',
