@@ -9,7 +9,7 @@ import config
 log = structlog.get_logger()
 
 
-async def classify(prompt: str, timeout: int = 10) -> dict:
+async def classify(prompt: str, timeout: int = 60) -> dict:
     """Send prompt to Phi-3 Mini; return parsed JSON response."""
     assert_no_reflection(prompt)
     payload = {

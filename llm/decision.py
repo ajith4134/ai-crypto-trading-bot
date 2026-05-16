@@ -9,7 +9,7 @@ import config
 log = structlog.get_logger()
 
 
-async def decide(prompt: str, timeout: int = 30) -> dict:
+async def decide(prompt: str, timeout: int = 120) -> dict:
     """Send prompt to Mistral 7B; return parsed JSON response."""
     assert_no_reflection(prompt)
     payload = {

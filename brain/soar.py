@@ -94,10 +94,10 @@ class MasterBrain:
             try:
                 if use_debate:
                     from llm.decision import decide
-                    verdict = await decide(prompt, timeout=20)
+                    verdict = await decide(prompt, timeout=120)
                 else:
                     from llm.router import classify
-                    verdict = await classify(prompt, timeout=10)
+                    verdict = await classify(prompt, timeout=60)
             except Exception as exc:
                 verdict = handle_ollama_failure(exc, "decide")
 
