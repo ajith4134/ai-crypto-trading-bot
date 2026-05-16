@@ -1,0 +1,103 @@
+"""
+Section AJ: Entry point & orchestrator — AJ-01 to AJ-03.
+"""
+import asyncio
+import signal
+import sys
+from pathlib import Path
+import structlog
+
+log = structlog.get_logger()
+
+
+def _startup_checks() -> None:
+    """AJ-01: Validate all dependencies before starting any service."""
+    import db
+    import redis_client
+    import config
+
+    # DB
+    db.init_pool()
+    log.info("postgres_ok")
+
+    # Redis
+    redis_client.init()
+    log.info("redis_ok")
+
+    # Ollama connectivity
+    import httpx
+    try:
+        r = httpx.get(f"{config.llm.ollama_url}/api/tags", timeout=5)
+        r.raise_for_status()
+        log.info("ollama_ok")
+    except Exception as exc:
+        log.error("ollama_unreachable", error=str(exc))
+        sys.exit(1)
+
+    # ML model checkpoints
+    required_models = [
+        Path("models/hmm_regime.pkl"),
+        Path("models/tft.pth"),
+        Path("models/patchtst.pth"),
+        Path("models/gnn.pth"),
+        Path("models/world_model.pth"),
+    ]
+    missing = [str(p) for p in required_models if not p.exists()]
+    if missing:
+        log.error("missing_ml_models", missing=missing)
+        sys.exit(1)
+
+    # AirLLM model directory
+    airllm_path = Path(config.llm.airllm_model_path)
+    if not airllm_path.exists():
+        log.error("airllm_model_missing", path=str(airllm_path))
+        sys.exit(1)
+
+    # Virtual balance init (paper mode)
+    if config.TRADING_MODE == "paper":
+        r = redis_client.get()
+        import redis_keys
+        if not r.get(redis_keys.VIRTUAL_BALANCE):
+            r.set(redis_keys.VIRTUAL_BALANCE, 10000.0)
+            log.info("virtual_balance_initialised", amount=10000.0)
+
+    log.info("all_startup_checks_passed")
+
+
+async def _main() -> None:
+    """AJ-02: Launch all services."""
+    _startup_checks()
+
+    from exchange.client import BinanceClient, BinanceWSManager
+    from scanner.main import scanner_loop
+    from brain.soar import MasterBrain
+
+    client = BinanceClient()
+    ws_manager = BinanceWSManager(client)
+
+    brain = MasterBrain()
+
+    # AJ-03: Graceful shutdown
+    loop = asyncio.get_running_loop()
+
+    def _shutdown(sig_name: str) -> None:
+        log.info("shutdown_requested", signal=sig_name)
+        brain.stop()
+        for task in asyncio.all_tasks(loop):
+            task.cancel()
+
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        loop.add_signal_handler(sig, lambda s=sig.name: _shutdown(s))
+
+    await asyncio.gather(
+        ws_manager.connect(),
+        scanner_loop(client),
+        brain.run(),
+        return_exceptions=True,
+    )
+
+    log.info("shutdown_complete")
+
+
+if __name__ == "__main__":
+    asyncio.run(_main())
