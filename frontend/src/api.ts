@@ -3,15 +3,13 @@ import axios from 'axios';
 
 const BASE = '';  // served by nginx on same origin
 
-let _token: string | null = null;
-
-export const setToken = (t: string) => { _token = t; };
-export const getToken = () => _token;
-export const clearToken = () => { _token = null; };
+export const setToken = (t: string) => { sessionStorage.setItem('token', t); };
+export const getToken = () => sessionStorage.getItem('token');
+export const clearToken = () => { sessionStorage.removeItem('token'); };
 
 const api = axios.create({ baseURL: BASE });
 api.interceptors.request.use(cfg => {
-  if (_token) cfg.headers['Authorization'] = `Bearer ${_token}`;
+  const tok = getToken(); if (tok) cfg.headers['Authorization'] = `Bearer ${tok}`;
   return cfg;
 });
 api.interceptors.response.use(r => r, err => {

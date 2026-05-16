@@ -1,14 +1,14 @@
 // AI-03: Panel 1 — Control Panel
 // All 4 settings required before Start Trading is enabled.
 import React, { useEffect, useState } from 'react';
-import { getBotStatus, setBotMode } from '../api';
+import { getBotStatus, setBotMode, getToken } from '../api';
 import axios from 'axios';
 import { card, title, badge } from './shared';
 
-const getToken = () => sessionStorage.getItem('token') || localStorage.getItem('token') || '';
 const authApi = axios.create({ baseURL: '' });
 authApi.interceptors.request.use(cfg => {
-  cfg.headers['Authorization'] = `Bearer ${getToken()}`;
+  const tok = getToken();
+  if (tok) cfg.headers['Authorization'] = `Bearer ${tok}`;
   return cfg;
 });
 
