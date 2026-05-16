@@ -1,0 +1,88 @@
+import React, { useEffect, useState } from 'react';
+import { getToken, login, setToken } from './api';
+import { connect, onMessage } from './ws';
+import ControlPanel from './panels/ControlPanel';
+import BrainStatus from './panels/BrainStatus';
+import OpenTradesTable from './panels/OpenTradesTable';
+import ClosedTradesTable from './panels/ClosedTradesTable';
+import SignalMonitor from './panels/SignalMonitor';
+import PairScanner from './panels/PairScanner';
+import StrategyPanel from './panels/StrategyPanel';
+import DirectionPanel from './panels/DirectionPanel';
+import PerformanceAnalytics from './panels/PerformanceAnalytics';
+import AccountRisk from './panels/AccountRisk';
+import SystemHealth from './panels/SystemHealth';
+import WebIntelPanel from './panels/WebIntelPanel';
+import FeatureHealth from './panels/FeatureHealth';
+import TelegramLog from './panels/TelegramLog';
+import MLModelsPanel from './panels/MLModelsPanel';
+import IntelligencePanel from './panels/IntelligencePanel';
+
+export type WsEvent = { channel: string; data: any };
+export const WsContext = React.createContext<WsEvent | null>(null);
+
+const LoginPage: React.FC<{ onLogin: () => void }> = ({ onLogin }) => {
+  const [user, setUser] = useState('admin');
+  const [pass, setPass] = useState('');
+  const [err, setErr] = useState('');
+  const submit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    try { const t = await login(user, pass); setToken(t); onLogin(); }
+    catch { setErr('Invalid credentials'); }
+  };
+  return (
+    <div style={{display:'flex',justifyContent:'center',alignItems:'center',height:'100vh',background:'#0a0a0a'}}>
+      <form onSubmit={submit} style={{background:'#1a1a2e',padding:32,borderRadius:8,minWidth:320,border:'1px solid #2a2a4a'}}>
+        <h2 style={{color:'#00d4ff',marginTop:0}}>Trading Bot Dashboard</h2>
+        {err && <p style={{color:'#ff4444'}}>{err}</p>}
+        <input value={user} onChange={e=>setUser(e.target.value)} placeholder="Username" style={{width:'100%',padding:8,marginBottom:12,background:'#0d0d1a',color:'#fff',border:'1px solid #333',borderRadius:4,boxSizing:'border-box'}}/>
+        <input type="password" value={pass} onChange={e=>setPass(e.target.value)} placeholder="Password" style={{width:'100%',padding:8,marginBottom:16,background:'#0d0d1a',color:'#fff',border:'1px solid #333',borderRadius:4,boxSizing:'border-box'}}/>
+        <button type="submit" style={{width:'100%',padding:10,background:'#00d4ff',color:'#000',border:'none',borderRadius:4,cursor:'pointer',fontWeight:'bold'}}>Login</button>
+      </form>
+    </div>
+  );
+};
+
+const App: React.FC = () => {
+  const [authed, setAuthed] = useState(!!getToken());
+  const [lastEvent, setLastEvent] = useState<WsEvent | null>(null);
+  const [wsOk, setWsOk] = useState(false);
+
+  useEffect(() => {
+    if (!authed) return;
+    connect();
+    onMessage((channel, data) => { setLastEvent({channel,data}); setWsOk(true); });
+  }, [authed]);
+
+  if (!authed) return <LoginPage onLogin={() => setAuthed(true)} />;
+
+  return (
+    <WsContext.Provider value={lastEvent}>
+      <div style={{background:'#0a0a0a',minHeight:'100vh',color:'#e0e0e0',fontFamily:'monospace',fontSize:13}}>
+        <div style={{background:'#1a1a2e',padding:'4px 16px',fontSize:11,color:wsOk?'#00ff88':'#ff8800',borderBottom:'1px solid #2a2a4a'}}>
+          {wsOk?'● Live':'○ Connecting...'} &nbsp;|&nbsp; AI Crypto Trading Bot
+        </div>
+        <div style={{padding:12,display:'grid',gap:12,gridTemplateColumns:'repeat(auto-fit, minmax(380px, 1fr))'}}>
+          <ControlPanel />
+          <BrainStatus />
+          <MLModelsPanel />
+          <IntelligencePanel />
+          <div style={{gridColumn:'1 / -1'}}><OpenTradesTable /></div>
+          <SignalMonitor />
+          <PairScanner />
+          <StrategyPanel />
+          <DirectionPanel />
+          <div style={{gridColumn:'1 / -1'}}><ClosedTradesTable /></div>
+          <WebIntelPanel />
+          <FeatureHealth />
+          <TelegramLog />
+          <div style={{gridColumn:'1 / -1'}}><PerformanceAnalytics /></div>
+          <AccountRisk />
+          <SystemHealth />
+        </div>
+      </div>
+    </WsContext.Provider>
+  );
+};
+
+export default App;

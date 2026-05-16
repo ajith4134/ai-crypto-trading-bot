@@ -24,6 +24,9 @@ services:
   ollama:
     image: ollama/ollama:latest
     restart: unless-stopped
+    environment:
+      # Unload models after 5 min idle so llama.cpp background tasks get full RAM
+      OLLAMA_KEEP_ALIVE: "5m"
     volumes:
       - ollama_models:/root/.ollama
     networks:
