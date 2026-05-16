@@ -197,3 +197,11 @@ async def web_intel_loop() -> None:
         except Exception as exc:
             log.error("web_intel_loop_error", error=str(exc))
         await asyncio.sleep(config.web_intelligence.rss_fetch_interval_minutes * 60)
+
+
+if __name__ == "__main__":
+    import asyncio
+    import db, redis_client
+    db.init_pool()
+    redis_client.init()
+    asyncio.run(web_intel_loop())

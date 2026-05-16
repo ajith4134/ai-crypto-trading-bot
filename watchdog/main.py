@@ -3,7 +3,6 @@ Section AG: Self-Healing & Auto-Restart Watchdog — AG-01 to AG-06.
 """
 import asyncio
 import json
-import subprocess
 from collections import defaultdict
 from datetime import datetime, timezone
 import httpx
@@ -36,13 +35,19 @@ async def _check_health(service: str) -> tuple[bool, dict]:
 
 
 def _restart_service(service: str) -> None:
-    """AG-03: Auto-restart via docker compose."""
+    """AG-03: Auto-restart via Docker SDK (docker socket mounted at /var/run/docker.sock)."""
     log.warning("restarting_service", service=service)
-    subprocess.run(
-        ["docker", "compose", "restart", service],
-        cwd="/opt/trading-bot",
-        capture_output=True,
-    )
+    try:
+        import docker as docker_sdk
+        client = docker_sdk.from_env()
+        containers = client.containers.list(all=True, filters={"name": f"trading-bot-{service}-1"})
+        if containers:
+            containers[0].restart()
+            log.info("service_restarted", service=service)
+        else:
+            log.warning("container_not_found", service=service)
+    except Exception as exc:
+        log.error("restart_failed", service=service, error=str(exc))
     try:
         from notifications.telegram import send_critical
         send_critical(f"Watchdog restarted service: {service}")

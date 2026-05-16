@@ -52,7 +52,7 @@ scanner:
 
 llm:
   # Ollama — fast models, always in RAM, used for time-critical decisions
-  ollama_url: "http://localhost:11434"
+  ollama_url: "http://ollama:11434"    # Docker service name
   router_model: "phi3:mini"        # Phi-3 Mini — market regime routing, situation classification (1-3 sec)
   decision_model: "mistral:7b"     # Mistral 7B — Debate Council moderator, final trade decision (3-6 sec)
 

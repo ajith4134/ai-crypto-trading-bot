@@ -57,3 +57,4 @@ structlog
 # Testing
 pytest
 pytest-asyncio
+docker

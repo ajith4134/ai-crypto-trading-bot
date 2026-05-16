@@ -152,8 +152,11 @@ async def run_scan(exchange_client) -> list[str]:
         }
 
     syms = list(ticker_data.keys())
-    weights = r.get(redis_keys.BRAIN_FEATURE_WEIGHTS)
-    weights = json.loads(weights) if weights else config.scanner.criteria_weights
+    weights_raw = r.get(redis_keys.BRAIN_FEATURE_WEIGHTS)
+    weights = json.loads(weights_raw) if weights_raw else {}
+    # Fall back to config weights if Brain hasn't learned custom weights yet
+    if not weights.get("volume"):
+        weights = config.scanner.criteria_weights
 
     vol_s = score_volume(ticker_data)
     volatility_s = score_volatility(ticker_data)
@@ -176,3 +179,13 @@ async def scanner_loop(exchange_client) -> None:
         except Exception as exc:
             log.error("scanner_error", error=str(exc))
         await asyncio.sleep(config.scanner.rescan_interval_hours * 3600)
+
+
+if __name__ == "__main__":
+    import asyncio
+    import db, redis_client, config
+    from exchange.client import BinanceClient
+    db.init_pool()
+    redis_client.init()
+    client = BinanceClient()
+    asyncio.run(scanner_loop(client))

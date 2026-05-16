@@ -47,11 +47,13 @@ def _startup_checks() -> None:
         log.error("missing_ml_models", missing=missing)
         sys.exit(1)
 
-    # llama.cpp GGUF model file (replaces AirLLM — see H-04 in TASKS.md for reason)
+    # llama.cpp GGUF model — warning only, not fatal (only needed for background tasks)
     llamacpp_path = Path(config.llm.llamacpp_model_path)
     if not llamacpp_path.exists():
-        log.error("llamacpp_model_missing", path=str(llamacpp_path))
-        sys.exit(1)
+        log.warning("llamacpp_model_not_found", path=str(llamacpp_path),
+                    note="Background research tasks disabled but trading continues")
+    else:
+        log.info("llamacpp_model_ok")
 
     # Virtual balance is set by the user via dashboard before pressing Start Trading.
     # It is NOT hardcoded here. POST /bot/start initialises it from bot:starting_capital_usdt.

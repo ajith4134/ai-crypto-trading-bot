@@ -192,3 +192,14 @@ async def run(ws_manager: BinanceWSManager) -> None:
         _silence_detector("kline"),
         _silence_detector("depth"),
     )
+
+
+if __name__ == "__main__":
+    import asyncio
+    import db, redis_client
+    from exchange.client import BinanceClient, BinanceWSManager
+    db.init_pool()
+    redis_client.init()
+    client = BinanceClient()
+    ws = BinanceWSManager(client)
+    asyncio.run(ws.connect())
