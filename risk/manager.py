@@ -59,9 +59,20 @@ async def monitor_trailing_sl(engine) -> None:
                     engine.close_trade(trade["id"], reason="trailing_sl")
                     continue
 
-                # O-02/O-03: Tighten or move SL if price moved in our favour
-                volatility = float(r.get(f"{pair}:atr") or 0)
-                trailing_dist = max(volatility * 2.0, mark * 0.02)
+                # Update peak PnL tracking
+                entry = float(trade.get("average_entry") or trade.get("entry_price") or 0)
+                capital = float(trade.get("capital_usdt") or 0)
+                leverage = int(trade.get("leverage") or 1)
+                if entry > 0 and capital > 0:
+                    direction_sign = 1.0 if direction == "long" else -1.0
+                    current_pnl = capital * leverage * (mark - entry) / entry * direction_sign
+                    peak_pnl = float(trade.get("peak_pnl_usdt") or 0)
+                    if current_pnl > peak_pnl:
+                        from memory.write import write_trade_update
+                        write_trade_update(trade["id"], {"peak_pnl_usdt": round(current_pnl, 4)})
+
+                # O-02/O-03: Move SL in profitable direction (2% trailing distance)
+                trailing_dist = mark * 0.02  # 2% trailing distance
 
                 if direction == "long":
                     new_sl = round(mark - trailing_dist, 8)
@@ -69,7 +80,7 @@ async def monitor_trailing_sl(engine) -> None:
                         engine.modify_sl(trade["id"], new_sl)
                 elif direction == "short":
                     new_sl = round(mark + trailing_dist, 8)
-                    if new_sl < sl_level:
+                    if new_sl < sl_level or sl_level == 0:
                         engine.modify_sl(trade["id"], new_sl)
 
         except Exception as exc:

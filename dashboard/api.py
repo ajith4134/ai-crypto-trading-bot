@@ -259,8 +259,22 @@ async def get_open_trades():
         t["current_pnl_usdt"] = current_pnl
         t["net_current_pnl"] = round(current_pnl - fees, 4)
         t["pct_change"] = round((mark - entry) / entry * 100, 4) if entry > 0 else 0
+        # Live hold time
+        if t.get("entry_time"):
+            try:
+                from datetime import datetime, timezone
+                et = t["entry_time"]
+                if hasattr(et, "replace"):
+                    elapsed = (datetime.now(timezone.utc) - et.replace(tzinfo=timezone.utc)).total_seconds()
+                else:
+                    elapsed = 0
+                t["hold_time_seconds"] = int(elapsed)
+                t["hold_hours"] = round(elapsed / 3600, 2)
+            except Exception:
+                pass
         enriched.append(t)
-    return enriched
+    total_pnl = round(sum(t.get("net_current_pnl", 0) for t in enriched), 4)
+    return {"trades": enriched, "total_open_pnl": total_pnl}
 
 
 @app.get("/trades/closed", dependencies=[Depends(_verify_token)])

@@ -98,6 +98,8 @@ async def process_signals(pairs: list[str], brain_state: dict, engine) -> list[s
 
             if accepted:
                 try:
+                    from risk.manager import compute_initial_sl
+                    initial_sl = compute_initial_sl(pair, signal["direction"])
                     trade_id = engine.open_trade({
                         "pair": pair,
                         "direction": signal["direction"],
@@ -109,6 +111,8 @@ async def process_signals(pairs: list[str], brain_state: dict, engine) -> list[s
                         "market_regime": signal.get("market_regime"),
                         "trade_potential_score": signal.get("signal_strength"),
                         "direction_confidence": signal.get("signal_strength"),
+                        "trailing_sl_level": initial_sl,
+                        "average_entry": None,  # set by engine from mark price
                     })
                     opened_trade_ids.append(trade_id)
                 except Exception as exc:

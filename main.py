@@ -65,7 +65,10 @@ async def _main() -> None:
     _startup_checks()
 
     from brain.soar import MasterBrain
+    from execution.factory import get_engine
+    from risk.manager import monitor_trailing_sl
     brain = MasterBrain()
+    engine = get_engine()
 
     # AJ-03: Graceful shutdown
     loop = asyncio.get_running_loop()
@@ -79,10 +82,11 @@ async def _main() -> None:
     for sig in (signal.SIGTERM, signal.SIGINT):
         loop.add_signal_handler(sig, lambda s=sig.name: _shutdown(s))
 
-    # scanner_loop runs in the separate scanner container
-    # brain runs here; data_feed runs in data_feed container
+    # brain + trailing SL monitor run together
+    # scanner runs in scanner container, data_feed in data_feed container
     await asyncio.gather(
         brain.run(),
+        monitor_trailing_sl(engine),
         return_exceptions=True,
     )
 
