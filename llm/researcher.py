@@ -19,8 +19,8 @@ def research(prompt: str, max_new_tokens: int = 512) -> str:
     """
     assert_no_reflection(prompt)
 
-    from airllm import AirLLMLlama
-    model = AirLLMLlama.from_pretrained(config.llm.airllm_model_path)
+    from airllm import AutoModel
+    model = AutoModel.from_pretrained(config.llm.airllm_model_path)
     input_text = f"[INST] {prompt} [/INST]"
     output = model.generate(
         input_text,
