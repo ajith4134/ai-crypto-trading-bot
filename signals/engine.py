@@ -78,9 +78,16 @@ def accept_or_reject(signal: dict, brain_state: dict) -> tuple[bool, str]:
 
 async def process_signals(pairs: list[str], brain_state: dict, engine) -> list[str]:
     """T-01 to T-04: Generate, filter, log all signals, start counterfactual tracking."""
+    import redis_client
+    r = redis_client.get()
     opened_trade_ids = []
+    max_open = int(r.get("bot:max_open_trades") or 999)
 
     for pair in pairs:
+        # Re-check open trade count each pair so we never exceed max_open
+        from memory.query import get_open_trades
+        if len(get_open_trades()) >= max_open:
+            break
         candidates = generate_candidate_signals(pair, brain_state)
         for signal in candidates:
             accepted, rejection_reason = accept_or_reject(signal, brain_state)
