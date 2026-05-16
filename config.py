@@ -123,8 +123,9 @@ class llm:
     ollama_url: str = _get(_cfg, "llm", "ollama_url")
     router_model: str = _get(_cfg, "llm", "router_model")
     decision_model: str = _get(_cfg, "llm", "decision_model")
-    airllm_model_path: str = _get(_cfg, "llm", "airllm_model_path")
-    airllm_tasks: list = _get(_cfg, "llm", "airllm_tasks")
+    llamacpp_url: str = _get(_cfg, "llm", "llamacpp_url")
+    llamacpp_model_path: str = _get(_cfg, "llm", "llamacpp_model_path")
+    llamacpp_tasks: list = _get(_cfg, "llm", "llamacpp_tasks")
     fallback_to_ml_on_llm_failure: bool = _get(_cfg, "llm", "fallback_to_ml_on_llm_failure")
     no_reflection_enforced: bool = _get(_cfg, "llm", "no_reflection_enforced")
 

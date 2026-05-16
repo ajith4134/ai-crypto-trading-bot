@@ -2,8 +2,11 @@
 I-05: Routes each LLM task to the correct runtime.
 
 Time-critical (Ollama): routing, debate, decision
-Background (AirLLM via Celery): strategy_research, opro_optimization,
+Background (llama.cpp via Celery): strategy_research, opro_optimization,
     ai_scientist, dgm_code_rewriting, sleep_consolidation, web_intel_interpretation
+
+NOTE: Blueprint specified AirLLM for background tasks. Replaced with llama.cpp
+GGUF (Q4_K_M) — same model (70B), same goal, CPU-only, no conversion needed.
 """
 import asyncio
 import structlog
@@ -21,9 +24,9 @@ async def route(task_name: str, prompt: str, **kwargs):
     """
     assert_no_reflection(prompt)
 
-    if task_name in config.llm.airllm_tasks:
+    if task_name in config.llm.llamacpp_tasks:
         raise ValueError(
-            f"Task '{task_name}' is an AirLLM background task. "
+            f"Task '{task_name}' is a llama.cpp background task. "
             "Submit it via Celery, not direct route() call."
         )
 

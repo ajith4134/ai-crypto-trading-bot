@@ -47,10 +47,10 @@ def _startup_checks() -> None:
         log.error("missing_ml_models", missing=missing)
         sys.exit(1)
 
-    # AirLLM model directory
-    airllm_path = Path(config.llm.airllm_model_path)
-    if not airllm_path.exists():
-        log.error("airllm_model_missing", path=str(airllm_path))
+    # llama.cpp GGUF model file (replaces AirLLM — see H-04 in TASKS.md for reason)
+    llamacpp_path = Path(config.llm.llamacpp_model_path)
+    if not llamacpp_path.exists():
+        log.error("llamacpp_model_missing", path=str(llamacpp_path))
         sys.exit(1)
 
     # Virtual balance init (paper mode)

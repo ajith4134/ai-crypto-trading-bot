@@ -55,9 +55,11 @@ llm:
   router_model: "phi3:mini"        # Phi-3 Mini — market regime routing, situation classification (1-3 sec)
   decision_model: "mistral:7b"     # Mistral 7B — Debate Council moderator, final trade decision (3-6 sec)
 
-  # AirLLM — Llama 3.1 70B, layer-by-layer inference, background tasks ONLY
-  airllm_model_path: "/models/llama-3.1-70b-4bit"
-  airllm_tasks:
+  # llama.cpp — Llama 3.1 70B Q4_K_M GGUF, background tasks ONLY
+  # ERROR: AirLLM conversion OOM-killed (needs ~132 GB RAM). ALTERNATIVE: llama.cpp GGUF.
+  llamacpp_url: "http://llama_cpp:8080"
+  llamacpp_model_path: "/models/llama-3.1-70b-gguf/Meta-Llama-3.1-70B-Instruct-Q4_K_M.gguf"
+  llamacpp_tasks:
     - strategy_research
     - opro_optimization
     - ai_scientist

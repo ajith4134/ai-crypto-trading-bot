@@ -30,22 +30,29 @@ services:
       - bot_net
     # Port 11434 NOT exposed externally — brain accesses via Docker network
 
-  airllm:
-    build: .
+  # llama_cpp replaces the original airllm service.
+  # ERROR: AirLLM conversion requires ~132 GB RAM (loads all shards simultaneously) — OOM-killed 3x.
+  # ALTERNATIVE: llama.cpp server with pre-quantized Q4_K_M GGUF.
+  # Same goal: CPU-only local 70B inference, ~4-8 GB peak RAM via memory-mapped GGUF.
+  llama_cpp:
+    image: ghcr.io/ggerganov/llama.cpp:server
     restart: unless-stopped
-    command: celery -A celery_app worker --queues=airllm --concurrency=1 --loglevel=info
-    env_file: .env
+    command: >
+      -m /models/llama-3.1-70b-gguf/Meta-Llama-3.1-70B-Instruct-Q4_K_M.gguf
+      --host 0.0.0.0
+      --port 8080
+      --ctx-size 4096
+      --threads 4
+      --n-predict 512
     volumes:
       - /models:/models
-    depends_on:
-      - redis
-      - postgres
     networks:
       - bot_net
     deploy:
       resources:
         limits:
-          memory: 5G
+          memory: 10G
+    # Port 8080 NOT exposed externally — celery_worker accesses via Docker network
 
   brain:
     build: .
@@ -101,7 +108,7 @@ services:
     depends_on:
       - redis
       - postgres
-      - airllm
+      - llama_cpp
     networks:
       - bot_net
     deploy:
@@ -134,7 +141,7 @@ services:
       - redis
       - postgres
       - ollama
-      - airllm
+      - llama_cpp
     networks:
       - bot_net
     deploy:
