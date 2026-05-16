@@ -56,7 +56,6 @@ class BinanceClient:
             api_key=config.BINANCE_API_KEY,
             api_secret=config.BINANCE_API_SECRET,
             testnet=config.BINANCE_TESTNET,
-            futures_url="https://testnet.binancefuture.com" if config.BINANCE_TESTNET else None,
         )
         log.info("binance_client_ready", testnet=config.BINANCE_TESTNET)
 
