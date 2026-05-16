@@ -1,6 +1,6 @@
 // AI-07: Panel 5 — Open Trades Table (all 15 columns, live updates)
 import React, { useContext, useEffect, useState } from 'react';
-import { getOpenTrades } from '../api';
+import { getOpenTradesFull } from '../api';
 import { WsContext } from '../context';
 import { card, title, Table } from './shared';
 
@@ -10,7 +10,7 @@ const OpenTradesTable: React.FC = () => {
   const evt = useContext(WsContext);
 
   const [totalPnl, setTotalPnl] = useState(0);
-  const refresh = () => getOpenTrades().then((res: any) => {
+  const refresh = () => getOpenTradesFull().then((res: any) => {
     if (Array.isArray(res)) { setTrades(res); }
     else { setTrades(res.trades || []); setTotalPnl(res.total_open_pnl || 0); }
   }).catch(()=>{});

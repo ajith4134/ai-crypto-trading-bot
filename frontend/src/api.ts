@@ -23,7 +23,8 @@ export const login = (username: string, password: string) =>
 export const getBotStatus      = () => api.get('/bot/status').then(r => r.data);
 export const setBotMode        = (mode: string) => api.post('/bot/mode', null, { params: { mode } });
 export const setBotSettings    = (s: object) => api.put('/bot/settings', s);
-export const getOpenTrades     = () => api.get('/trades/open').then(r => r.data);
+export const getOpenTrades     = () => api.get('/trades/open').then(r => Array.isArray(r.data) ? r.data : (r.data?.trades || []));
+export const getOpenTradesFull  = () => api.get('/trades/open').then(r => r.data);  // includes total_open_pnl
 export const getClosedTrades   = (params?: object) => api.get('/trades/closed', { params }).then(r => r.data);
 export const getBrainStatus    = () => api.get('/brain/status').then(r => r.data);
 export const getAnalytics      = () => api.get('/analytics/metrics').then(r => r.data);
