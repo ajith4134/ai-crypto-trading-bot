@@ -1,0 +1,91 @@
+trading:
+  mode: paper                    # paper | live — controlled via dashboard or .env
+  paper_trade_threshold: 2000    # minimum closed paper trades before live is unlocked
+  max_active_pairs: 60
+  min_open_trades: 3
+  max_open_trades: 15
+  max_total_capital_pct: 80      # never deploy more than 80% of account capital at once
+
+capital:
+  per_trade_min_pct: 5           # minimum capital per trade as % of account
+  per_trade_max_pct: 30          # maximum capital per trade as % of account
+  leverage_min: 5
+  leverage_max: 20               # hard cap — never exceeded under any condition
+  dca_trigger_1_pct: -20         # first DCA at -20% from original entry (long) / +20% (short)
+  dca_trigger_2_pct: -40         # second DCA at -40% from original entry (long) / +40% (short)
+  dca_rounds_max: 2
+
+risk:
+  daily_loss_limit_pct: 5        # live mode only — pause new opens if daily loss > 5%
+  max_drawdown_pct: 15           # live mode only — pause new opens if drawdown > 15% from peak
+  circuit_breaker_live_only: true
+
+brain:
+  evolution_stage: 1
+  stage_1_to_2_trades: 100       # Stage 1→2: 100 closed paper trades (no performance requirement)
+  stage_2_to_3_trades: 500       # Stage 2→3: 500 closed paper trades + win rate ≥ 45%
+  stage_2_to_3_winrate: 45
+  stage_3_to_4_trades: 1500      # Stage 3→4: 1500 trades + win rate ≥ 52% + Sharpe ≥ 1.0
+  stage_3_to_4_winrate: 52
+  stage_3_to_4_sharpe: 1.0
+  live_unlock_trades: 2000        # Live unlock: 2000 trades + Stage 4 + win rate ≥ 52% + Sharpe ≥ 1.0
+  opro_window_size: 5             # run OPRO optimization every 5 closed trades
+  code_rewrite_interval_trades: 500  # DGM code rewriting every 500 trades
+
+curiosity:
+  exploration_budget_pct: 12     # 10-15% of paper trading capacity goes to exploration
+
+strategies:
+  trial_min_trades: 30           # new strategies must complete ≥30 paper trades before promotion
+  trial_min_days: 7              # AND ≥7 calendar days — whichever is reached last
+  counterfactual_window_hours: 72  # track rejected signals for 72 hours
+
+scanner:
+  rescan_interval_hours: 8
+  criteria_weights:
+    volume: 0.20
+    volatility: 0.25
+    spread: 0.15
+    win_rate: 0.30
+    pnl: 0.10
+
+llm:
+  # Ollama — fast models, always in RAM, used for time-critical decisions
+  ollama_url: "http://localhost:11434"
+  router_model: "phi3:mini"        # Phi-3 Mini — market regime routing, situation classification (1-3 sec)
+  decision_model: "mistral:7b"     # Mistral 7B — Debate Council moderator, final trade decision (3-6 sec)
+
+  # AirLLM — Llama 3.1 70B, layer-by-layer inference, background tasks ONLY
+  airllm_model_path: "/models/llama-3.1-70b-4bit"
+  airllm_tasks:
+    - strategy_research
+    - opro_optimization
+    - ai_scientist
+    - dgm_code_rewriting
+    - sleep_consolidation
+    - web_intel_interpretation
+
+  fallback_to_ml_on_llm_failure: true
+  no_reflection_enforced: true     # assert_no_reflection() called on every prompt
+
+memory:
+  fast_memory_size: 500            # Redis: last N trade IDs
+  sleep_consolidation_hour: 3      # run sleep consolidation at 3am UTC
+  opro_evaluation_window: 5        # evaluate OPRO improvement over N trades
+
+web_intelligence:
+  serpapi_searches_per_day: 8      # budget: 250/month free tier → 8/day
+  reddit_fetch_interval_minutes: 60
+  rss_fetch_interval_minutes: 30
+  github_fetch_interval_hours: 24
+  source_credibility_min_signals: 10  # new sources unweighted until ≥10 signals tracked
+
+notifications:
+  critical_alert_immediate: true
+  trade_alert_enabled: true
+  daily_summary_hour_utc: 8
+
+logging:
+  level: INFO
+  log_to_file: true
+  log_dir: /var/log/trading-bot

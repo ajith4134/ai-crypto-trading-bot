@@ -1,0 +1,28 @@
+-- E-02: strategies table (must exist before trades due to FK)
+CREATE TABLE IF NOT EXISTS strategies (
+    id                      UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    name                    TEXT NOT NULL,
+    status                  TEXT NOT NULL CHECK (status IN ('experimental', 'active', 'retired')),
+    created_at              TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    retired_at              TIMESTAMPTZ,
+    parent_strategy_id      UUID REFERENCES strategies(id),
+    generation              INTEGER NOT NULL DEFAULT 0,
+    source                  TEXT NOT NULL CHECK (source IN ('brain', 'web', 'self_play', 'research')),
+    code                    TEXT NOT NULL,
+    file_path               TEXT,
+    entry_conditions        JSONB,
+    exit_conditions         JSONB,
+    position_sizing_rules   JSONB,
+    dca_rules               JSONB,
+    trailing_sl_params      JSONB,
+    win_rate                NUMERIC(5,2),
+    avg_pnl_usdt            NUMERIC(12,4),
+    sharpe_ratio            NUMERIC(8,4),
+    sortino_ratio           NUMERIC(8,4),
+    max_drawdown_pct        NUMERIC(8,4),
+    profit_factor           NUMERIC(8,4),
+    trade_count             INTEGER NOT NULL DEFAULT 0,
+    paper_trade_count       INTEGER NOT NULL DEFAULT 0,
+    active_open_trades      INTEGER NOT NULL DEFAULT 0,
+    retirement_reason       TEXT
+);

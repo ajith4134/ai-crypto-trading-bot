@@ -1,0 +1,8 @@
+.env
+models/
+data/historical/
+logs/
+__pycache__/
+*.pyc
+.DS_Store
+*.egg-info/

@@ -1,0 +1,57 @@
+# Binance connectivity
+python-binance
+websockets
+
+# Database
+redis
+psycopg2-binary
+pgvector
+
+# ML / Deep Learning
+torch
+pytorch-forecasting
+torch-geometric
+transformers
+hmmlearn
+ruptures
+deap
+stable-baselines3
+finrl
+scikit-learn
+scipy
+numpy
+pandas
+
+# AirLLM — Llama 3.1 70B layer-by-layer inference (background tasks only)
+# Repo: https://github.com/lyogavin/airllm
+airllm
+
+# Web framework & API
+fastapi
+uvicorn[standard]
+python-jose[cryptography]
+passlib[bcrypt]
+pydantic
+
+# Task queue
+celery
+redis
+
+# Notifications
+python-telegram-bot
+
+# Web intelligence
+praw
+feedparser
+requests
+beautifulsoup4
+serpapi
+
+# Config & utilities
+pyyaml
+python-dotenv
+structlog
+
+# Testing
+pytest
+pytest-asyncio
