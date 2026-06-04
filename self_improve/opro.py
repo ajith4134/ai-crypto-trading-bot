@@ -46,7 +46,7 @@ def get_current_prompt() -> str:
 
 
 def save_new_prompt(new_prompt_json: str) -> None:
-    """AB-03: Write candidate prompt to brain_state."""
+    """AB-03: Write candidate prompt to brain_state AND publish addendum to Redis so brain consumes it."""
     import json as _json
     try:
         parsed = _json.loads(new_prompt_json)
@@ -61,8 +61,13 @@ def save_new_prompt(new_prompt_json: str) -> None:
             )
 
     r = redis_client.get()
+    # brain/soar.py _decide() reads this every cycle and splices it into the Ollama prompt.
+    # Cap length so a runaway LLM output can't poison every decision.
+    addendum = (parsed.get("new_prompt_section") or "").strip()[:500] if isinstance(parsed, dict) else ""
+    if addendum:
+        r.set("brain:executor_prompt_addendum", addendum)
     version = int(r.incr("brain:opro_prompt_version"))
-    log.info("opro_prompt_updated", version=version)
+    log.info("opro_prompt_updated", version=version, addendum_chars=len(addendum))
 
 
 def revert_prompt(previous_prompt_json: str) -> None:

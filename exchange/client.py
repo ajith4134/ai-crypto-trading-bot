@@ -78,26 +78,179 @@ class BinanceClient:
         positions = _backoff_call(self._client.futures_position_information, symbol=pair)
         return positions[0] if positions else {}
 
-    def place_market_order(self, pair: str, side: str, qty: float) -> dict:
+    def _get_step_size(self, pair: str) -> float:
+        """Return the LOT_SIZE stepSize for `pair`. Cached per-process.
+
+        Binance rejects orders whose quantity has more precision than the
+        symbol's stepSize allows (APIError -1111). This helper looks up the
+        step size from /fapi/v1/exchangeInfo and caches it.
+        """
+        if not hasattr(self, "_step_size_cache"):
+            self._step_size_cache: dict[str, float] = {}
+        if pair in self._step_size_cache:
+            return self._step_size_cache[pair]
+        try:
+            info = _backoff_call(self._client.futures_exchange_info)
+            for sym in info.get("symbols", []):
+                step = 0.001  # safe default for major pairs
+                for f in sym.get("filters", []):
+                    if f.get("filterType") == "LOT_SIZE":
+                        step = float(f.get("stepSize", 0.001))
+                        break
+                self._step_size_cache[sym["symbol"]] = step
+        except Exception:
+            pass
+        return self._step_size_cache.get(pair, 0.001)
+
+    def _round_qty(self, pair: str, qty: float) -> float:
+        """Round `qty` DOWN to the pair's stepSize multiple. Never returns 0."""
+        step = self._get_step_size(pair)
+        if step <= 0:
+            return qty
+        import math
+        rounded = math.floor(qty / step) * step
+        # Round to step's decimal precision to remove float artifacts
+        # (e.g. step=0.001 → 3 decimals)
+        step_str = f"{step:.10f}".rstrip("0").rstrip(".")
+        decimals = len(step_str.split(".")[1]) if "." in step_str else 0
+        return round(rounded, decimals)
+
+    def place_market_order(self, pair: str, side: str, qty: float,
+                           reduce_only: bool = False) -> dict:
+        """cont. 61 audit fix — Added `reduce_only` flag. CRITICAL:
+        without reduce_only=True on close orders, Binance one-way mode
+        treats a redundant close as a new opening trade. Audit 2026-05-29
+        found a TRXUSDT short closed twice (SL + another trigger fired
+        within 3s), the second BUY opened a 146-LONG that was never
+        intended. Callers MUST pass reduce_only=True for close/partial
+        orders (open and DCA orders correctly leave it False)."""
         _track_weight(1)
-        return _backoff_call(
-            self._client.futures_create_order,
-            symbol=pair,
-            side=side.upper(),
-            type="MARKET",
-            quantity=qty,
-        )
+        qty_rounded = self._round_qty(pair, qty)
+        if qty_rounded <= 0:
+            raise ValueError(
+                f"qty {qty} rounds to 0 at stepSize for {pair} — order too small")
+        # cont. 69: minNotional guard on OPENS only (reduce_only closes must
+        # always go through to flat the position regardless of notional). Binance
+        # rejects sub-minNotional opens with -4164/-1013; fail loudly here so the
+        # caller logs a clean reason instead of an opaque API error.
+        if not reduce_only:
+            try:
+                mn = self._get_min_notional(pair)
+                mark = float(self.get_mark_price(pair).get("markPrice") or 0)
+                notional = qty_rounded * mark
+                if mark > 0 and notional < mn:
+                    raise ValueError(
+                        f"notional {notional:.2f} < minNotional {mn:.2f} for "
+                        f"{pair} — open too small")
+            except ValueError:
+                raise
+            except Exception:
+                pass  # exchange-info/mark fetch failed → let the order attempt proceed
+        params = {
+            "symbol": pair,
+            "side": side.upper(),
+            "type": "MARKET",
+            "quantity": qty_rounded,
+        }
+        if reduce_only:
+            params["reduceOnly"] = True
+        return _backoff_call(self._client.futures_create_order, **params)
 
     def place_limit_order(self, pair: str, side: str, qty: float, price: float) -> dict:
         _track_weight(1)
+        qty_rounded = self._round_qty(pair, qty)
+        if qty_rounded <= 0:
+            raise ValueError(
+                f"qty {qty} rounds to 0 at stepSize for {pair} — order too small")
         return _backoff_call(
             self._client.futures_create_order,
             symbol=pair,
             side=side.upper(),
             type="LIMIT",
-            quantity=qty,
-            price=price,
+            quantity=qty_rounded,
+            price=self._round_price(pair, price),
             timeInForce="GTC",
+        )
+
+    # ── cont. 69: live SL must be an exchange-native STOP, not a LIMIT ────────
+    def _get_tick_size(self, pair: str) -> float:
+        """PRICE_FILTER tickSize for `pair` (cached). Binance rejects prices with
+        more precision than tickSize (APIError -1111). Mirrors _get_step_size."""
+        if not hasattr(self, "_tick_size_cache"):
+            self._tick_size_cache: dict[str, float] = {}
+        if pair in self._tick_size_cache:
+            return self._tick_size_cache[pair]
+        try:
+            info = _backoff_call(self._client.futures_exchange_info)
+            for sym in info.get("symbols", []):
+                tick = 0.0001
+                for f in sym.get("filters", []):
+                    if f.get("filterType") == "PRICE_FILTER":
+                        tick = float(f.get("tickSize", 0.0001))
+                        break
+                self._tick_size_cache[sym["symbol"]] = tick
+        except Exception:
+            pass
+        return self._tick_size_cache.get(pair, 0.0001)
+
+    def _round_price(self, pair: str, price: float) -> float:
+        """Round `price` to the pair's tickSize. Stop/limit prices that violate
+        tickSize are rejected with -1111."""
+        tick = self._get_tick_size(pair)
+        if tick <= 0:
+            return price
+        import math
+        rounded = round(price / tick) * tick
+        tick_str = f"{tick:.10f}".rstrip("0").rstrip(".")
+        decimals = len(tick_str.split(".")[1]) if "." in tick_str else 0
+        return round(rounded, decimals)
+
+    def _get_min_notional(self, pair: str) -> float:
+        """MIN_NOTIONAL for `pair` (cached). Binance rejects orders whose
+        notional (qty × price) is below this (APIError -4164/-1013)."""
+        if not hasattr(self, "_min_notional_cache"):
+            self._min_notional_cache: dict[str, float] = {}
+        if pair in self._min_notional_cache:
+            return self._min_notional_cache[pair]
+        try:
+            info = _backoff_call(self._client.futures_exchange_info)
+            for sym in info.get("symbols", []):
+                mn = 5.0
+                for f in sym.get("filters", []):
+                    if f.get("filterType") in ("MIN_NOTIONAL", "NOTIONAL"):
+                        mn = float(f.get("notional", f.get("minNotional", 5.0)))
+                        break
+                self._min_notional_cache[sym["symbol"]] = mn
+        except Exception:
+            pass
+        return self._min_notional_cache.get(pair, 5.0)
+
+    def change_leverage(self, pair: str, leverage: int) -> dict:
+        """Set per-symbol leverage on Binance BEFORE opening. Without this, live
+        uses whatever leverage the account already has on the symbol (often the
+        20x default), not the bot's intended per-trade leverage → wrong margin /
+        liquidation distance and possible margin-reject. Idempotent on Binance."""
+        _track_weight(1)
+        lev = max(1, int(leverage))
+        return _backoff_call(self._client.futures_change_leverage,
+                             symbol=pair, leverage=lev)
+
+    def place_stop_market_order(self, pair: str, side: str,
+                                stop_price: float) -> dict:
+        """Place an exchange-native STOP_MARKET that closes the WHOLE remaining
+        position when `stop_price` triggers. closePosition=True means: no qty
+        needed (always flats the position, so it stays correct after partial
+        TPs), reduceOnly is implied, and Binance auto-cancels it when the
+        position closes. Used for the trailing SL (cont. 69)."""
+        _track_weight(1)
+        return _backoff_call(
+            self._client.futures_create_order,
+            symbol=pair,
+            side=side.upper(),
+            type="STOP_MARKET",
+            stopPrice=self._round_price(pair, stop_price),
+            closePosition="true",
+            workingType="MARK_PRICE",
         )
 
     def cancel_order(self, pair: str, order_id: int) -> dict:
@@ -107,6 +260,12 @@ class BinanceClient:
     def get_order_status(self, pair: str, order_id: int) -> dict:
         _track_weight(1)
         return _backoff_call(self._client.futures_get_order, symbol=pair, orderId=order_id)
+
+    def get_open_interest(self, pair: str) -> float:
+        """Return current open interest in base-asset units (weight=1)."""
+        _track_weight(1)
+        result = _backoff_call(self._client.futures_open_interest, symbol=pair)
+        return float(result.get("openInterest", 0))
 
     # --- G-03: All USDT-M futures symbols ---
 

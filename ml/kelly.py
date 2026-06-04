@@ -27,23 +27,47 @@ def _clamp(pct: float) -> float:
     return max(config.capital.per_trade_min_pct, min(config.capital.per_trade_max_pct, pct))
 
 
+def _mark_called(result_pct: float) -> None:
+    """Durable evidence for feature_health: each Kelly call bumps a counter
+    and writes the latest sizing decision. Without this, the only evidence
+    F16 fires was the brain-process log line `kelly_sizing` — unreadable from
+    a container-internal checker."""
+    try:
+        import time as _t
+        import redis_client as _rc
+        r = _rc.get()
+        r.incr("kelly:call_count")
+        r.set("kelly:last_call_ts", str(int(_t.time())))
+        r.set("kelly:last_pct", str(result_pct))
+    except Exception:
+        pass
+
+
 def get_position_size_pct(paper_closed_count: int) -> float:
     """Return capital % based on trade count phase."""
     if paper_closed_count < 50:
-        return float(config.capital.per_trade_min_pct)
+        out = float(config.capital.per_trade_min_pct)
+        _mark_called(out)
+        return out
 
     from memory.query import get_recent_trades
     trades = get_recent_trades(min(paper_closed_count, 200))
     if not trades:
-        return float(config.capital.per_trade_min_pct)
+        out = float(config.capital.per_trade_min_pct)
+        _mark_called(out)
+        return out
 
     wins = [t for t in trades if (t.get("net_pnl_usdt") or 0) > 0]
     losses = [t for t in trades if (t.get("net_pnl_usdt") or 0) <= 0]
     if not wins or not losses:
-        return float(config.capital.per_trade_min_pct)
+        out = float(config.capital.per_trade_min_pct)
+        _mark_called(out)
+        return out
 
     win_rate = len(wins) / len(trades) * 100
     avg_win = sum(float(t["net_pnl_usdt"]) for t in wins) / len(wins)
     avg_loss = sum(abs(float(t["net_pnl_usdt"])) for t in losses) / len(losses)
 
-    return compute_kelly(win_rate, avg_win, avg_loss)
+    out = compute_kelly(win_rate, avg_win, avg_loss)
+    _mark_called(out)
+    return out

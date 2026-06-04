@@ -76,8 +76,32 @@ def update_account_metrics(exchange_client=None) -> None:
         except Exception as exc:
             log.error("account_metrics_update_failed", error=str(exc))
     else:
+        # Paper mode: compute account metrics from open trades and virtual balance
         balance = float(r.get(redis_keys.VIRTUAL_BALANCE) or 0)
         r.set(redis_keys.ACCOUNT_BALANCE, balance)
+
+        trades = get_open_trades()
+        unrealised = 0.0
+        total_notional = 0.0
+        deployed_capital = 0.0
+
+        for t in trades:
+            mark = float(r.get(redis_keys.MARK_PRICE.replace("{pair}", t["pair"])) or 0)
+            entry = float(t.get("average_entry") or t.get("entry_price") or 0)
+            qty = float(t.get("quantity") or 0)
+            capital = float(t.get("capital_usdt") or 0)
+            direction_sign = 1.0 if t.get("direction") == "long" else -1.0
+            deployed_capital += capital
+            if entry > 0 and mark > 0 and qty > 0:
+                unrealised += (mark - entry) * qty * direction_sign
+                total_notional += mark * qty
+
+        total_account = balance + deployed_capital
+        margin_ratio = round(deployed_capital / total_account, 6) if total_account > 0 else 0
+
+        r.set(redis_keys.MARGIN_RATIO, margin_ratio)
+        r.set(redis_keys.UNREALISED_PNL, round(unrealised, 4))
+        r.set(redis_keys.TOTAL_EXPOSURE, round(total_notional, 2))
 
 
 def update_position_risk() -> None:
@@ -121,14 +145,21 @@ def update_position_risk() -> None:
 
 
 def check_dca_reserve(capital_usdt: float) -> tuple[bool, str]:
-    """P-04: Verify free balance covers position + 2 DCA rounds before open_trade."""
+    """P-04: Verify free balance covers position + DCA reserve before open_trade.
+
+    Cont. 43 (2026-05-24): when `dca_rounds_max <= 0` the DCA system is off,
+    so the 2x reserve collapses to 1x (entry only). Frees ~50% capital
+    previously held for rounds that empirically never produced profit."""
     r = redis_client.get()
     if config.TRADING_MODE == "live":
         free = float(r.get(redis_keys.ACCOUNT_BALANCE) or 0)
     else:
         free = float(r.get(redis_keys.VIRTUAL_BALANCE) or 0)
 
-    total_needed = capital_usdt * (1 + 0.5 + 0.5)
+    if config.capital.dca_rounds_max <= 0:
+        total_needed = capital_usdt
+    else:
+        total_needed = capital_usdt * (1 + 0.5 + 0.5)
     if free < total_needed:
         return False, "insufficient_dca_reserve"
     return True, "ok"

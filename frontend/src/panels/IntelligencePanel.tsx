@@ -13,10 +13,13 @@ const IntelligencePanel: React.FC = () => {
     if (evt?.channel === 'trade_opened') getOpenTrades().then(setTrades).catch(()=>{});
   }, [evt]);
 
+  const hasBrainAction = (ba: any) =>
+    ba && typeof ba === 'object' && !Array.isArray(ba) && Object.keys(ba).length > 0;
+
   const rows = trades.map(t => [
     t.pair, t.direction?.toUpperCase(), t.strategy_id?.slice(0,8)||'—',
-    t.trade_potential_score||'—', t.direction_confidence||'—',
-    t.brain_actions?.length||0,
+    t.trade_potential_score?.toFixed(1)||'—', t.direction_confidence?.toFixed(1)||'—',
+    hasBrainAction(t.brain_actions) ? '✓' : '—',
   ]);
 
   return (

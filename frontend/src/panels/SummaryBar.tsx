@@ -23,16 +23,22 @@ const SummaryBar: React.FC = () => {
     </div>
   );
 
-  const unrealColour = (s.unrealised_pnl || 0) >= 0 ? '#00ff88' : '#ff4444';
-  const realisedColour = (s.realised_pnl || 0) >= 0 ? '#00ff88' : '#ff4444';
+  const unreal = +(s.unrealised_pnl || 0);
+  const realised = +(s.realised_pnl || 0);
+  const totalPnl = unreal + realised;
 
+  const isLive = s.mode === 'live';
   return (
     <div style={{ display: 'flex', flexWrap: 'wrap', gap: 0, marginBottom: 12 }}>
-      {tile('Virtual Balance', `$${(s.virtual_balance || 0).toLocaleString(undefined, { maximumFractionDigits: 2 })}`, '#00d4ff')}
-      {tile('Unrealised P&L', fmt(s.unrealised_pnl || 0, 4), unrealColour)}
-      {tile('Realised P&L', fmt(s.realised_pnl || 0, 4), realisedColour)}
-      {tile('Open Trades', String(s.open_count || 0), '#ffaa00')}
-      {tile('Closed Trades', String(s.closed_count || 0), '#888')}
+      {/* cont. 66 — live mode shows BOTH the real Binance balance and the
+          trading budget; paper mode shows just the virtual balance. */}
+      {isLive && s.real_balance != null &&
+        tile('Binance Balance', `$${(s.real_balance || 0).toLocaleString(undefined, { maximumFractionDigits: 2 })}`, '#f0b90b')}
+      {tile(isLive ? 'Trading Budget' : 'Virtual Balance', `$${(s.virtual_balance || 0).toLocaleString(undefined, { maximumFractionDigits: 2 })}`, '#00d4ff')}
+      {tile('Open P&L', fmt(unreal, 2), unreal >= 0 ? '#00ff88' : '#ff4444')}
+      {tile('Realised P&L', fmt(realised, 2), realised >= 0 ? '#00ff88' : '#ff4444')}
+      {tile('Total P&L', fmt(totalPnl, 2), totalPnl >= 0 ? '#00ff88' : '#ff4444')}
+      {tile('Open / Closed', `${s.open_count || 0} / ${s.closed_count || 0}`, '#ffaa00')}
       {tile('Win Rate', `${(s.win_rate || 0).toFixed(1)}%`, (s.win_rate || 0) >= 50 ? '#00ff88' : '#ff8800')}
     </div>
   );

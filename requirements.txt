@@ -20,9 +20,20 @@ scikit-learn
 scipy
 numpy
 pandas
+xgboost
 
 # NOTE: airllm removed — replaced by llama.cpp GGUF (see TASKS.md H-04)
 # NOTE: finrl removed — FinRL has complex deps; MARL uses stable-baselines3 directly
+
+# cont. 54 — P2 Chronos-2 foundation forecaster (zero-shot 1h forecasts).
+# Auto-defers to F19 TFT once trusted; cold-start fallback otherwise.
+# ml/foundation_forecast.py is cold-start-safe: returns None when the
+# package isn't importable, so the install failing won't break the bot.
+chronos-forecasting
+huggingface_hub
+
+# cont. 54 — P1 Mamba SSM forecaster runs on PURE PyTorch (no mamba-ssm
+# CUDA kernel dependency). Implementation is in ml/mamba_forecaster.py.
 
 # Web framework & API
 fastapi
@@ -54,7 +65,11 @@ pyyaml
 python-dotenv
 structlog
 
+# F49 Autonomous Self-Training Orchestrator (cont. 47) — Bayesian HPO
+optuna
+
 # Testing
 pytest
 pytest-asyncio
 docker
+hdbscan>=0.8.33  # Phase A cont. 55 — online cluster prediction

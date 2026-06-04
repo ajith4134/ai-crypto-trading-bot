@@ -1,0 +1,31 @@
+ Container trading-bot-postgres-1 Running 
+ Container trading-bot-pretrainer-run-da8a560a660e Creating 
+ Container trading-bot-pretrainer-run-da8a560a660e Created 
+2026-05-27 10:40:48 [info     ] pretrainer_torch_config        interop_threads=2 mkldnn=True num_threads=4
+2026-05-27 10:40:48 [info     ] pretrainer_started             active_trading_pairs=200 download_pairs=300
+2026-05-27 10:40:49 [info     ] db_pool_ready                  max=10 min=2
+2026-05-27 10:40:50 [info     ] binance_client_ready           testnet=True
+2026-05-27 10:40:51 [info     ] total_usdt_m_pairs_available   count=527
+2026-05-27 10:40:51 [info     ] pretraining_on_pairs           count=300
+2026-05-27 10:40:51 [info     ] step_1_downloading_ohlcv       note='~1800 files across 6 timeframes'
+2026-05-27 10:40:51 [info     ] ohlcv_complete                 pairs=300
+2026-05-27 10:40:51 [info     ] step_2_training_hmm_skipped    file=hmm_regime.pkl reason=checkpoint_already_exists size_mb=0.0
+2026-05-27 10:40:51 [info     ] step_3_saving_tft_architecture_skipped file=tft.pth reason=checkpoint_already_exists size_mb=0.5
+2026-05-27 10:40:51 [info     ] step_4_saving_patchtst_architecture_skipped file=patchtst.pth reason=checkpoint_already_exists size_mb=0.4
+2026-05-27 10:40:51 [info     ] step_5_training_gnn_with_correlation_skipped file=gnn.pth reason=checkpoint_already_exists size_mb=0.0
+2026-05-27 10:40:51 [info     ] step_6_saving_world_model_architecture_skipped file=world_model.pth reason=checkpoint_already_exists size_mb=0.3
+2026-05-27 10:40:51 [info     ] step_7_training_candlenet_1m
+2026-05-27 10:40:51 [info     ] candlenet_1m_training_start    note='CNN-GRU on 1min OHLCV+HA+patterns, ~282K samples'
+2026-05-27 10:41:13 [info     ] candlenet_train_data_ready     interval=1m pairs=300 samples=92700
+2026-05-27 10:41:15 [info     ] candlenet_gaf_precompute_start interval=1m samples=92700
+2026-05-27 10:41:21 [info     ] candlenet_gaf_precompute_progress done=10000 elapsed_s=5.4 interval=1m total=92700
+2026-05-27 10:41:28 [info     ] candlenet_gaf_precompute_progress done=20000 elapsed_s=12.4 interval=1m total=92700
+2026-05-27 10:41:33 [info     ] candlenet_gaf_precompute_progress done=30000 elapsed_s=17.7 interval=1m total=92700
+2026-05-27 10:41:39 [info     ] candlenet_gaf_precompute_progress done=40000 elapsed_s=23.8 interval=1m total=92700
+2026-05-27 10:41:45 [info     ] candlenet_gaf_precompute_progress done=50000 elapsed_s=29.6 interval=1m total=92700
+2026-05-27 10:41:51 [info     ] candlenet_gaf_precompute_progress done=60000 elapsed_s=36.1 interval=1m total=92700
+2026-05-27 10:41:58 [info     ] candlenet_gaf_precompute_progress done=70000 elapsed_s=42.6 interval=1m total=92700
+2026-05-27 10:42:04 [info     ] candlenet_gaf_precompute_progress done=80000 elapsed_s=48.5 interval=1m total=92700
+2026-05-27 10:42:09 [info     ] candlenet_gaf_precompute_progress done=90000 elapsed_s=53.9 interval=1m total=92700
+2026-05-27 10:42:11 [info     ] candlenet_gaf_precompute_done  cache_mb=2669.8 elapsed_s=55.3 interval=1m samples=92700
+

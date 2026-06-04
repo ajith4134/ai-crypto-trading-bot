@@ -7,16 +7,25 @@ import OpenTradesTable from './panels/OpenTradesTable';
 import ClosedTradesTable from './panels/ClosedTradesTable';
 import SignalMonitor from './panels/SignalMonitor';
 import PairScanner from './panels/PairScanner';
+import LaunchPad from './panels/LaunchPad';
 import StrategyPanel from './panels/StrategyPanel';
 import DirectionPanel from './panels/DirectionPanel';
+import DirectionWinRate from './panels/DirectionWinRate';
 import PerformanceAnalytics from './panels/PerformanceAnalytics';
 import AccountRisk from './panels/AccountRisk';
 import SystemHealth from './panels/SystemHealth';
 import WebIntelPanel from './panels/WebIntelPanel';
 import FeatureHealth from './panels/FeatureHealth';
+import FeatureFiringHealth from './panels/FeatureFiringHealth';
+import LLMProvidersPanel from './panels/LLMProvidersPanel';
+import HedgeLearnedParamsPanel from './panels/HedgeLearnedParamsPanel';
+import MemoryClustersPanel from './panels/MemoryClustersPanel';
+import DecoderFeedPanel from './panels/DecoderFeedPanel';
+import SelfPlayLOBPanel from './panels/SelfPlayLOBPanel';
 import TelegramLog from './panels/TelegramLog';
 import MLModelsPanel from './panels/MLModelsPanel';
 import IntelligencePanel from './panels/IntelligencePanel';
+import AIIntelligencePanel from './panels/AIIntelligencePanel';
 
 import { WsEvent, WsContext } from './context';
 import SummaryBar from './panels/SummaryBar';
@@ -87,11 +96,20 @@ const App: React.FC = () => {
           <div style={{gridColumn:'1 / -1'}}><OpenTradesTable /></div>
           <SignalMonitor />
           <PairScanner />
+          <LaunchPad />
           <StrategyPanel />
+          <AIIntelligencePanel />
           <DirectionPanel />
+          <DirectionWinRate />
           <div style={{gridColumn:'1 / -1'}}><ClosedTradesTable /></div>
           <WebIntelPanel />
           <FeatureHealth />
+          <FeatureFiringHealth />
+          <LLMProvidersPanel />
+          <HedgeLearnedParamsPanel />
+          <MemoryClustersPanel />
+          <SelfPlayLOBPanel />
+          <div style={{gridColumn:'1 / -1'}}><DecoderFeedPanel /></div>
           <TelegramLog />
           <div style={{gridColumn:'1 / -1'}}><PerformanceAnalytics /></div>
           <AccountRisk />

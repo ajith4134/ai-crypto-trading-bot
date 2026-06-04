@@ -7,15 +7,46 @@ import redis_keys
 
 log = structlog.get_logger()
 _MODEL_PATH = Path("models/tft.pth")
-_model = None
+_model       = None
+_last_mtime  = 0.0
 
 
 def _load():
-    global _model
-    if _model is None and _MODEL_PATH.exists():
+    """Mtime-based cache invalidation so brain picks up freshly-pretrained TFT
+    without container restart (matches the pattern used in direction_model.py
+    and world_model/model.py). Resets `_model` cache when on-disk file changes."""
+    global _model, _last_mtime
+    if not _MODEL_PATH.exists():
+        return _model
+    mtime = _MODEL_PATH.stat().st_mtime
+    if _model is not None and mtime == _last_mtime:
+        return _model
+    try:
         import torch
-        _model = torch.load(_MODEL_PATH, map_location="cpu")
+        from ml.architectures import TFTModel, inject_into_main
+        inject_into_main()  # so legacy torch.save(model) .pth files load
+        checkpoint = torch.load(_MODEL_PATH, map_location="cpu", weights_only=False)
+        if isinstance(checkpoint, dict):
+            # state_dict format (current). New TFT architecture has more keys than the
+            # old LSTM stub — load_state_dict will raise on mismatch so old .pth files
+            # can't be silently loaded into the new architecture.
+            m = TFTModel()
+            try:
+                m.load_state_dict(checkpoint)
+            except Exception as exc:
+                log.warning("tft_state_dict_mismatch_must_repretrain",
+                            error=str(exc)[:200])
+                return _model
+            _model = m
+        else:
+            # Legacy full-pickle format — wrong architecture now, refuse and warn.
+            log.warning("tft_legacy_full_pickle_must_repretrain")
+            return _model
         _model.eval()
+        _last_mtime = mtime
+        log.info("tft_model_loaded", mtime=round(mtime, 2))
+    except Exception as exc:
+        log.warning("tft_load_failed", error=str(exc)[:200])
     return _model
 
 
@@ -34,15 +65,33 @@ def get_price_forecast(pair: str, timeframe: str) -> dict:
         candles_raw = r.lrange(redis_keys.CANDLES.replace("{pair}", pair).replace("{interval}", timeframe), 0, 99)
         if len(candles_raw) < 10:
             return {}
-        import torch, numpy as np
+        import torch
         closes = [float(json.loads(c)["c"]) for c in reversed(candles_raw)]
-        arr = torch.tensor(closes, dtype=torch.float32).unsqueeze(0).unsqueeze(-1)
+
+        # NORMALIZATION CONTRACT (must match pretrainer/main.py:train_tft):
+        # divide every close by closes[0] so the model sees scale-invariant
+        # relative prices. After forward pass, multiply quantile outputs by
+        # closes[0] to recover absolute prices. Without this, the model trained
+        # on relative inputs would receive raw $50000+ scalars and produce garbage.
+        anchor = closes[0] if closes[0] > 0 else 1.0
+        closes_norm = [c / anchor for c in closes]
+        arr = torch.tensor(closes_norm, dtype=torch.float32).unsqueeze(0).unsqueeze(-1)
         with torch.no_grad():
             out = model(arr)
-        forecast = {"q10": float(out[0][0]), "q50": float(out[0][1]), "q90": float(out[0][2])}
+        # Unnormalize: q*_relative * anchor = q*_absolute
+        forecast = {
+            "q10": float(out[0][0]) * anchor,
+            "q50": float(out[0][1]) * anchor,
+            "q90": float(out[0][2]) * anchor,
+        }
+        # Forecast TTL was 300s; with 100 active pairs and ~5s brain cycle each
+        # pair is touched every ~8min so the cache expired BETWEEN touches and
+        # F19 contributed zero to direction_confidence most of the time. 1h
+        # quantile forecasts are reasonably stable over 30 min — raise TTL so
+        # the per-signal lazy compute actually amortises across the active set.
         r.set(
             redis_keys.PRICE_FORECAST.replace("{pair}", pair).replace("{interval}", timeframe),
-            json.dumps(forecast), ex=300,
+            json.dumps(forecast), ex=1800,
         )
         return forecast
     except Exception as exc:

@@ -23,7 +23,8 @@ def update_competence_map(trade: dict) -> None:
         with conn.cursor() as cur:
             cur.execute("SELECT competence_map FROM brain_state WHERE id=1")
             row = cur.fetchone()
-            cmap = json.loads(row[0]) if row and row[0] else {}
+            raw = row[0] if row else None
+            cmap = raw if isinstance(raw, dict) else (json.loads(raw) if raw else {})
 
     # Update rolling scores per domain
     for domain_key, metric_val in [
@@ -73,21 +74,42 @@ def get_priority_learning_gap(every_n_trades: int = 50, trade_count: int = 0) ->
     return worst_domain
 
 
-def evaluate_self_improvement_mechanisms(trade_count: int) -> dict:
-    """AC-04: Track whether each mechanism is producing measurable improvement."""
-    results = {}
+def evaluate_self_improvement_mechanisms(trade_count: int,
+                                          min_samples: int = 10,
+                                          window_days: int = 7) -> dict:
+    """AC-04: Track whether each mechanism is producing measurable improvement.
+
+    Returns a dict keyed by experiment_type with:
+      {mechanism: {success_rate, samples, neutral_excluded}}
+
+    Mechanisms with fewer than `min_samples` non-neutral experiments are omitted
+    from the result entirely — too noisy to act on. `neutral` outcomes are counted
+    in the total but not the success numerator (avoids penalising first-run / data-
+    pending paths).
+    """
+    results: dict = {}
 
     with db_conn() as conn:
         with conn.cursor() as cur:
-            cur.execute("""
-                SELECT experiment_type, AVG(CASE WHEN outcome = 'positive' THEN 1 ELSE 0 END) as success_rate
+            cur.execute(f"""
+                SELECT
+                  experiment_type,
+                  COUNT(*) FILTER (WHERE outcome IN ('positive','negative')) AS n_decided,
+                  SUM(CASE WHEN outcome = 'positive' THEN 1 ELSE 0 END)::float
+                    / NULLIF(COUNT(*) FILTER (WHERE outcome IN ('positive','negative')), 0)
+                    AS success_rate
                 FROM experiments
-                WHERE created_at > NOW() - INTERVAL '7 days'
+                WHERE created_at > NOW() - INTERVAL '{int(window_days)} days'
                 GROUP BY experiment_type
             """)
             for row in cur.fetchall():
-                results[row[0]] = round(float(row[1] or 0) * 100, 1)
-
+                etype, n_decided, success_rate = row
+                if (n_decided or 0) < min_samples:
+                    continue
+                results[etype] = {
+                    "success_rate_pct": round(float(success_rate or 0) * 100, 1),
+                    "samples": int(n_decided),
+                }
     return results
 
 

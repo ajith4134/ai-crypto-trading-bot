@@ -1,0 +1,526 @@
+PHASE A CODE PATCH DRAFT (companion to Migration 027 — applied 2026-05-29).
+
+Scope:
+  Part 1 — Write-through patches across 7 existing files (~75 LOC). Keeps
+           existing tp1/tp2 behavior intact; in parallel populates new `tp`
+           column with the SAME value as tp1. Reads use COALESCE(tp, tp1).
+           No functional change to trade entry/exit logic in this phase.
+  Part 2 — 3 NEW pattern/ module files: __init__.py, clusterer.py, registry.py.
+  Part 3 — 1 NEW pretrainer file: pattern_cluster_train.py.
+
+NOT in this draft (deferred to later phases):
+  - Single-TP 100% close behavior (Phase C — gated on predictor existing)
+  - celery_app.py new beat tasks `update_pattern_registry` + `cleanup_stale_predictions`
+  - dashboard/api.py UI surfacing of tp column / pattern cluster
+  - prediction/refresh_loop.py + prediction/xgb_predictor.py (Phase B)
+
+================================================================================
+PART 1 — WRITE-THROUGH PATCHES (7 files, ~75 LOC)
+================================================================================
+
+The principle: every site that writes tp1 also writes tp (same value). Every
+site that reads tp1 from Redis uses COALESCE(tp, tp1) (or the Python equivalent
+for Redis reads). This is reversible (revert to ignoring tp; functional state
+unchanged) and lets the new `tp` column accumulate consistent data.
+
+────────────────────────────────────────────────────────────────────────────────
+FILE 1: risk/manager.py
+────────────────────────────────────────────────────────────────────────────────
+
+@@ around line 283-290 — _compute_tp_targets fallback path, add `tp` to return
+
+         tp1_pct = vol_unit * 1.5 * 100.0   # % units
+         tp2_pct = vol_unit * 3.0 * 100.0
+         tp1 = entry_price * (1.0 + (tp1_pct / 100.0) * sign)
+         tp2 = entry_price * (1.0 + (tp2_pct / 100.0) * sign)
+         return {
+             "tp1":       round(float(tp1), 8),
+             "tp2":       round(float(tp2), 8),
++            # Phase A write-through (cont. 55): single `tp` mirrors tp1.
++            # Phase C will replace this with predictor output.
++            "tp":        round(float(tp1), 8),
+             "mag1_pct":  None,
+             "mag3_pct":  None,
+         }
+
+@@ around line 298-309 — _compute_tp_targets main path, add `tp` to return
+
+     tp1 = entry_price * (1.0 + (abs(mag1_avg) / 100.0) * sign)
+     tp2 = entry_price * (1.0 + (abs(mag3_avg) / 100.0) * sign)
+
+     # tp2 must be further from entry than tp1 in the favourable direction
+     if (sign > 0 and tp2 <= tp1) or (sign < 0 and tp2 >= tp1):
+         tp2 = entry_price * (1.0 + (abs(mag1_avg) * 2.0 / 100.0) * sign)
+     return {
+         "tp1":       round(float(tp1), 8),
+         "tp2":       round(float(tp2), 8),
++        # Phase A write-through.
++        "tp":        round(float(tp1), 8),
+         "mag1_pct":  round(float(mag1_avg), 4),
+         "mag3_pct":  round(float(mag3_avg), 4),
+     }
+
+(No changes required at lines 456-614 — TP firing logic reads from Redis
+`trade:{id}:tp1` / `tp2` which signals/engine.py keeps writing through. The new
+behavior — close 100% at single tp — comes in Phase C, NOT here.)
+
+────────────────────────────────────────────────────────────────────────────────
+FILE 2: signals/engine.py  (around line 2008-2021 — TP target persistence)
+────────────────────────────────────────────────────────────────────────────────
+
+@@ around line 2008 — also write Redis `trade:{id}:tp`
+
+                             r.set(f"trade:{trade_id}:tp1", _tps["tp1"])
+                             r.set(f"trade:{trade_id}:tp2", _tps["tp2"])
++                            # Phase A write-through.
++                            r.set(f"trade:{trade_id}:tp", _tps.get("tp", _tps["tp1"]))
+
+@@ around line 2014 — UPDATE trades to write tp column too
+
+                                 "tp1_target": _tps["tp1"],
+                                 "tp2_target": _tps["tp2"],
++                                "tp_target":  _tps.get("tp", _tps["tp1"]),
+                                 "mag1_pct": _tps.get("mag1_pct"),
+                                 "mag3_pct": _tps.get("mag3_pct"),
+
+(Verify that the surrounding statement is an UPDATE / parameterized write; if
+the bot uses an ORM mapping the new field is automatically picked up by the
+column-name mapping. If it uses raw SQL with named columns, the SQL string
+needs `tp_target = %(tp_target)s` adjacent to `tp1_target = %(tp1_target)s`.)
+
+────────────────────────────────────────────────────────────────────────────────
+FILE 3: memory/write.py
+────────────────────────────────────────────────────────────────────────────────
+
+@@ around line 109 — add tp_target to the trade-memory column list
+
+         "tp1_target", "tp2_target", "mag1_pct", "mag3_pct",
++        "tp_target",
+         ...
+
+@@ around line 183-187 — also delete tp Redis key on trade closure
+
+             r.delete(
+                 f"trade:{trade_id}:tp1",
+                 f"trade:{trade_id}:tp2",
++                f"trade:{trade_id}:tp",
+                 ...
+                 f"trade:{trade_id}:tp1_fired",
++                f"trade:{trade_id}:tp_fired",
+             )
+
+────────────────────────────────────────────────────────────────────────────────
+FILE 4: execution/paper.py  (3 sites: lines 76, 165, 212)
+────────────────────────────────────────────────────────────────────────────────
+
+@@ line 76 — cleanup includes tp_fired key
+
+                          f"trade:{trade_id}:tp1_fired")
++                         f"trade:{trade_id}:tp_fired",
+
+@@ line 165 — cleanup includes tp key
+
+                 r.delete(f"trade:{trade_id}:tp1", f"trade:{trade_id}:tp2",
++                         f"trade:{trade_id}:tp",
+                          ...)
+
+@@ line 212 — same pattern
+                 (same fix as line 165)
+
+────────────────────────────────────────────────────────────────────────────────
+FILE 5: execution/live.py  (3 sites: lines 138, 181, 218 — mirror paper.py)
+────────────────────────────────────────────────────────────────────────────────
+
+(Identical pattern to paper.py — add `trade:{id}:tp` and `trade:{id}:tp_fired`
+to the delete keys at all 3 sites.)
+
+────────────────────────────────────────────────────────────────────────────────
+FILE 6: dashboard/api.py  (4 sites)
+────────────────────────────────────────────────────────────────────────────────
+
+@@ around line 671-676 — surface tp_fired flag (mirror tp1_fired pattern)
+
+         # F48 §Idea B — surface the tp1_fired Redis flag so the open-trades
+         # table shows when a partial take-profit has been hit.
++        # Phase A: also surface tp_fired so Phase C can switch the UI over
++        # without another patch round-trip.
+         try:
+             t["tp1_fired"] = (r.get(f"trade:{t.get('id')}:tp1_fired") == "1")
++            t["tp_fired"]  = (r.get(f"trade:{t.get('id')}:tp_fired") == "1") or t["tp1_fired"]
+         except Exception:
+             t["tp1_fired"] = False
++            t["tp_fired"]  = False
+
+@@ around line 1087 — SELECT list includes tp_target
+
+                    tp1_target, tp2_target, mag1_pct, mag3_pct,
++                   tp_target,
+
+────────────────────────────────────────────────────────────────────────────────
+FILE 7: risk/frontier/llm_council.py  (6 sites: lines 44-47, 206-207)
+────────────────────────────────────────────────────────────────────────────────
+
+@@ around line 44-47 — accept either tp1 or tp as the trigger source
+
+     tp1_fired = r.get(f"trade:{trade_id}:tp1_fired") == "1"
++    tp_fired  = r.get(f"trade:{trade_id}:tp_fired")  == "1"
++    # Phase A: either flag triggers. Phase C will drop tp1 path.
++    any_tp_fired = tp1_fired or tp_fired
+     council_seen_tp1 = r.get(f"llm_council:tp1_seen:{trade_id}") == "1"
+-    if tp1_fired and not council_seen_tp1:
++    if any_tp_fired and not council_seen_tp1:
+         return True, "tp1_just_fired"
+
+@@ around line 206-207 — unchanged (consume side)
+
+
+================================================================================
+PART 2 — NEW pattern/ MODULE FILES
+================================================================================
+
+────────────────────────────────────────────────────────────────────────────────
+NEW FILE: pattern/__init__.py
+────────────────────────────────────────────────────────────────────────────────
+
+"""Pattern clustering + effectiveness registry (cont. 55).
+
+See /opt/trading-bot/next_impl/predict_all_before_open.md.
+"""
+
+────────────────────────────────────────────────────────────────────────────────
+NEW FILE: pattern/clusterer.py
+────────────────────────────────────────────────────────────────────────────────
+
+"""HDBSCAN clustering on CandleNet embeddings (Phase A.2).
+
+Used by:
+  - pattern_cluster_train.py — offline batch trainer
+  - prediction/refresh_loop.py (Phase B) — online cluster prediction per signal
+
+Persistence:
+  models/pattern_clusters.pkl  — fitted HDBSCAN + centroid table
+"""
+from __future__ import annotations
+import pickle
+import os
+from pathlib import Path
+import structlog
+
+log = structlog.get_logger()
+
+_MODEL_PATH = Path(os.environ.get("PATTERN_CLUSTERS_PATH",
+                                  "/app/models/pattern_clusters.pkl"))
+
+
+def fit_clusters(embeddings, min_cluster_size: int = 50):
+    """Batch-fit HDBSCAN on a (N, EMBED_DIM) embedding matrix.
+    Returns the fitted clusterer + per-cluster centroid array."""
+    import hdbscan
+    import numpy as np
+
+    n_samples = len(embeddings)
+    adaptive_min = max(min_cluster_size, n_samples // 500)
+
+    clusterer = hdbscan.HDBSCAN(
+        min_cluster_size=adaptive_min,
+        min_samples=10,
+        metric="euclidean",
+        cluster_selection_method="eom",
+        prediction_data=True,  # required for online predict_cluster
+    )
+    labels = clusterer.fit_predict(embeddings)
+
+    # Compute centroids for offline analytics (mean of cluster members).
+    unique_labels = sorted(set(labels) - {-1})  # -1 is noise
+    centroids = {}
+    for cid in unique_labels:
+        mask = labels == cid
+        centroids[int(cid)] = np.asarray(embeddings)[mask].mean(axis=0)
+
+    log.info("pattern_clusters_fit",
+             n_samples=n_samples,
+             n_clusters=len(unique_labels),
+             n_noise=int((labels == -1).sum()),
+             min_cluster_size=adaptive_min)
+
+    return clusterer, centroids, labels
+
+
+def save(clusterer, centroids, model_version: str) -> None:
+    _MODEL_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with open(_MODEL_PATH, "wb") as f:
+        pickle.dump({
+            "clusterer":     clusterer,
+            "centroids":     centroids,
+            "model_version": model_version,
+        }, f)
+    log.info("pattern_clusters_saved", path=str(_MODEL_PATH),
+             model_version=model_version)
+
+
+def load() -> dict | None:
+    if not _MODEL_PATH.exists():
+        return None
+    try:
+        with open(_MODEL_PATH, "rb") as f:
+            return pickle.load(f)
+    except Exception as exc:
+        log.warning("pattern_clusters_load_failed", error=str(exc)[:200])
+        return None
+
+
+def predict_cluster(embedding) -> tuple[int, float]:
+    """Online: return (cluster_id, strength) for a single embedding.
+    cluster_id = -1 means noise / unknown.
+    strength ∈ [0, 1] is HDBSCAN's membership strength (higher = more confident).
+    """
+    import hdbscan
+    import numpy as np
+
+    blob = load()
+    if blob is None:
+        return -1, 0.0
+    clusterer = blob["clusterer"]
+    try:
+        emb_2d = np.asarray(embedding).reshape(1, -1)
+        labels, strengths = hdbscan.approximate_predict(clusterer, emb_2d)
+        return int(labels[0]), float(strengths[0])
+    except Exception as exc:
+        log.debug("pattern_cluster_predict_failed", error=str(exc)[:120])
+        return -1, 0.0
+
+
+────────────────────────────────────────────────────────────────────────────────
+NEW FILE: pattern/registry.py
+────────────────────────────────────────────────────────────────────────────────
+
+"""pattern_effectiveness_registry CRUD + on-close updater (Phase A.3).
+
+Schema reference: migrations/027_predict_all_schema.sql (table
+pattern_effectiveness_registry).
+
+Called by:
+  - celery_app.update_pattern_registry beat task (Phase A — to be added later)
+  - Phase B/C predict gates via lookup()
+"""
+from __future__ import annotations
+import structlog
+from db import db_conn
+
+log = structlog.get_logger()
+
+
+def lookup(pattern_cluster_id: int, market_regime: str, direction: str) -> dict | None:
+    """Return registry row for (cluster, regime, direction) or None if missing."""
+    if pattern_cluster_id is None or pattern_cluster_id < 0:
+        return None
+    with db_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT n_trades, n_wins, avg_rr, avg_hold_seconds,
+                       net_pnl_usdt, calibration_ece, drift_flagged
+                FROM pattern_effectiveness_registry
+                WHERE pattern_cluster_id = %s AND market_regime = %s AND direction = %s
+            """, (pattern_cluster_id, market_regime, direction))
+            row = cur.fetchone()
+    if row is None:
+        return None
+    n_trades, n_wins, avg_rr, avg_hold, net_pnl, ece, drift = row
+    return {
+        "pattern_cluster_id": pattern_cluster_id,
+        "market_regime":      market_regime,
+        "direction":          direction,
+        "n_trades":           int(n_trades or 0),
+        "n_wins":             int(n_wins or 0),
+        "win_rate":           (n_wins / n_trades) if n_trades else None,
+        "avg_rr":             float(avg_rr) if avg_rr is not None else None,
+        "avg_hold_seconds":   int(avg_hold) if avg_hold is not None else None,
+        "net_pnl_usdt":       float(net_pnl or 0),
+        "calibration_ece":    float(ece) if ece is not None else None,
+        "drift_flagged":      bool(drift),
+    }
+
+
+def update_on_close(trade_id: str) -> dict | None:
+    """Recompute the registry row for the (cluster, regime, direction) tied to
+    `trade_id`. Idempotent — recomputes from all closed trades in that bucket.
+
+    Returns updated row dict or None if the trade has no pattern_cluster_id."""
+    with db_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT pattern_cluster_id, market_regime, direction
+                FROM trades WHERE id = %s
+            """, (trade_id,))
+            row = cur.fetchone()
+    if not row:
+        log.debug("pattern_registry_update_trade_not_found", trade_id=trade_id)
+        return None
+    cluster_id, regime, direction = row
+    if cluster_id is None or cluster_id < 0:
+        return None
+    # Re-aggregate all closed trades in this bucket. Idempotent.
+    with db_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT
+                  COUNT(*) AS n_trades,
+                  COUNT(*) FILTER (WHERE net_pnl_usdt > 0) AS n_wins,
+                  AVG(actual_rr) AS avg_rr,
+                  AVG(hold_time_seconds)::int AS avg_hold,
+                  SUM(net_pnl_usdt) AS net_pnl
+                FROM trades
+                WHERE pattern_cluster_id = %s
+                  AND market_regime = %s
+                  AND direction = %s
+                  AND closed_at IS NOT NULL
+            """, (cluster_id, regime, direction))
+            n_trades, n_wins, avg_rr, avg_hold, net_pnl = cur.fetchone()
+            cur.execute("""
+                INSERT INTO pattern_effectiveness_registry
+                  (pattern_cluster_id, market_regime, direction,
+                   n_trades, n_wins, avg_rr, avg_hold_seconds, net_pnl_usdt,
+                   last_updated)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, NOW())
+                ON CONFLICT (pattern_cluster_id, market_regime, direction)
+                DO UPDATE SET
+                  n_trades         = EXCLUDED.n_trades,
+                  n_wins           = EXCLUDED.n_wins,
+                  avg_rr           = EXCLUDED.avg_rr,
+                  avg_hold_seconds = EXCLUDED.avg_hold_seconds,
+                  net_pnl_usdt     = EXCLUDED.net_pnl_usdt,
+                  last_updated     = NOW()
+            """, (cluster_id, regime, direction,
+                  int(n_trades or 0), int(n_wins or 0),
+                  float(avg_rr) if avg_rr is not None else None,
+                  int(avg_hold) if avg_hold is not None else None,
+                  float(net_pnl or 0)))
+            conn.commit()
+    log.info("pattern_registry_updated",
+             cluster_id=cluster_id, regime=regime, direction=direction,
+             n_trades=int(n_trades or 0), n_wins=int(n_wins or 0))
+    return lookup(cluster_id, regime, direction)
+
+
+================================================================================
+PART 3 — NEW pretrainer/pattern_cluster_train.py
+================================================================================
+
+"""Offline batch trainer for HDBSCAN pattern clusters (Phase A.2).
+
+Reads closed-trade CandleNet embeddings, fits HDBSCAN, persists clusters,
+backfills `trades.pattern_cluster_id` for historical rows.
+
+Run via:
+  docker exec -it trading-bot-brain-1 python -m pretrainer.pattern_cluster_train
+"""
+from __future__ import annotations
+import argparse
+import sys
+import structlog
+
+log = structlog.get_logger()
+
+
+def _gather_embeddings(limit: int | None = None):
+    """Pull (trade_id, CandleNet embedding) for every closed trade.
+
+    IMPLEMENTATION NOTE — DEFERRED:
+    The actual embedding-extraction interface depends on how ml/candlenet.py
+    surfaces per-trade embeddings today. Two paths:
+      (a) Embeddings already cached at trade-open time in Redis
+          `trade:{id}:candlenet_embedding` — read from there.
+      (b) Re-run CandleNet inference on stored OHLCV for each closed trade —
+          slower, requires loading the trained model.
+
+    First-pass implementation: try (a); fall back to (b) for any trade missing
+    the cached embedding. This function is the seam where that decision lands.
+    """
+    raise NotImplementedError(
+        "Resolve embedding-extraction path before running. "
+        "See docstring."
+    )
+
+
+def train_and_persist(min_cluster_size: int = 50,
+                      limit: int | None = None,
+                      model_version: str = "v1") -> dict:
+    from pattern.clusterer import fit_clusters, save
+    from db import db_conn
+    import numpy as np
+
+    rows = _gather_embeddings(limit=limit)
+    trade_ids = np.array([r[0] for r in rows])
+    embeddings = np.stack([r[1] for r in rows])
+
+    clusterer, centroids, labels = fit_clusters(embeddings, min_cluster_size)
+    save(clusterer, centroids, model_version)
+
+    # Backfill trades.pattern_cluster_id.
+    n_backfilled = 0
+    with db_conn() as conn:
+        with conn.cursor() as cur:
+            for tid, cid in zip(trade_ids, labels):
+                if cid < 0:
+                    continue  # skip noise
+                cur.execute("""
+                    UPDATE trades SET pattern_cluster_id = %s WHERE id = %s
+                """, (int(cid), str(tid)))
+                n_backfilled += 1
+            conn.commit()
+
+    log.info("pattern_cluster_train_done",
+             n_trades_clustered=int(n_backfilled),
+             n_clusters=len(centroids),
+             model_version=model_version)
+    return {"n_backfilled": n_backfilled, "n_clusters": len(centroids)}
+
+
+if __name__ == "__main__":
+    p = argparse.ArgumentParser()
+    p.add_argument("--min-cluster-size", type=int, default=50)
+    p.add_argument("--limit", type=int, default=None)
+    p.add_argument("--model-version", default="v1")
+    args = p.parse_args()
+    res = train_and_persist(
+        min_cluster_size=args.min_cluster_size,
+        limit=args.limit,
+        model_version=args.model_version,
+    )
+    sys.exit(0 if res["n_backfilled"] > 0 else 1)
+
+
+================================================================================
+DEPLOY STEPS (after user approval, in order)
+================================================================================
+
+1. Apply Part 1 patches (write-through) to all 7 files. ~75 LOC total.
+2. Verify Python syntax: `python3 -m py_compile risk/manager.py signals/engine.py memory/write.py execution/paper.py execution/live.py dashboard/api.py risk/frontier/llm_council.py`
+3. Create Part 2 + Part 3 files:
+   - `mkdir -p /opt/trading-bot/pattern`
+   - Write pattern/__init__.py, pattern/clusterer.py, pattern/registry.py, pretrainer/pattern_cluster_train.py
+4. Add `hdbscan` to requirements.txt if not present:
+   - `pip show hdbscan 2>&1 | head -3` — verify presence first
+5. Resolve embedding-extraction path in _gather_embeddings() (TODO in docstring).
+6. Rebuild Docker: `cd /opt/trading-bot && docker compose build brain celery_worker celery_beat`
+7. Restart: `docker compose up -d brain celery_worker celery_beat`
+8. Verify within 5 min:
+   - `redis-cli GET trade:<some_open_trade>:tp` should populate as new trades fire
+   - `SELECT COUNT(*) FROM trades WHERE tp IS NOT NULL AND tp1 IS NOT NULL` should grow
+   - `SELECT COUNT(*) FROM trades WHERE tp = tp1` should be 100% (write-through invariant)
+9. Run `python -m pretrainer.pattern_cluster_train` (after step 5 resolved) to populate `trades.pattern_cluster_id` historically.
+10. Verify `SELECT pattern_cluster_id, COUNT(*) FROM trades WHERE pattern_cluster_id IS NOT NULL GROUP BY 1` produces sane cluster distribution.
+
+ROLLBACK:
+- Code: revert the 7 file patches + delete pattern/ + pretrainer/pattern_cluster_train.py.
+- DB: run rollback SQL block at bottom of migrations/027_predict_all_schema.sql.
+- Pickle: delete /opt/trading-bot/models/pattern_clusters.pkl.
+
+OPEN VERIFICATION ITEMS (resolve at apply-time)
+1. Confirm `hdbscan` is installed inside the brain container (it's a heavy native dep).
+   If not, add to requirements.txt + rebuild adds ~30s to build time.
+2. Resolve embedding-extraction path in pretrainer/pattern_cluster_train.py:_gather_embeddings.
+3. Confirm `dashboard/api.py:1087` SELECT statement context — it may be inside a
+   larger SQL string that needs the new column added before a comma boundary.
+4. signals/engine.py:2014 site — UPDATE vs INSERT, named vs positional params:
+   line context will determine the exact patch shape.

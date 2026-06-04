@@ -1,5 +1,6 @@
 """Q-01 to Q-07: Telegram alert system."""
 import asyncio
+import concurrent.futures
 import time
 from collections import defaultdict
 import structlog
@@ -17,10 +18,22 @@ async def _send(message: str) -> None:
     await bot.send_message(chat_id=config.TELEGRAM_CHAT_ID, text=message, parse_mode="HTML")
 
 
+def _run_sync(coro):
+    """Run a coroutine from any context. If called inside a running event loop
+    (e.g. async watchdog tick), runs the coroutine on a worker thread so we don't
+    crash with 'This event loop is already running'."""
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return asyncio.run(coro)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+        return pool.submit(asyncio.run, coro).result()
+
+
 def send_critical(message: str) -> None:
     """Q-02: Send immediately, no rate limiting — for emergencies."""
     try:
-        asyncio.get_event_loop().run_until_complete(_send(f"🚨 <b>CRITICAL</b>\n{message}"))
+        _run_sync(_send(f"🚨 <b>CRITICAL</b>\n{message}"))
         log.info("telegram_critical_sent")
     except Exception as exc:
         log.error("telegram_send_failed", error=str(exc))
@@ -54,7 +67,7 @@ def send_trade_alert(event_type: str, data: dict) -> None:
         msg = f"{event_type}: {data}"
 
     try:
-        asyncio.get_event_loop().run_until_complete(_send(msg))
+        _run_sync(_send(msg))
     except Exception as exc:
         log.error("telegram_trade_alert_failed", error=str(exc))
 
@@ -70,7 +83,7 @@ def send_daily_summary(data: dict) -> None:
         f"Top Pair: {data.get('top_pair', 'N/A')}"
     )
     try:
-        asyncio.get_event_loop().run_until_complete(_send(msg))
+        _run_sync(_send(msg))
     except Exception as exc:
         log.error("telegram_daily_summary_failed", error=str(exc))
 
@@ -83,7 +96,7 @@ def send_weekly_report(data: dict) -> None:
         f"Brain Stage: {data.get('brain_stage', 1)}"
     )
     try:
-        asyncio.get_event_loop().run_until_complete(_send(msg))
+        _run_sync(_send(msg))
     except Exception as exc:
         log.error("telegram_weekly_report_failed", error=str(exc))
 
@@ -97,6 +110,6 @@ def send_monthly_report(data: dict) -> None:
         f"Best Strategy: {data.get('best_strategy', 'N/A')}"
     )
     try:
-        asyncio.get_event_loop().run_until_complete(_send(msg))
+        _run_sync(_send(msg))
     except Exception as exc:
         log.error("telegram_monthly_report_failed", error=str(exc))

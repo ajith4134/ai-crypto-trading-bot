@@ -16,7 +16,15 @@ services:
   redis:
     image: redis:7-alpine
     restart: unless-stopped
-    command: redis-server --maxmemory 1gb --maxmemory-policy allkeys-lru --save ""
+    # cont. 68c: persistence MANDATORY. Prior `--save ""` + appendonly off meant
+    # every host reboot wiped ALL runtime config (feature flags, trail kill switch,
+    # weights) — the recurring "keys got wiped" root cause. AOF + RDB on a named
+    # volume now survives both reboots and `compose up -d` recreations.
+    # volatile-lru (not allkeys-lru) so config keys WITHOUT a TTL are never evicted.
+    # maxmemory 768mb: this box has only 3.8 GB RAM total — 1gb was unsafe headroom.
+    command: redis-server --maxmemory 768mb --maxmemory-policy volatile-lru --appendonly yes --save "60 100 300 10"
+    volumes:
+      - redis_data:/data
     networks:
       - bot_net
     # NOT exposed externally
@@ -27,39 +35,86 @@ services:
     environment:
       # Unload models after 5 min idle so llama.cpp background tasks get full RAM
       OLLAMA_KEEP_ALIVE: "5m"
+      # cont. 65k — RAM cap. Without these Ollama held 3 models resident at once
+      # (mistral:7b + phi3:mini + nomic-embed = 8.8 GB) on a 19 GB box, leaving
+      # ~400 MB free and starving CandleNet training + the evolution worker.
+      # MAX_LOADED_MODELS=2 keeps at most one gen model + the small embedder
+      # resident (~5.3 GB); every feature still requests its own model, Ollama
+      # just evicts LRU instead of hoarding. No hard mem_limit — a cgroup
+      # ceiling would OOM-kill mid-inference (worse than capping load).
+      # cont. 68b: was MAX_LOADED_MODELS=1 (despite this comment saying 2) —
+      # that made decide()'s phi3:mini and the RAG nomic-embed THRASH/reload
+      # against each other (~18s cold-start each). And NUM_PARALLEL=1 serialized
+      # the debate's 3 concurrent decide() calls (bull/bear/risk) → 3×~80s ≈
+      # 265s, blowing the 30s per-agent timeout → 8 consecutive decide failures.
+      # Box has 6 CPUs + ~12 GB free, so: 2 resident models, 3 parallel slots
+      # (one per debate agent). KV-cache growth is small for phi3:mini.
+      OLLAMA_MAX_LOADED_MODELS: "2"
+      # cont. 69: host went 6→8 cores. ROOT CAUSE of "always degraded": the
+      # F37 debate fired 3 concurrent decide() calls while ollama was capped at
+      # cpus:3.0 with NUM_PARALLEL=3 / NUM_THREADS=3 → 3 parallel inferences
+      # split 3 cores = ~1 core each → phi3 blew the 60s timeout every time.
+      # cont. 69 redesign: debate is now a SINGLE batched decide() call
+      # (debate.council batched_mode), so 1 latency-critical inference at a time.
+      # Give that one call the cores: PARALLEL=2 (one gen + one nomic-embed for
+      # the postmortem RAG can overlap), THREADS=5 so a lone debate call uses the
+      # whole 5-core cgroup. cpus bumped 3→5 below (box now has 8).
+      OLLAMA_NUM_PARALLEL: "2"
+      OLLAMA_NUM_THREADS: "5"
     volumes:
       - ollama_models:/root/.ollama
     networks:
       - bot_net
     # Port 11434 NOT exposed externally — brain accesses via Docker network
-
-  # llama_cpp replaces the original airllm service.
-  # ERROR: AirLLM conversion requires ~132 GB RAM (loads all shards simultaneously) — OOM-killed 3x.
-  # ALTERNATIVE: llama.cpp server with pre-quantized Q4_K_M GGUF.
-  # Same goal: CPU-only local 70B inference, ~4-8 GB peak RAM via memory-mapped GGUF.
-  llama_cpp:
-    build:
-      context: .
-      dockerfile: Dockerfile.llamacpp
-    restart: unless-stopped
-    volumes:
-      - /models:/models
-    networks:
-      - bot_net
+    # cont. 68b: cap to 3 cores (was 2). The thread-cap fix freed enough load
+    # headroom to give the latency-critical LLM another core without re-starving
+    # the trading/forecast/training path (which are also capped).
     deploy:
       resources:
         limits:
-          memory: 10G
-    # Port 8080 NOT exposed externally — celery_worker accesses via Docker network
+          cpus: "5.0"   # cont. 69: 3→5 (host 6→8 cores). Leaves 3 cores for
+                        # the trading/forecast/training path. Inference is now
+                        # bursty (1 batched debate call), not 3 sustained, so 5
+                        # cores during a burst won't starve the rest.
+
+  # llama_cpp service removed 2026-05-20.
+  # History: blueprint specified AirLLM Llama 3.1 70B for background tasks
+  # → AirLLM conversion needs ~132 GB RAM (loads all shards), OOM-killed
+  # → switched to llama.cpp serving the 42.5 GB Q4_K_M GGUF
+  # → on 16 GB / 4-core host the model never finished loading (1007 restarts,
+  #   each restart re-ran the multi-minute CPU tensor repack from block 0)
+  # Replacement: 3-provider cloud failover (Groq → Cerebras → SambaNova) all
+  # hosting Llama 3.3 70B on OpenAI-compatible APIs. Same blueprint task set,
+  # same 70B parameter class, fail-soft across providers. See
+  # llm/researcher.py and BLUEPRINT_COMPLIANCE_AUDIT.md for the deviation
+  # record (cloud-hosted vs blueprint's "all local" intent).
 
   brain:
-    build: .
+    image: trading-bot-app:latest
     restart: unless-stopped
     command: python main.py
     env_file: .env
     volumes:
       - /models:/models
-      - ./models:/app/models
+      - /opt/trading-bot/models:/app/models
+      # cont. 65k — deploy the PCG missing-forecast→OFI-fallback fix
+      # (signals/engine.py) WITHOUT an image rebuild (disk ~90% full). The
+      # brain runs process_signals → generate_candidate_signals, so the engine
+      # change must be live here. Revert to baked image once disk is healthy.
+      - ./signals:/app/signals
+      # cont. 65k Layer 2a — ml/tf_fusion.py (new) for the learned TF-fusion the
+      # cascade calls; the model file lands in the shared /app/models mount.
+      - ./ml:/app/ml
+      # cont. 65k — risk/manager.py SL/TP placement redesign (mag clip + TP/SL
+      # ceilings) must be live where trades open + trailing runs.
+      - ./risk:/app/risk
+      # cont. 65k-5 — memory/write.py whitelist now includes canonical tp1/tp2/tp
+      # columns (dashboard source) so new trades persist them, not just *_target.
+      - ./memory:/app/memory
+      # cont. 2026-06-04 — brain/ (soar.py SOAR loop: macro-veto demotion, decide
+      # timeout) now bind-mounted so iterating on the brain loop is restart-only,
+      # not a 13-min image rebuild. Keep host brain/ as the source of truth.
+      - ./brain:/app/brain
     depends_on:
       - postgres
       - redis
@@ -72,10 +127,20 @@ services:
           memory: 2G
 
   data_feed:
-    build: .
+    image: trading-bot-app:latest
     restart: unless-stopped
     command: python -m data.feed
     env_file: .env
+    volumes:
+      # data_feed runs ml/gnn, ml/patchtst, ml/transfer_entropy, ml/mutual_info inference
+      # on a schedule. Without this mount it reads stale .pth files baked into the image
+      # at build time, not the current pretrained checkpoints. Rule 4 finding 2026-05-18.
+      - /opt/trading-bot/models:/app/models
+      # cont. 69x — candle-source migration. _poll_candles/_poll_short_candles now build
+      # the CANDLES list from the WS-fed CSV corpus (the deep history the live klines:ws
+      # zset lacks, e.g. 300×1h for PatchTST) instead of /fapi/v1/klines. Read-only: the
+      # corpus is WRITTEN by the celery incremental_ws worker, never by data_feed.
+      - /opt/trading-bot/data/historical:/app/data/historical:ro
     depends_on:
       - redis
       - postgres
@@ -86,11 +151,78 @@ services:
         limits:
           memory: 1G
 
+  micro_ws:
+    # cont. 66 — tick-level order-book microstructure (data/micro_ws.py).
+    # Maintains local order books from Binance USDT-M futures diff-depth
+    # streams and writes the same {pair}:micro:* keys as the REST poller at
+    # sub-second cadence. No models mount needed (pure feature math).
+    image: trading-bot-app:latest
+    restart: unless-stopped
+    command: python -m data.micro_ws
+    env_file: .env
+    # cont. 66 — code (data/micro_ws.py, signals/microstructure.py) is baked
+    # into the image; no source bind-mounts needed.
+    depends_on:
+      - redis
+    networks:
+      - bot_net
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+
+  # cont. 69x — WS klines corpus feed (data/kline_ws.py). Streams CLOSED mainnet
+  # candles (1m/5m/15m/30m/1h) into Redis sorted sets klines:ws:{pair}:{itv}; the
+  # hourly corpus task merges them with ZERO fapi REST (retires the /fapi/v1/klines
+  # hammer). Source bind-mounted so no image rebuild was needed to add this service.
+  kline_ws:
+    image: trading-bot-app:latest
+    restart: unless-stopped
+    command: python -m data.kline_ws
+    env_file: .env
+    volumes:
+      - ./data/kline_ws.py:/app/data/kline_ws.py:ro
+    depends_on:
+      - redis
+    networks:
+      - bot_net
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+
+  # cont. 69x item 2 — real-time liquidation flow feed (data/liq_ws.py). Streams
+  # !forceOrder@arr (all-market forced liquidations) and maintains a rolling
+  # per-pair notional window in Redis ({pair}:liq_flow_dir/intensity, liq:global_rate).
+  # Feeds F58 entry bonus (data/liquidation_levels.get_bonus) + the exit
+  # liq-cascade kill switch. NEW free WS source — replaces no REST. Source
+  # bind-mounted so no image rebuild was needed to add this service.
+  liq_ws:
+    image: trading-bot-app:latest
+    restart: unless-stopped
+    command: python -m data.liq_ws
+    env_file: .env
+    volumes:
+      - ./data/liq_ws.py:/app/data/liq_ws.py:ro
+    depends_on:
+      - redis
+    networks:
+      - bot_net
+    deploy:
+      resources:
+        limits:
+          memory: 384M
+
   scanner:
-    build: .
+    image: trading-bot-app:latest
     restart: unless-stopped
     command: python -m scanner.main
     env_file: .env
+    volumes:
+      # cont. 66 — deploy the volatility-weight boost + raised dead-pair floor
+      # (scanner/main.py) WITHOUT an image rebuild (matches the cont. 65k
+      # bind-mount pattern). Revert to baked image when next rebuilt.
+      - ./scanner:/app/scanner
     depends_on:
       - redis
       - postgres
@@ -102,14 +234,13 @@ services:
           memory: 512M
 
   web_intel:
-    build: .
+    image: trading-bot-app:latest
     restart: unless-stopped
     command: python -m web_intel.collector
     env_file: .env
     depends_on:
       - redis
       - postgres
-      - llama_cpp
     networks:
       - bot_net
     deploy:
@@ -118,10 +249,23 @@ services:
           memory: 512M
 
   dashboard:
-    build: .
+    image: trading-bot-app:latest
     restart: unless-stopped
     command: uvicorn dashboard.api:app --host 0.0.0.0 --port 8000
     env_file: .env
+    # cont. 52f — dashboard reads /app/models/* for its /models endpoint to
+    # decide each model's status (active / stale / missing). Without this
+    # mount the dashboard sees only the .pth files baked into the image at
+    # build time, so CandleNet 1m/5m/15m (trained AFTER the last dashboard
+    # build) show "missing" forever even though they exist on the host and
+    # are loaded fine by brain/data_feed/celery_worker. Mirrors the same
+    # mount used by every other service that touches /app/models.
+    volumes:
+      - /opt/trading-bot/models:/app/models
+      # cont. 66 — close-all / mode-switch run in this process and call
+      # _purge_trade_row; mount ./memory so the predictions-FK purge fix
+      # (else trades stay stuck 'open') is live here too, not just in brain.
+      - ./memory:/app/memory
     depends_on:
       - redis
       - postgres
@@ -134,31 +278,240 @@ services:
           memory: 512M
 
   celery_worker:
-    build: .
+    image: trading-bot-app:latest
     restart: unless-stopped
-    command: celery -A celery_app worker --queues=default --concurrency=2 --loglevel=info
+    # Worker consumes both queues. task_routes in celery_app.py was supposed to
+    # collapse all "queue=airllm" tasks (opro_optimize, research_strategy,
+    # generate_hypothesis, etc.) onto "default" but in practice the decorator
+    # queue wins and tasks pile up in airllm. Consuming both queues is the
+    # simplest correct fix; one worker handles everything.
+    # Concurrency=2 — matches Ollama's effective single-threaded server-side
+    # throughput. Bumping to 4 caused 3rd/4th workers to hit the 300s HTTP
+    # read timeout while waiting in Ollama's queue.
+    #
+    # Queue split (cont. 40 follow-up): web_intel interpret_and_store calls
+    # take ~120-300s each and were filling the default queue. Routed them
+    # to a dedicated `web_intel` queue so fast tasks (DGM, research, retrain)
+    # land in default and aren't blocked. Worker consumes default first,
+    # then airllm/celery, then web_intel as the lowest-priority drain.
+    command: celery -A celery_app worker --queues=default,airllm,celery,web_intel --concurrency=3 --loglevel=info
     env_file: .env
+    # HF model cache — CryptoBERT (~440MB) + FinBERT (~440MB) + tokenizer
+    # overhead persist on host so container rebuilds don't re-download.
+    # See ml/sentiment.py — celery_worker is the inference host (background only).
+    environment:
+      - HF_HOME=/app/.hf_cache
+      - TRANSFORMERS_CACHE=/app/.hf_cache
+      # cont. 68b: cap BLAS/OMP threads to 1. This worker runs non-latency-critical
+      # self-improvement (OPRO/research/self-play/AI-scientist); without a cap each
+      # numpy op grabbed all 6 cores × concurrency 3 → massive oversubscription.
+      - OMP_NUM_THREADS=1
+      - OPENBLAS_NUM_THREADS=1
+      - MKL_NUM_THREADS=1
+      - NUMEXPR_NUM_THREADS=1
+      - TORCH_NUM_THREADS=1
     volumes:
-      - ./models:/app/models
+      - /opt/trading-bot/models:/app/models
+      - ./hf_cache:/app/.hf_cache
+      # cont. 65k — deploy the CLOUD-PRIMARY llm/researcher.py WITHOUT an image
+      # rebuild (disk 90% full). The image still ships the old local-primary
+      # researcher.py, which made interpret_and_store/web-intel tasks spend ~280s
+      # on Ollama, jamming all worker slots and starving the OFI producer on the
+      # `default` queue → stale OFI → no signals → no trades. Cloud-primary drops
+      # those tasks to ~3s when cloud is available. celery_app.py mounted too so
+      # the cont. 65k `llm`-queue routing is consistent once the dedicated llm
+      # worker lands (follow-up; needs a rebuild window to deploy routing to all
+      # enqueuers). Revert to baked image once disk is healthy.
+      - ./llm:/app/llm
+      - ./celery_app.py:/app/celery_app.py
+      # cont. 66 — Pool GA evolution task (evolve_strategy_pool_task) imports
+      # research.engine.evolve_strategy_pool at runtime; mount ./research so the
+      # new function is live on the worker without an image rebuild (matches the
+      # cont. 65k bind-mount deploy pattern). Revert to baked image when rebuilt.
+      - ./research:/app/research
+      # cont. 65k — sync_new_scanner_symbols runs here (default queue) and writes
+      # training CSVs for newly-added scanner symbols.
+      - ./data/historical:/app/data/historical
     depends_on:
       - redis
       - postgres
       - ollama
-      - llama_cpp
     networks:
       - bot_net
     deploy:
       resources:
         limits:
-          memory: 2G
+          # 2G was tight once both BERT models loaded (~1.2G resident + tokenizer
+          # overhead + the existing workload). Bumped to 3G to leave headroom.
+          memory: 3G
+          cpus: "1.0"   # cont. 68b: non-urgent self-improvement — 1 core max
+
+  # cont. 65 — dedicated CandleNet worker. Isolates candlenet_infer_all (and
+  # the four retrain_candlenet_{1m,5m,15m,1h} tasks) from the default queue
+  # where they previously sat behind 15k+ LLM tasks, executing only every
+  # ~38 min and letting {pair}:{tf}:candle_forecast keys (TTL 90s) expire
+  # ~96% of the time. With this worker, candle-forecast keys stay warm and
+  # downstream consumers (multi_tf_cascade, scanner F50a, engine F48 bonus,
+  # predict_all xgb predictor) actually see live values.
+  # Concurrency=1: CandleNet inference for 100 pairs × 4 TFs takes ~25-30s,
+  # well under the 60s beat cadence. Concurrency=1 keeps memory + CPU
+  # predictable; weekly retrains (Sunday 06:00-07:30 UTC) serialize on the
+  # same worker which is intentional (each retrain is heavy by itself).
+  celery_worker_candlenet:
+    image: trading-bot-app:latest
+    restart: unless-stopped
+    command: celery -A celery_app worker --queues=candlenet,predict_all,microstructure --concurrency=2 --loglevel=info
+    env_file: .env
+    # cont. 66 — PyTorch DataLoader passes GAF tensors between workers via
+    # /dev/shm; Docker's 64MB default overflows during CandleNet retrains
+    # ("RuntimeError: unable to allocate shared memory ... No space left on
+    # device" in training_30m_retry.log) — which is why candlenet_1h.pth was
+    # never produced. 2GB is ample for the capped sample batches.
+    shm_size: 2gb
+    environment:
+      # cont. 65k — cap retrain samples (the daily refresh_historical_data chains
+      # retrains in-process here). 50k samples ≈ 1.4G GAF → fits the 7G limit
+      # alongside inference. Without the cap, fresh mainnet data = ~99k samples → OOM.
+      - CANDLENET_MAX_SAMPLES=50000
+      # cont. 68b: cap PyTorch threads to 1. Each inference op defaulted to all 6
+      # cores × concurrency 2 = 12 threads — a major oversubscription driver.
+      - OMP_NUM_THREADS=1
+      - OPENBLAS_NUM_THREADS=1
+      - MKL_NUM_THREADS=1
+      - NUMEXPR_NUM_THREADS=1
+      - TORCH_NUM_THREADS=1
+    volumes:
+      - /opt/trading-bot/models:/app/models
+      # cont. 65f — mount historical CSVs so retrain_candlenet_30m / _1h can
+      # read what pretrainer downloaded. Without this, the worker sees only
+      # the image-baked snapshot (frozen at build time, no 30m.csv) and
+      # retrain returns insufficient_data, pairs_loaded=0.
+      - ./data/historical:/app/data/historical
+      # cont. 65k — bind-mount the ml/ source so the class-balanced + true-ECE
+      # CandleNet training fix (ml/candlenet.py) is live WITHOUT an image
+      # rebuild. The host disk was 96% full and the build cache was pruned, so
+      # a cold torch rebuild risked ENOSPC. This mount deploys the fix via a
+      # plain recreate; revert to a baked image once disk is healthy.
+      - ./ml:/app/ml
+      # cont. 65k — routing consistency: manual retrains triggered from this
+      # container must also route to cn_train (not the old candlenet queue).
+      - ./celery_app.py:/app/celery_app.py
+      # cont. 65k Layer 1 — signals/microstructure.py (new, not baked in image)
+      # for the microstructure_scan_task this worker now consumes.
+      - ./signals:/app/signals
+    depends_on:
+      - redis
+      - postgres
+    networks:
+      - bot_net
+    deploy:
+      resources:
+        limits:
+          # 7G holds the six CandleNet models (~4MB each) + torch runtime +
+          # 1h training peak (~5.3GB GAF precompute on 92.7K samples) +
+          # headroom. Bumped 1500→3000→7000 across cont. 65f as 30m/1h
+          # retrain failures uncovered the real peak. Host has ~11G free
+          # after pretrainer completed.
+          memory: 7000M
+          cpus: "1.5"   # cont. 68b: forecast inference — 1.5 cores
+
+  # cont. 65k — DEDICATED CandleNet TRAINING worker. Consumes the `cn_train`
+  # queue (retrain_candlenet_{1m,5m,15m,30m,1h}) so the minutes-long, memory-heavy
+  # retrains NEVER contend with candlenet_infer_all on celery_worker_candlenet.
+  # Root cause it fixes: retrains on the shared `candlenet` queue starved
+  # inference → forecasts expired (300s TTL) → PCG strict-rejected every signal →
+  # trade freeze. Concurrency=1 (one heavy retrain at a time). Bind-mounts mirror
+  # the candlenet worker (models + historical CSVs + live ml/ + routing).
+  celery_worker_cn_train:
+    # cont. 65k — reuse the candlenet worker's already-built image. Same code +
+    # the bind-mounts below deploy the live ml/ + celery_app.py changes.
+    image: trading-bot-app:latest
+    restart: unless-stopped
+    command: celery -A celery_app worker --queues=cn_train --concurrency=1 --prefetch-multiplier=1 --without-gossip --without-mingle --loglevel=info
+    env_file: .env
+    # cont. 66 — 2GB /dev/shm for the PyTorch DataLoader (see candlenet worker).
+    shm_size: 2gb
+    environment:
+      # cont. 65k — cap training samples so the GAF precompute fits the 4G limit.
+      # Fresh MAINNET data yields ~99k samples/15m (vs old 4989) → ~2.8G GAF →
+      # OOM at 4G. 50k samples ≈ 1.5G GAF (fits, leaves torch+model headroom) and
+      # is still 10× the old data. Raise once RAM headroom grows.
+      - CANDLENET_MAX_SAMPLES=50000
+      # cont. 68b: bound training to 2 threads (was all-6). Takes effect on next
+      # restart — NOT recreating now so the in-flight 1h run keeps its progress.
+      - OMP_NUM_THREADS=2
+      - OPENBLAS_NUM_THREADS=2
+      - MKL_NUM_THREADS=2
+      - TORCH_NUM_THREADS=2
+    volumes:
+      - /opt/trading-bot/models:/app/models
+      - ./data/historical:/app/data/historical
+      - ./ml:/app/ml
+      - ./celery_app.py:/app/celery_app.py
+    depends_on:
+      - redis
+      - postgres
+    networks:
+      - bot_net
+    deploy:
+      resources:
+        limits:
+          # cont. 68b: 4G OOM-KILLED the 1h training (OOMKilled=true) — the GAF
+          # cache (1.44G measured) + torch + train/val tensors across epochs +
+          # contention pushed it past 4G at the epoch boundary. Bumped to 6G.
+          # Safe: Ollama unloads its models after 5m idle, so during a quiet-LLM
+          # training window the box has ample free RAM.
+          memory: 6000M
+          cpus: "2.0"   # cont. 68b: matches the OMP/TORCH=2 thread cap
+
+  # celery_beat scheduler — added 2026-05-20.
+  # Without this, every crontab-scheduled task in celery_app.py (sleep_consolidation,
+  # F25 GA, F39B DGM, F39C AI Scientist, F41 self_play, F30 governance check, F43
+  # metacog, F2 pattern mining, F9 counterfactual sweep, web_intel outcome tracking,
+  # daily/weekly summaries — 12 tasks total) never fired. Worker alone only EXECUTES
+  # tasks; beat SCHEDULES them. Exactly one beat instance must exist to avoid
+  # duplicate fires.
+  celery_beat:
+    image: trading-bot-app:latest
+    restart: unless-stopped
+    command: celery -A celery_app beat --loglevel=info --schedule=/tmp/celerybeat-schedule
+    env_file: .env
+    volumes:
+      # cont. 65k — beat must see the updated task_routes (retrain_candlenet_* →
+      # cn_train queue) so SCHEDULED retrains reach the dedicated training worker.
+      - ./celery_app.py:/app/celery_app.py
+    depends_on:
+      - redis
+      - postgres
+    networks:
+      - bot_net
+    deploy:
+      resources:
+        limits:
+          memory: 256M
 
   watchdog:
-    build: .
+    image: trading-bot-app:latest
     restart: unless-stopped
     command: python -m watchdog.main
     env_file: .env
+    # Host docker socket is root:docker (gid 1001 on this host). Add the
+    # container user to that gid so docker SDK calls aren't PermissionError.
+    group_add:
+      - "1001"
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
+      # cont. 47 — watchdog rewrites .env when the dashboard /bot/mode_switch
+      # endpoint signals a paper↔live transition.
+      - ./.env:/app/.env:rw
+      # cont. 61 — retrain watchdog reads model file mtimes to detect stale
+      # checkpoints and refire missed cron retrains. Without this mount,
+      # watchdog reads stale baked-in files from the image and fires false
+      # alarms.
+      - /opt/trading-bot/models:/app/models:ro
+      # cont. 69m — mount the CURRENT compose so mode-switch recreates use it
+      # (was baked/stale → reverted recent edits + recreated unintended services).
+      - ./docker-compose.yml:/app/docker-compose.yml:ro
     depends_on:
       - brain
       - data_feed
@@ -174,12 +527,23 @@ services:
           memory: 256M
 
   pretrainer:
-    build: .
+    image: trading-bot-app:latest
     # One-shot service — not started by default `docker compose up`
     profiles:
       - pretrainer
     command: python -m pretrainer.main
+    # cont. 65f — run as root so the container can write into the
+    # bind-mounted host dir /opt/trading-bot/data/historical (owned by
+    # ajithd747:ajithd747 0755). botuser (default) lacks write perms,
+    # which crashed the 30m+50-new-pair CSV downloads with PermissionError.
+    user: "0:0"
     env_file: .env
+    volumes:
+      # WRITES the pretrained .pth files here. Without this mount, training is
+      # ephemeral and lost on container removal. Rule 4 finding 2026-05-18.
+      - /opt/trading-bot/models:/app/models
+      # Historical OHLCV CSVs persist across pretrainer runs (saves re-download)
+      - ./data/historical:/app/data/historical
     depends_on:
       - postgres
     networks:
@@ -205,6 +569,7 @@ services:
 volumes:
   postgres_data:
   ollama_models:
+  redis_data:
 
 networks:
   bot_net:

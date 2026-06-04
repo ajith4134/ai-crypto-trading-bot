@@ -19,6 +19,8 @@ def init() -> None:
 
 
 def get() -> redis.Redis:
+    global _client
     if _client is None:
-        raise RuntimeError("Redis not initialised — call init() at startup")
+        # Auto-initialise in Celery worker child processes (they don't run startup code)
+        init()
     return _client

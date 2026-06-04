@@ -44,6 +44,61 @@ ETHERSCAN_API_KEY: str = os.getenv("ETHERSCAN_API_KEY", "")
 COINGECKO_API_KEY: str = os.getenv("COINGECKO_API_KEY", "")
 GITHUB_TOKEN: str = os.getenv("GITHUB_TOKEN", "")
 
+# Cloud 70B-class LLM providers — failover chain replacing local llama_cpp.
+# Order in llm/providers.py:get_providers() is by latency + free-tier headroom.
+# Unset keys are silently skipped — chain degrades gracefully to whatever's set.
+GROQ_API_KEY: str = os.getenv("GROQ_API_KEY", "")
+CEREBRAS_API_KEY: str = os.getenv("CEREBRAS_API_KEY", "")
+SAMBANOVA_API_KEY: str = os.getenv("SAMBANOVA_API_KEY", "")
+# Added 2026-05-20 (PROGRESS.md cont. 8): expand free-tier budget so debate
+# council bursts don't drop to round-1-only during cooldown windows.
+#   NVIDIA NIM — build.nvidia.com  (~40 RPM, meta/llama-3.3-70b-instruct)
+#   Mistral    — console.mistral.ai (~60 RPM, mistral-large-latest ~123B)
+NVIDIA_API_KEY: str = os.getenv("NVIDIA_API_KEY", "")
+MISTRAL_API_KEY: str = os.getenv("MISTRAL_API_KEY", "")
+
+# cont. 58 (2026-05-28): 12-provider expansion — additional free / free-tier
+# LLM endpoints. Local OpenAI-compatible servers default to common ports but
+# the host must actually be running them; unset URL = provider silently
+# skipped. Cloud keys also silently skipped when empty. All endpoints below
+# expose OpenAI-compatible /v1/chat/completions so they share the same
+# call_provider_sync adapter.
+#
+# Local OpenAI-compatible servers (set the URL env var to enable):
+#   LLAMACPP    — llama.cpp HTTP server     (python -m llama_cpp.server)
+#   LMSTUDIO    — LM Studio                 (https://lmstudio.ai)
+#   JANAI       — Jan.ai local server       (https://jan.ai)
+#   TEXTGEN     — text-generation-webui     (oobabooga; api extension)
+#   GPT4ALL     — GPT4All local server      (https://gpt4all.io)
+#
+# Cloud OpenAI-compatible (set the API key env var to enable):
+#   OPENROUTER       — openrouter.ai             (many free models like meta-llama-3.3-70b:free)
+#   TOGETHER         — together.ai               (Llama 3.3 70B Instruct Turbo Free)
+#   DEEPINFRA        — deepinfra.com             (free initial credits)
+#   FIREWORKS        — fireworks.ai              (free serverless tier)
+#   HUGGINGFACE      — router.huggingface.co     (free Inference API)
+#   GOOGLE_AI_STUDIO — generativelanguage.googleapis.com (Gemini 2.0 Flash free tier)
+#   CLOUDFLARE       — api.cloudflare.com        (Workers AI free daily limit)
+LLAMACPP_URL:    str = os.getenv("LLAMACPP_URL", "")
+LMSTUDIO_URL:    str = os.getenv("LMSTUDIO_URL", "")
+JANAI_URL:       str = os.getenv("JANAI_URL", "")
+TEXTGEN_URL:     str = os.getenv("TEXTGEN_URL", "")
+GPT4ALL_URL:     str = os.getenv("GPT4ALL_URL", "")
+LLAMACPP_MODEL:  str = os.getenv("LLAMACPP_MODEL", "default")
+LMSTUDIO_MODEL:  str = os.getenv("LMSTUDIO_MODEL", "local-model")
+JANAI_MODEL:     str = os.getenv("JANAI_MODEL", "default")
+TEXTGEN_MODEL:   str = os.getenv("TEXTGEN_MODEL", "default")
+GPT4ALL_MODEL:   str = os.getenv("GPT4ALL_MODEL", "Llama 3 8B Instruct")
+
+OPENROUTER_API_KEY:       str = os.getenv("OPENROUTER_API_KEY", "")
+TOGETHER_API_KEY:         str = os.getenv("TOGETHER_API_KEY", "")
+DEEPINFRA_API_KEY:        str = os.getenv("DEEPINFRA_API_KEY", "")
+FIREWORKS_API_KEY:        str = os.getenv("FIREWORKS_API_KEY", "")
+HUGGINGFACE_API_KEY:      str = os.getenv("HUGGINGFACE_API_KEY", "")
+GOOGLE_AI_STUDIO_API_KEY: str = os.getenv("GOOGLE_AI_STUDIO_API_KEY", "")
+CLOUDFLARE_API_KEY:       str = os.getenv("CLOUDFLARE_API_KEY", "")
+CLOUDFLARE_ACCOUNT_ID:    str = os.getenv("CLOUDFLARE_ACCOUNT_ID", "")
+
 # --- config.yaml ---
 
 _CONFIG_PATH = Path(__file__).parent / "config.yaml"
@@ -89,6 +144,8 @@ class risk:
     daily_loss_limit_pct: int = _get(_cfg, "risk", "daily_loss_limit_pct")
     max_drawdown_pct: int = _get(_cfg, "risk", "max_drawdown_pct")
     circuit_breaker_live_only: bool = _get(_cfg, "risk", "circuit_breaker_live_only")
+    # cont. 44: list of [trigger_usdt, lock_pct] pairs, evaluated top-down
+    profit_lock_tiers: list = _get(_cfg, "risk", "profit_lock_tiers")
 
 
 class brain:

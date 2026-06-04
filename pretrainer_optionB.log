@@ -1,0 +1,76 @@
+ Container trading-bot-postgres-1 Running 
+ Container trading-bot-pretrainer-run-7ad35077eac5 Creating 
+ Container trading-bot-pretrainer-run-7ad35077eac5 Created 
+2026-05-27 12:32:39 [info     ] pretrainer_torch_config        interop_threads=2 mkldnn=True num_threads=4
+2026-05-27 12:32:39 [info     ] pretrainer_started             active_trading_pairs=200 download_pairs=300
+2026-05-27 12:32:39 [info     ] db_pool_ready                  max=10 min=2
+2026-05-27 12:32:41 [info     ] binance_client_ready           testnet=True
+2026-05-27 12:32:41 [info     ] total_usdt_m_pairs_available   count=527
+2026-05-27 12:32:41 [info     ] pretraining_on_pairs           count=300
+2026-05-27 12:32:41 [info     ] step_1_downloading_ohlcv       note='~1800 files across 6 timeframes'
+2026-05-27 12:32:41 [info     ] ohlcv_complete                 pairs=300
+2026-05-27 12:32:41 [info     ] step_2_training_hmm_skipped    file=hmm_regime.pkl reason=checkpoint_already_exists size_mb=0.0
+2026-05-27 12:32:41 [info     ] step_3_saving_tft_architecture_skipped file=tft.pth reason=checkpoint_already_exists size_mb=0.5
+2026-05-27 12:32:41 [info     ] step_4_saving_patchtst_architecture_skipped file=patchtst.pth reason=checkpoint_already_exists size_mb=0.4
+2026-05-27 12:32:41 [info     ] step_5_training_gnn_with_correlation_skipped file=gnn.pth reason=checkpoint_already_exists size_mb=0.0
+2026-05-27 12:32:41 [info     ] step_6_saving_world_model_architecture_skipped file=world_model.pth reason=checkpoint_already_exists size_mb=0.3
+2026-05-27 12:32:41 [info     ] step_7_training_candlenet_1m
+2026-05-27 12:32:41 [info     ] candlenet_1m_training_start    note='CNN-GRU on 1min OHLCV+HA+patterns, ~282K samples'
+2026-05-27 12:32:59 [info     ] candlenet_train_data_ready     interval=1m pairs=300 samples=92700
+2026-05-27 12:33:02 [info     ] candlenet_subsampled           interval=1m kept=10000 original=92699 reason=CANDLENET_MAX_SAMPLES
+2026-05-27 12:33:02 [info     ] candlenet_gaf_precompute_start interval=1m samples=10000
+2026-05-27 12:33:07 [info     ] candlenet_gaf_precompute_progress done=10000 elapsed_s=4.6 interval=1m total=10000
+2026-05-27 12:33:07 [info     ] candlenet_gaf_precompute_done  cache_mb=288.0 elapsed_s=4.6 interval=1m samples=10000
+2026-05-27 13:04:54 [info     ] candlenet_epoch                best_val_loss=0.594 epoch=0 epoch_secs=1902.6 interval=1m patience_left=2 tr_loss=5.5604 val_loss=0.594
+2026-05-27 13:35:05 [info     ] candlenet_epoch                best_val_loss=0.5885 epoch=1 epoch_secs=1810.5 interval=1m patience_left=2 tr_loss=3.1397 val_loss=0.5885
+2026-05-27 14:05:56 [info     ] candlenet_epoch                best_val_loss=0.5716 epoch=2 epoch_secs=1851.1 interval=1m patience_left=2 tr_loss=3.0499 val_loss=0.5716
+2026-05-27 14:07:21 [info     ] redis_ready                    host=redis port=6379
+2026-05-27 14:07:21 [info     ] model_versioned_save           model=candlenet_1m pruned=[] version=20260527T140721Z
+2026-05-27 14:07:21 [info     ] drift_training_snapshot_saved  features=17 model=candlenet_1m
+2026-05-27 14:07:21 [info     ] candlenet_trained_and_saved    best_val_loss=0.57162 dir_calib_err=0.0167 interval=1m pairs_loaded=300 path=models/candlenet_1m.pth samples=10000 top_decile_lift=8.4615 val_auc=0.8783
+2026-05-27 14:07:21 [info     ] candlenet_1m_training_done     best_val_loss=0.57162 dir_calib_err=0.0167 pairs_loaded=300 samples=10000 status=trained top_decile_lift=8.4615 val_auc=0.8783
+2026-05-27 14:07:21 [info     ] step_8_training_candlenet_5m
+2026-05-27 14:07:21 [info     ] candlenet_5m_training_start    note='CNN+GRU+TCN+GAF on 5min OHLCV+HA+patterns, ~282K samples'
+2026-05-27 14:07:33 [info     ] candlenet_train_data_ready     interval=5m pairs=300 samples=92700
+2026-05-27 14:07:35 [info     ] candlenet_subsampled           interval=5m kept=10000 original=92699 reason=CANDLENET_MAX_SAMPLES
+2026-05-27 14:07:35 [info     ] candlenet_gaf_precompute_start interval=5m samples=10000
+2026-05-27 14:07:38 [info     ] candlenet_gaf_precompute_progress done=10000 elapsed_s=2.8 interval=5m total=10000
+2026-05-27 14:07:38 [info     ] candlenet_gaf_precompute_done  cache_mb=288.0 elapsed_s=2.8 interval=5m samples=10000
+2026-05-27 14:37:48 [info     ] candlenet_epoch                best_val_loss=0.4703 epoch=0 epoch_secs=1809.7 interval=5m patience_left=2 tr_loss=6.6084 val_loss=0.4703
+2026-05-27 15:06:41 [info     ] candlenet_epoch                best_val_loss=0.4703 epoch=1 epoch_secs=1733.3 interval=5m patience_left=1 tr_loss=4.5038 val_loss=0.4857
+2026-05-27 15:45:00 [info     ] candlenet_epoch                best_val_loss=0.4703 epoch=2 epoch_secs=2299.0 interval=5m patience_left=0 tr_loss=4.342 val_loss=0.4828
+2026-05-27 15:45:00 [info     ] candlenet_early_stop           best_val_loss=0.4703 epoch=2 interval=5m
+2026-05-27 15:46:34 [info     ] model_versioned_save           model=candlenet_5m pruned=[] version=20260527T154634Z
+2026-05-27 15:46:34 [info     ] drift_training_snapshot_saved  features=17 model=candlenet_5m
+2026-05-27 15:46:34 [info     ] candlenet_trained_and_saved    best_val_loss=0.470345 dir_calib_err=0.0179 interval=5m pairs_loaded=300 path=models/candlenet_5m.pth samples=10000 top_decile_lift=6.25 val_auc=0.8507
+2026-05-27 15:46:34 [info     ] candlenet_5m_training_done     best_val_loss=0.470345 dir_calib_err=0.0179 pairs_loaded=300 samples=10000 status=trained top_decile_lift=6.25 val_auc=0.8507
+2026-05-27 15:46:34 [info     ] step_9_training_candlenet_15m
+2026-05-27 15:46:34 [info     ] candlenet_15m_training_start   note='CNN+GRU+TCN+GAF on 15min OHLCV+HA+patterns'
+2026-05-27 15:46:49 [info     ] candlenet_train_data_ready     interval=15m pairs=300 samples=92700
+2026-05-27 15:46:52 [info     ] candlenet_subsampled           interval=15m kept=10000 original=92699 reason=CANDLENET_MAX_SAMPLES
+2026-05-27 15:46:52 [info     ] candlenet_gaf_precompute_start interval=15m samples=10000
+2026-05-27 15:46:58 [info     ] candlenet_gaf_precompute_progress done=10000 elapsed_s=5.2 interval=15m total=10000
+2026-05-27 15:46:58 [info     ] candlenet_gaf_precompute_done  cache_mb=288.0 elapsed_s=5.2 interval=15m samples=10000
+2026-05-27 16:20:46 [info     ] candlenet_epoch                best_val_loss=0.9164 epoch=0 epoch_secs=2028.7 interval=15m patience_left=2 tr_loss=10.3637 val_loss=0.9164
+2026-05-27 16:52:04 [info     ] candlenet_epoch                best_val_loss=0.9164 epoch=1 epoch_secs=1877.3 interval=15m patience_left=1 tr_loss=7.2584 val_loss=1.0046
+2026-05-27 17:19:14 [info     ] candlenet_epoch                best_val_loss=0.8824 epoch=2 epoch_secs=1630.3 interval=15m patience_left=2 tr_loss=7.0757 val_loss=0.8824
+2026-05-27 17:20:34 [info     ] model_versioned_save           model=candlenet_15m pruned=[] version=20260527T172034Z
+2026-05-27 17:20:34 [info     ] drift_training_snapshot_saved  features=17 model=candlenet_15m
+2026-05-27 17:20:34 [info     ] candlenet_trained_and_saved    best_val_loss=0.882434 dir_calib_err=0.0274 interval=15m pairs_loaded=300 path=models/candlenet_15m.pth samples=10000 top_decile_lift=6.6667 val_auc=0.8847
+2026-05-27 17:20:34 [info     ] candlenet_15m_training_done    best_val_loss=0.882434 dir_calib_err=0.0274 pairs_loaded=300 samples=10000 status=trained top_decile_lift=6.6667 val_auc=0.8847
+2026-05-27 17:20:34 [info     ] step_10_training_entry_timing_agent
+2026-05-27 17:20:34 [info     ] entry_timing_agent_step_start
+mkdir -p failed for path /home/botuser/.config/matplotlib: [Errno 13] Permission denied: '/home/botuser'
+Matplotlib created a temporary cache directory at /tmp/matplotlib-ftwiyi4j because there was an issue with the default path (/home/botuser/.config/matplotlib); it is highly recommended to set the MPLCONFIGDIR environment variable to a writable directory, in particular to speed up the import of Matplotlib and to better support multiprocessing.
+2026-05-27 17:20:36 [info     ] entry_timing_agent_step_done   events=0 note='need ≥ 200 logged signal events; bot logs them as signals fire' status=insufficient_history
+2026-05-27 17:20:36 [info     ] step_11_verifying_checkpoints
+2026-05-27 17:20:36 [info     ] all_checkpoints_verified       count=8
+2026-05-27 17:20:36 [info     ] checkpoint_ok                  file=hmm_regime.pkl size_mb=0.0
+2026-05-27 17:20:36 [info     ] checkpoint_ok                  file=tft.pth size_mb=0.5
+2026-05-27 17:20:36 [info     ] checkpoint_ok                  file=patchtst.pth size_mb=0.4
+2026-05-27 17:20:36 [info     ] checkpoint_ok                  file=gnn.pth size_mb=0.0
+2026-05-27 17:20:36 [info     ] checkpoint_ok                  file=world_model.pth size_mb=0.3
+2026-05-27 17:20:36 [info     ] checkpoint_ok                  file=candlenet_1m.pth size_mb=4.3
+2026-05-27 17:20:36 [info     ] checkpoint_ok                  file=candlenet_5m.pth size_mb=4.3
+2026-05-27 17:20:36 [info     ] checkpoint_ok                  file=candlenet_15m.pth size_mb=4.3
+2026-05-27 17:20:36 [info     ] pretrainer_complete            message='All models ready. Bot can now start paper trading.' next_step='docker compose up -d'

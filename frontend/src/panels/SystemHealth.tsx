@@ -17,8 +17,9 @@ const SystemHealth: React.FC = () => {
   const serviceStatus = (name:string) => {
     const s = health.services?.[name];
     if (!s) return {color:'#555',label:'Unknown'};
-    if (s.status==='ok') return {color:'#00ff88',label:'Running'};
+    if (s.status==='ok')       return {color:'#00ff88',label:'Running'};
     if (s.status==='degraded') return {color:'#ffaa00',label:'Degraded'};
+    if (s.status==='loading')  return {color:'#00aaff',label:'Loading...'};
     return {color:'#ff4444',label:'Down'};
   };
 

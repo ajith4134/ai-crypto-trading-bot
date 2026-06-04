@@ -1,0 +1,705 @@
+RECONCILED DRAFT (v2) — not yet applied.
+Replaces v1 entirely. v1's actuator peak-scaling is dropped in favor of Bundle B's
+R1+R2+R3+R4 from /opt/trading-bot/next_impl/f9_f12_revolutionary_uses.md.
+
+Files touched (7):
+  1. metacognition/decoders.py    — keep v1 (miss_tag/evidence/confidence in F9 JSON)
+  2. metacognition/actuator.py    — REWRITE: R1 per-(regime × band) buckets + R3 density×unanimity² scaling
+  3. metacognition/confidence.py  — NEW FILE (R4 bot self-confidence index)
+  4. redis_keys.py                — add 3 new keys
+  5. signals/engine.py            — R1 bucket-aware read + R2 pair-list read + R4 capital×conf + hard-skip
+  6. risk/manager.py              — R4 trail_dist_pct *= (2.0 − confidence_t)
+  7. celery_app.py                — v1 persistence patch + 2 new beat tasks (R2 + R4)
+
+Total: ~310 LOC added, ~25 LOC modified. F30/F46 governance gate preserved on all
+behavior changes. Parameter defaults locked: hard-skip @ 0.30, probation graduation
+@ 50 trades + 50% WR. Verification correction: R4 capital multiplier lands in
+signals/engine.py (NOT risk/manager.py — size_position does not exist).
+
+Migration draft remains as v1: /opt/trading-bot/next_impl/step1_026_predicted_profit_loop_phase1.sql.draft
+
+================================================================================
+FILE 1: metacognition/decoders.py  (unchanged from v1; for completeness)
+================================================================================
+
+@@ around line 32 — extend _MISS_SYSTEM with tag vocabulary (8 tags). [As v1.]
+@@ around line 100 — extend JSON spec: miss_tag, miss_tag_confidence, miss_tag_evidence. [As v1.]
+@@ around line 193 — validate miss_tag against _VALID_MISS_TAGS; clamp confidence; default evidence={}.  [As v1.]
+
+(Full diff in v1; not repeated here. ~50 LOC added.)
+
+
+================================================================================
+FILE 2: metacognition/actuator.py  (REWRITE for R1 + R3)
+================================================================================
+
+REPLACE the current _F9_STEP, _F9_MAX_DRIFT, _apply(), apply_filter_change(),
+and get_filter_overrides() with the bucketed version below. Keep F12 functions
+unchanged for now (F12's per-pair handling lives in pair-list updater, R2 below).
+
+@@ Add module-level constants (top of file, near _F9_ACTIONS)
+
+# R1 — strength band size. 4-unit bands match the cluster shape in DB
+# (340@42, 170@46, 46@49 — see project_reconciled_bundle_b memory).
+_F9_BAND_WIDTH = 4
+
+# R1 — regime fallback hierarchy. Specific bucket > _global_fallback.
+_F9_REGIME_KEYS = ("bull", "bear", "range", "unknown")
+
+# R3 — density / unanimity scaling caps.
+_F9_DENSITY_CAP = 3.0    # at 20+ same-direction votes
+_F9_DENSITY_DIV = 20.0   # divisor: density = n_total / DIV
+
+@@ Add helpers
+
+def _band_for(strength: float) -> str:
+    """Band key like '40-44'. Strength bucket of width _F9_BAND_WIDTH."""
+    lo = int(_F9_BAND_WIDTH * (int(strength) // _F9_BAND_WIDTH))
+    return f"{lo}-{lo + _F9_BAND_WIDTH}"
+
+def _bucket_key(regime: str | None, strength: float | None) -> str | None:
+    """Return 'bull|40-44' or None if regime/strength missing."""
+    if regime is None or strength is None:
+        return None
+    r = str(regime).lower()
+    if r not in _F9_REGIME_KEYS:
+        r = "unknown"
+    return f"{r}|{_band_for(strength)}"
+
+def _read_bucketed_overrides() -> dict:
+    """Read the v2-schema overrides JSON from Redis. Returns {} if absent or
+    if schema is v1 (caller must handle migration on first write)."""
+    r = redis_client.get()
+    try:
+        raw = r.get(redis_keys.BRAIN_FILTER_OVERRIDES)
+        if not raw:
+            return {}
+        d = json.loads(raw)
+        return d if isinstance(d, dict) else {}
+    except Exception:
+        return {}
+
+def _votes_for_bucket(bucket_key: str, delta_key: str) -> tuple[int, int]:
+    """How many recent decodes voted +/- on this bucket × delta_key? Reads
+    audit counters (set in _apply_bucketed below). Returns (n_same, n_total)."""
+    if not bucket_key:
+        return (0, 0)
+    r = redis_client.get()
+    try:
+        plus  = int(r.get(f"decoders:f9_votes:{bucket_key}:{delta_key}:plus")  or 0)
+        minus = int(r.get(f"decoders:f9_votes:{bucket_key}:{delta_key}:minus") or 0)
+    except Exception:
+        return (0, 0)
+    total = plus + minus
+    same  = max(plus, minus)
+    return (same, total)
+
+@@ Add new _apply_bucketed() — replaces _apply for F9
+
+def _apply_bucketed(action_dict: dict, regime: str | None,
+                    strength: float | None,
+                    kind: str = "f9") -> dict:
+    """R1 + R3: bucketed override with density × unanimity² scaling.
+
+    Returns status dict {applied, bucket, delta_key, prev, new, mult, capped, reason}.
+    Failures are non-fatal — all errors captured and returned as applied=False.
+    """
+    if not isinstance(action_dict, dict):
+        return {"applied": False, "reason": "action_not_dict"}
+
+    action_name = action_dict.get("action")
+    magnitude   = action_dict.get("magnitude", "small")
+
+    vocab = _F9_ACTIONS  # F9 only for now; F12 stays on legacy _apply
+
+    if action_name not in vocab:
+        log.info("decoder_action_unknown", kind=kind, action=action_name)
+        return {"applied": False, "reason": f"unknown_action_{action_name}"}
+
+    delta_key, sign = vocab[action_name]
+    if delta_key is None:
+        return {"applied": False, "reason": "no_change"}
+
+    if magnitude not in ("small", "medium"):
+        return {"applied": False, "reason": f"invalid_magnitude_{magnitude}"}
+
+    if not _governance_active():
+        return {"applied": False, "reason": "governance_F46_inactive"}
+
+    base_step = _F9_STEP.get(delta_key, {}).get(magnitude)
+    if base_step is None:
+        return {"applied": False, "reason": "no_step_defined"}
+
+    cap = _F9_MAX_DRIFT.get(delta_key)
+    if cap is None:
+        return {"applied": False, "reason": "no_cap_defined"}
+
+    # Record this vote BEFORE computing scaling so it factors into its own update.
+    bucket = _bucket_key(regime, strength)
+    if not bucket:
+        return {"applied": False, "reason": "no_bucket_key"}
+
+    r = redis_client.get()
+    try:
+        vote_key = f"decoders:f9_votes:{bucket}:{delta_key}:{'plus' if sign > 0 else 'minus'}"
+        r.incr(vote_key)
+    except Exception:
+        pass
+
+    # R3 — density × unanimity² scaling.
+    n_same, n_total = _votes_for_bucket(bucket, delta_key)
+    if n_total > 0:
+        unanimity = n_same / n_total
+        density   = min(_F9_DENSITY_CAP, n_total / _F9_DENSITY_DIV)
+        mult      = density * (unanimity ** 2)
+        # Floor at 1.0 so a brand-new vote always has at least base effect.
+        mult      = max(1.0, mult)
+    else:
+        mult = 1.0
+
+    delta = sign * base_step * mult
+
+    # Read current bucketed overrides JSON.
+    current = _read_bucketed_overrides()
+    buckets = current.setdefault("by_regime_and_band", {})
+    bucket_dict = buckets.setdefault(bucket, {})
+    prev = float(bucket_dict.get(delta_key, 0.0))
+    proposed = prev + delta
+    clipped = max(-cap, min(cap, proposed))
+    capped = clipped != proposed
+
+    bucket_dict[delta_key] = round(clipped, 4)
+    bucket_dict["n_evidence"] = int(bucket_dict.get("n_evidence", 0)) + 1
+    import time as _time
+    bucket_dict["last_update_ts"] = int(_time.time())
+    current.setdefault("_meta", {})["schema_version"] = 2
+    current["_meta"]["saved_ts"] = int(_time.time())
+
+    try:
+        r.set(redis_keys.BRAIN_FILTER_OVERRIDES, json.dumps(current))
+        r.incr(f"decoders:{kind}_writeback_applied_count")
+        r.incr(f"decoders:bucket_applied_count:{bucket}")
+        if capped:
+            r.incr(f"decoders:{kind}_writeback_capped_count")
+    except Exception as exc:
+        return {"applied": False, "reason": f"redis_write_failed_{str(exc)[:60]}"}
+
+    log.info("decoder_writeback_bucketed_applied", kind=kind,
+             action=action_name, bucket=bucket, delta_key=delta_key,
+             prev=round(prev, 4), new=round(clipped, 4),
+             mult=round(mult, 3), n_total=n_total, capped=capped)
+
+    return {
+        "applied": True, "bucket": bucket, "delta_key": delta_key,
+        "prev": round(prev, 4), "new": round(clipped, 4),
+        "mult": round(mult, 3), "n_total": n_total,
+        "delta": round(delta, 4), "capped": capped,
+    }
+
+@@ REPLACE apply_filter_change
+
+def apply_filter_change(action_dict: dict,
+                        regime: str | None = None,
+                        signal_strength: float | None = None) -> dict:
+    """R1+R3 entry point. F9 writeback to bucketed BRAIN_FILTER_OVERRIDES."""
+    return _apply_bucketed(
+        action_dict, regime=regime, strength=signal_strength, kind="f9",
+    )
+
+@@ REPLACE get_filter_overrides — return bucketed structure
+
+def get_filter_overrides() -> dict:
+    """Read v2 bucketed override dict. Empty when unset.
+    Caller uses get_bucket_delta() to resolve a (regime, strength) → delta."""
+    return _read_bucketed_overrides()
+
+@@ Add bucket-resolution helper for consumers (signals/engine.py uses this)
+
+def get_bucket_delta(regime: str | None,
+                     signal_strength: float | None,
+                     delta_key: str = "min_signal_strength_delta") -> float:
+    """R1 read path. Resolve (regime, strength) → numeric delta.
+    Fallback hierarchy: bucket → '<regime>|*' → _global_fallback → 0.0."""
+    overrides = _read_bucketed_overrides()
+    bucket = _bucket_key(regime, signal_strength)
+    if bucket:
+        bd = overrides.get("by_regime_and_band", {}).get(bucket)
+        if bd and delta_key in bd:
+            return float(bd[delta_key])
+    # Regime-wide fallback (e.g. "bull|*")
+    if regime:
+        wide = f"{str(regime).lower()}|*"
+        bd = overrides.get("by_regime_and_band", {}).get(wide)
+        if bd and delta_key in bd:
+            return float(bd[delta_key])
+    # Global fallback.
+    gf = overrides.get("_global_fallback")
+    if isinstance(gf, dict) and delta_key in gf:
+        return float(gf[delta_key])
+    return 0.0
+
+
+================================================================================
+FILE 3: metacognition/confidence.py  (NEW FILE — R4 bot self-confidence)
+================================================================================
+
+"""R4 — Bot Self-Confidence Index (Bundle B).
+
+Hourly-recomputed scalar in [0.20, 1.00] derived from the last 1h of:
+  hits   = closed trades exited via trailing_sl with net_pnl > 0
+  misses = F9 decodes inserted (rejected-but-would-have-won)
+  losers = F12 decodes inserted (high-pot losers paired with low-pot winners)
+
+confidence = clip( (hits + 1) / (hits + misses + losers + 1), 0.20, 1.00 )
+
+Consumers (per project_reconciled_bundle_b memory — sizing landed in signals/engine.py):
+  - signals/engine.py:1742-ish — capital_usdt *= confidence_t
+  - signals/engine.py:earlier-in-flow — hard-skip if confidence_t < 0.30
+  - risk/manager.py:1209 — trail_dist_pct *= (2.0 − confidence_t)
+
+F46 governance gate: confidence reads return 1.0 (no-op) when F46 inactive.
+"""
+from __future__ import annotations
+import structlog
+import time
+
+import redis_client
+import redis_keys
+
+log = structlog.get_logger()
+
+_CONFIDENCE_FLOOR    = 0.20
+_CONFIDENCE_CEILING  = 1.00
+_HARD_SKIP_THRESHOLD = 0.30   # locked default per user 2026-05-29
+
+
+def _governance_active() -> bool:
+    try:
+        from feature_governance.registry import is_active
+        return bool(is_active("F46"))
+    except Exception:
+        return True
+
+
+def compute_and_store(window_seconds: int = 3600) -> dict:
+    """Compute confidence over the last `window_seconds`, persist to Redis.
+    Called by celery beat task `compute_bot_confidence` every 5 minutes."""
+    from db import db_conn
+
+    if not _governance_active():
+        log.debug("bot_confidence_governance_inactive")
+        return {"status": "skipped", "reason": "F46_inactive"}
+
+    try:
+        with db_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT
+                      (SELECT COUNT(*) FROM trades
+                         WHERE exit_reason = 'trailing_sl'
+                           AND net_pnl_usdt > 0
+                           AND closed_at > NOW() - INTERVAL '%s seconds') AS hits,
+                      (SELECT COUNT(*) FROM counterfactuals
+                         WHERE miss_decoded = TRUE
+                           AND created_at > NOW() - INTERVAL '%s seconds') AS misses,
+                      (SELECT COUNT(*) FROM mismatches
+                         WHERE decoded_at > NOW() - INTERVAL '%s seconds') AS losers
+                """, (window_seconds, window_seconds, window_seconds))
+                hits, misses, losers = cur.fetchone()
+    except Exception as exc:
+        log.warning("bot_confidence_db_failed", error=str(exc)[:200])
+        return {"status": "error", "reason": "db"}
+
+    hits, misses, losers = int(hits or 0), int(misses or 0), int(losers or 0)
+    raw = (hits + 1.0) / (hits + misses + losers + 1.0)
+    conf = max(_CONFIDENCE_FLOOR, min(_CONFIDENCE_CEILING, raw))
+
+    r = redis_client.get()
+    try:
+        r.set(redis_keys.BRAIN_BOT_CONFIDENCE, round(conf, 4))
+        r.set(redis_keys.BRAIN_BOT_CONFIDENCE + ":updated_ts", int(time.time()))
+        r.set(redis_keys.BRAIN_BOT_CONFIDENCE + ":components",
+              f"hits={hits},miss={misses},lose={losers}")
+    except Exception as exc:
+        log.warning("bot_confidence_redis_failed", error=str(exc)[:200])
+
+    log.info("bot_confidence_computed",
+             confidence=round(conf, 4),
+             hits=hits, misses=misses, losers=losers)
+    return {"status": "ok", "confidence": round(conf, 4),
+            "hits": hits, "misses": misses, "losers": losers}
+
+
+def get_confidence() -> float:
+    """Read the cached confidence value. Returns 1.0 (no-op) on any error
+    or when F46 inactive. Consumers MUST default to no-op behavior on 1.0."""
+    if not _governance_active():
+        return 1.0
+    r = redis_client.get()
+    try:
+        v = r.get(redis_keys.BRAIN_BOT_CONFIDENCE)
+        if v is None:
+            return 1.0
+        c = float(v)
+        return max(_CONFIDENCE_FLOOR, min(_CONFIDENCE_CEILING, c))
+    except Exception:
+        return 1.0
+
+
+def should_hard_skip() -> bool:
+    """R4 entry-gate hard-skip. True when confidence below 0.30."""
+    if not _governance_active():
+        return False
+    c = get_confidence()
+    return c < _HARD_SKIP_THRESHOLD
+
+
+================================================================================
+FILE 4: redis_keys.py  (add 3 new keys)
+================================================================================
+
+@@ After BRAIN_SCORER_OVERRIDES on line 116
+
+BRAIN_PAIR_PROBATION   = "brain:pair_probation"     # JSON dict — R2 probation list
+BRAIN_PAIR_SUSPENSION  = "brain:pair_suspension"    # JSON dict — R2 suspension list
+BRAIN_BOT_CONFIDENCE   = "brain:bot_confidence"     # str (float) — R4 self-confidence
+
+
+================================================================================
+FILE 5: signals/engine.py  (R1 bucket-aware + R2 pair-list + R4 capital/skip)
+================================================================================
+
+@@ around line 857-864 — REPLACE the existing F9 override read with bucket-aware
+
+                # cont. 27 — F9 decoder writeback (R1 bucketed since cont. 55).
+                # Per-(regime × strength-band) delta. Falls back to regime-wide
+                # then global. Reads zero when overrides empty or F46 gated off.
+                try:
+                    from metacognition.actuator import get_bucket_delta
+                    _delta = get_bucket_delta(
+                        regime=brain_state.get("market_regime"),
+                        signal_strength=float(signal.get("signal_strength") or 0.0),
+                        delta_key="min_signal_strength_delta",
+                    )
+                    if _delta != 0.0:
+                        min_strength = max(15.0, min(35.0, min_strength + _delta))
+                except Exception:
+                    pass
+
+@@ Near the rejection-decision entry point (find existing accept_or_reject or
+   equivalent at brain_stage 3 — line number depends on file; user/agent confirm)
+
+                # R4 hard-skip — block entries entirely when bot confidence < 0.30.
+                # Logged + Redis counter per silent-rejection rule.
+                try:
+                    from metacognition.confidence import should_hard_skip
+                    if should_hard_skip():
+                        try:
+                            r.incr("bot:confidence:hard_skip_count")
+                        except Exception:
+                            pass
+                        log.info("entry_blocked_low_bot_confidence",
+                                 pair=signal.get("pair"),
+                                 direction=signal.get("direction"))
+                        return {"accepted": False,
+                                "rejection_reason": "bot_confidence_below_floor"}
+                except Exception:
+                    pass
+
+                # R2 pair-list check — suspension first (hard block), then
+                # probation (loosened strength + candle bonus).
+                try:
+                    import json as _json
+                    _pair = signal.get("pair")
+                    _susp = r.get(redis_keys.BRAIN_PAIR_SUSPENSION)
+                    _susp = _json.loads(_susp) if _susp else {}
+                    _sd = _susp.get(_pair) if isinstance(_susp, dict) else None
+                    if isinstance(_sd, dict) and _sd.get("blocked"):
+                        try:
+                            r.incr(f"pair:suspension:blocked_count:{_pair}")
+                        except Exception:
+                            pass
+                        log.info("entry_blocked_pair_suspended", pair=_pair)
+                        return {"accepted": False,
+                                "rejection_reason": "pair_suspended_blocked"}
+                    if isinstance(_sd, dict) and _sd.get("strength_delta"):
+                        min_strength = max(15.0, min(35.0,
+                            min_strength + float(_sd["strength_delta"])))
+
+                    _prob = r.get(redis_keys.BRAIN_PAIR_PROBATION)
+                    _prob = _json.loads(_prob) if _prob else {}
+                    _pd = _prob.get(_pair) if isinstance(_prob, dict) else None
+                    if isinstance(_pd, dict) and _pd.get("strength_delta"):
+                        min_strength = max(15.0, min(35.0,
+                            min_strength + float(_pd["strength_delta"])))
+                except Exception:
+                    pass
+
+@@ around line 1742 — R4 capital multiplier (after debate-mult, before final clip)
+
+                        capital_usdt = max(5.0, round(capital_usdt * debate_size_mult, 2))
++                       # R4 — bot self-confidence sizing. No-op when F46 gated off
++                       # or confidence=1.0. Drops capital proportionally when bot
++                       # is in a losing/missing streak.
++                       try:
++                           from metacognition.confidence import get_confidence
++                           _conf = get_confidence()
++                           if _conf < 1.0:
++                               capital_usdt = max(5.0, round(capital_usdt * _conf, 2))
++                               try:
++                                   r.incr("bot:confidence:sizing_applied_count")
++                               except Exception:
++                                   pass
++                       except Exception:
++                           pass
+
+
+================================================================================
+FILE 6: risk/manager.py  (R4 trailing SL widen)
+================================================================================
+
+@@ around line 1209 — R4 trail tightening when low confidence
+
+                        trail_mult = max(0.4, min(2.0, 1.5 / (profit_ratio ** 0.5)))
+                        trail_dist_pct = trail_mult * vol_unit
++                       # R4 — tighten trail (widen, paradoxically — multiply by
++                       # 2−conf, so conf=1.0→×1.0, conf=0.5→×1.5, conf=0.2→×1.8).
++                       # Logic: when bot's recent decisions are bad, give wider
++                       # trailing room so noise doesn't stop us out before the
++                       # remaining good trades can recover.
++                       try:
++                           from metacognition.confidence import get_confidence
++                           _conf = get_confidence()
++                           if _conf < 1.0:
++                               trail_dist_pct *= (2.0 - _conf)
++                               try:
++                                   r.incr("trail:confidence_widen_count")
++                               except Exception:
++                                   pass
++                       except Exception:
++                           pass
+
+
+================================================================================
+FILE 7: celery_app.py  (v1 persistence patch + 2 new beat tasks)
+================================================================================
+
+@@ around line 2204 — extend UPDATE (as v1)
+
+                         UPDATE counterfactuals
+                         SET miss_decode_reason   = %s,
++                            miss_tag             = %s,
++                            miss_tag_confidence  = %s,
++                            miss_tag_evidence    = %s,
+                             miss_decoded         = TRUE
+                         WHERE id = %s
+
+@@ around line 2219 — pass regime + strength to apply_filter_change (R1 needs them)
+
+             fc = result.get("filter_change")
+             if fc:
+                 try:
+                     from metacognition.actuator import apply_filter_change
+-                    apply_filter_change(fc)
++                    apply_filter_change(
++                        fc,
++                        regime=row.get("market_regime"),
++                        signal_strength=(float(row["signal_strength"])
++                                         if row.get("signal_strength") is not None
++                                         else None),
++                    )
+
+@@ Add beat schedule entries (find the beat_schedule dict at line 44)
+
+    "update_pair_lists_from_decoder": {                       # R2
+        "task": "celery_app.update_pair_lists_from_decoder",
+        "schedule": 300.0,                                    # every 5 min
+    },
+    "compute_bot_confidence": {                               # R4
+        "task": "celery_app.compute_bot_confidence",
+        "schedule": 300.0,                                    # every 5 min
+    },
+
+@@ Add 2 new tasks at end of file
+
+@app.task(queue="default")
+def update_pair_lists_from_decoder() -> dict:
+    """R2 — refresh BRAIN_PAIR_PROBATION and BRAIN_PAIR_SUSPENSION from the
+    decoder corpus. Probation: pair appears in F9 misses ≥3 times in last 24h.
+    Suspension: pair appears as F12 loser ≥3 times in 24h (+5 strength delta),
+    or ≥6 times in 24h (blocked=True for 6h).
+    Graduates from probation: post-add closed_trades ≥ 50 AND winrate ≥ 50%.
+    Auto-lifts suspension: now ≥ auto_lift_at."""
+    import json as _json, sys, time
+    if "/app" not in sys.path:
+        sys.path.insert(0, "/app")
+    import structlog
+    from db import db_conn
+    import redis_client
+    import redis_keys
+    log = structlog.get_logger()
+    r = redis_client.get()
+
+    # --- 1) F9 miss counts by pair (24h) → probation candidates ---
+    with db_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT s.pair, COUNT(*) AS n
+                FROM counterfactuals c
+                JOIN signals s ON s.id = c.signal_id
+                WHERE c.miss_decoded = TRUE
+                  AND c.created_at > NOW() - INTERVAL '24 hours'
+                GROUP BY s.pair
+                HAVING COUNT(*) >= 3
+            """)
+            f9_pairs = dict(cur.fetchall())
+
+            cur.execute("""
+                SELECT t.pair, COUNT(*) AS n
+                FROM mismatches m
+                JOIN trades t ON t.id = m.loser_trade_id
+                WHERE m.decoded_at > NOW() - INTERVAL '24 hours'
+                GROUP BY t.pair
+                HAVING COUNT(*) >= 3
+            """)
+            f12_loser_pairs = dict(cur.fetchall())
+
+    now = int(time.time())
+
+    # --- 2) Probation list build ---
+    prob_raw = r.get(redis_keys.BRAIN_PAIR_PROBATION)
+    probation = _json.loads(prob_raw) if prob_raw else {}
+    if not isinstance(probation, dict):
+        probation = {}
+
+    for pair, miss_count in f9_pairs.items():
+        if pair not in probation:
+            probation[pair] = {
+                "strength_delta":      -5.0,
+                "candle_setup_boost":  0.05,
+                "graduates_after":     50,
+                "trades_in_probation": 0,
+                "added_ts":            now,
+                "miss_count_24h":      int(miss_count),
+            }
+        else:
+            probation[pair]["miss_count_24h"] = int(miss_count)
+
+    # Graduation check — pairs in probation whose post-add closed trades ≥ 50 AND WR ≥ 50%.
+    if probation:
+        with db_conn() as conn:
+            with conn.cursor() as cur:
+                graduated = []
+                for pair, pd in list(probation.items()):
+                    added_ts = pd.get("added_ts", now)
+                    cur.execute("""
+                        SELECT COUNT(*) AS n,
+                               COUNT(*) FILTER (WHERE net_pnl_usdt > 0) AS wins
+                        FROM trades
+                        WHERE pair = %s
+                          AND closed_at IS NOT NULL
+                          AND opened_at > to_timestamp(%s)
+                    """, (pair, added_ts))
+                    n, wins = cur.fetchone()
+                    n = int(n or 0); wins = int(wins or 0)
+                    pd["trades_in_probation"] = n
+                    pd["wins_in_probation"]   = wins
+                    if n >= 50 and (wins / max(1, n)) >= 0.50:
+                        graduated.append(pair)
+                for pair in graduated:
+                    del probation[pair]
+                    log.info("pair_probation_graduated", pair=pair)
+
+    try:
+        r.set(redis_keys.BRAIN_PAIR_PROBATION, _json.dumps(probation))
+        r.set("pair:probation:count", len(probation))
+    except Exception:
+        pass
+
+    # --- 3) Suspension list build ---
+    susp_raw = r.get(redis_keys.BRAIN_PAIR_SUSPENSION)
+    suspension = _json.loads(susp_raw) if susp_raw else {}
+    if not isinstance(suspension, dict):
+        suspension = {}
+
+    # Auto-lift expired suspensions.
+    expired = [p for p, sd in suspension.items()
+               if isinstance(sd, dict) and now >= int(sd.get("auto_lift_at", 0))]
+    for pair in expired:
+        del suspension[pair]
+        log.info("pair_suspension_auto_lifted", pair=pair)
+
+    # Add/update suspensions.
+    for pair, loser_count in f12_loser_pairs.items():
+        loser_count = int(loser_count)
+        blocked = loser_count >= 6
+        delta = 10.0 if blocked else 5.0
+        suspension[pair] = {
+            "strength_delta":  delta,
+            "blocked":         blocked,
+            "loser_count_24h": loser_count,
+            "auto_lift_at":    now + (6 * 3600),
+            "added_ts":        now,
+        }
+
+    try:
+        r.set(redis_keys.BRAIN_PAIR_SUSPENSION, _json.dumps(suspension))
+        r.set("pair:suspension:count", len(suspension))
+    except Exception:
+        pass
+
+    log.info("pair_lists_updated",
+             probation_count=len(probation),
+             suspension_count=len(suspension),
+             f9_pairs=len(f9_pairs),
+             f12_loser_pairs=len(f12_loser_pairs))
+    return {"status": "ok",
+            "probation_count": len(probation),
+            "suspension_count": len(suspension)}
+
+
+@app.task(queue="default")
+def compute_bot_confidence() -> dict:
+    """R4 — recompute the bot self-confidence index."""
+    import sys
+    if "/app" not in sys.path:
+        sys.path.insert(0, "/app")
+    from metacognition.confidence import compute_and_store
+    return compute_and_store(window_seconds=3600)
+
+
+================================================================================
+DEPLOY STEPS (after approval, in order):
+================================================================================
+
+1. Copy SQL draft → migrations/026_predicted_profit_loop_phase1.sql
+2. Apply: `docker exec trading-bot-postgres-1 psql -U botuser -d trading_bot -f /migrations/026_*.sql`
+3. Apply file patches 1-7 above (decoders, actuator, NEW confidence.py, redis_keys, engine, manager, celery_app).
+4. Register F46 sub-gates in feature_governance/bootstrap.py: F46_bucketed, F46_pair_lists, F46_confidence (all gated on F46 parent).
+5. Rebuild Docker image:
+     `cd /opt/trading-bot && docker compose build && docker compose up -d`
+6. Verify within 10 min:
+   - `SELECT miss_tag, COUNT(*) FROM counterfactuals WHERE miss_decoded=TRUE
+      AND created_at > NOW() - INTERVAL '1 hour' GROUP BY miss_tag;` → tags landing
+   - `redis-cli GET brain:filter_overrides | jq` → v2 bucketed schema
+   - `redis-cli GET brain:bot_confidence` → float in [0.20, 1.00]
+   - `redis-cli GET brain:pair_probation | jq` → dict of probation pairs
+7. Counters to watch (silent-rejection rule):
+   - `decoders:f9_miss_tag_invalid_count` (should stay low)
+   - `decoders:bucket_applied_count:bull|40-44` (should grow)
+   - `bot:confidence:hard_skip_count` (should be rare; if >>0 the bot is in a slump)
+   - `pair:suspension:blocked_count:*` (per-pair blocks)
+
+ROLLBACK:
+- File patches: revert via git or restore from /opt/trading-bot/backups/.
+- Migration: run the rollback block at bottom of step1_026_*.sql.draft.
+- Redis state can be wiped via `metacognition/actuator.py:reset_overrides()` for R1
+  and `redis-cli DEL brain:pair_probation brain:pair_suspension brain:bot_confidence` for R2/R4.
+
+OPEN VERIFICATION ITEMS (not blocking approval — to confirm during deploy):
+1. `signals/engine.py` line numbers for the R2 pair-list and R4 hard-skip insertion
+   points may shift between drafting and apply; locate by surrounding context, not by line.
+2. F30/F46 sub-gate registration in feature_governance/bootstrap.py — need to confirm
+   the existing F46 entry there and follow the same pattern.
+3. The `accept_or_reject` (or equivalent) early-return path in signals/engine.py for
+   the R4 hard-skip — need to verify the exact return shape used elsewhere in that file.

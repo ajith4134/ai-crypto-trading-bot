@@ -26,8 +26,10 @@ def _check_health() -> None:
 
 
 def get_conn():
+    global _pool
     if _pool is None:
-        raise RuntimeError("DB pool not initialised — call init_pool() at startup")
+        # Auto-initialise in Celery worker child processes (same fix as redis_client.get())
+        init_pool()
     return _pool.getconn()
 
 
