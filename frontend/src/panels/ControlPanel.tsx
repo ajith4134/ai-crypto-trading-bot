@@ -82,7 +82,11 @@ const FapiStatus: React.FC = () => {
 // cont. 47 — Full paper↔live mode switcher.
 // Calls /bot/mode_switch which stops the bot, closes any open positions,
 // rewrites .env, restarts brain + celery + data_feed via watchdog.
-// Bidirectional: paper→live AND live→paper.
+// Two explicit, always-visible mode buttons so there is NO confusion between
+// simulated (paper) money and real money:
+//   • "Live Trading — Paper Money"  → target=paper  (simulated, safe, no exchange risk)
+//   • "Live Trading — Real Money"   → target=live   (REAL Binance MAINNET orders)
+// The currently-active mode is highlighted; clicking the other one switches to it.
 const ModeSwitchButton: React.FC<{
   currentMode: 'live' | 'paper';
   liveUnlocked: boolean;
@@ -91,116 +95,138 @@ const ModeSwitchButton: React.FC<{
   leverage?: number;
 }> = ({ currentMode, liveUnlocked, maxPos, startingCapital, leverage }) => {
   const [phase, setPhase] = useState<'idle' | 'confirming' | 'pending' | 'complete' | 'failed'>('idle');
+  const [target, setTarget] = useState<'live' | 'paper'>('live');
   const [errMsg, setErrMsg] = useState('');
   const [statusDetail, setStatusDetail] = useState<any>(null);
   const [liveCapital, setLiveCapital] = useState(String(startingCapital ?? 50));
   const [liveMaxPos,  setLiveMaxPos]  = useState(String(maxPos          ?? 10));
 
-  const goingTo: 'live' | 'paper' = currentMode === 'live' ? 'paper' : 'live';
-  const disabled = goingTo === 'live' && !liveUnlocked;
+  // Step 1: a button was clicked → enter confirm for THAT target.
+  const begin = (t: 'live' | 'paper') => {
+    if (phase === 'pending') return;
+    if (currentMode === t) return;          // already in this mode — no-op
+    if (t === 'live' && !liveUnlocked) return;
+    setTarget(t);
+    setErrMsg('');
+    setPhase('confirming');
+  };
 
-  const click = async () => {
-    if (phase === 'idle') {
-      setPhase('confirming');
-      return;
-    }
-    if (phase === 'confirming') {
-      setPhase('pending');
-      setErrMsg('');
-      try {
-        const payload: any = {
-          target: goingTo,
-          confirm: true,
-          close_open_trades: true,
-        };
-        if (goingTo === 'live') {
-          payload.max_position_usdt     = parseFloat(liveMaxPos);
-          payload.starting_capital_usdt = parseFloat(liveCapital);
-          payload.leverage              = leverage ?? 5;
-        }
-        const r = await switchBotMode(payload);
-        setStatusDetail(r);
-        // Poll status until complete or failed
-        const start = Date.now();
-        const poll = async () => {
-          if (Date.now() - start > 120000) {  // 2 min timeout
-            setPhase('failed');
-            setErrMsg('Timeout waiting for mode change (>120s)');
-            return;
-          }
-          try {
-            const s = await getModeChangeStatus();
-            setStatusDetail(s);
-            if (s.status === 'complete') {
-              setPhase('complete');
-              setTimeout(() => setPhase('idle'), 5000);
-            } else if (s.status === 'failed') {
-              setPhase('failed');
-              setErrMsg(JSON.stringify(s.result || s));
-            } else {
-              setTimeout(poll, 3000);
-            }
-          } catch (e: any) {
-            setTimeout(poll, 3000);
-          }
-        };
-        setTimeout(poll, 3000);
-      } catch (e: any) {
-        setPhase('failed');
-        setErrMsg(e?.response?.data?.detail || String(e));
+  // Step 2: confirm → commit the switch + poll status.
+  const commit = async () => {
+    setPhase('pending');
+    setErrMsg('');
+    try {
+      const payload: any = { target, confirm: true, close_open_trades: true };
+      if (target === 'live') {
+        payload.max_position_usdt     = parseFloat(liveMaxPos);
+        payload.starting_capital_usdt = parseFloat(liveCapital);
+        payload.leverage              = leverage ?? 5;
       }
+      const r = await switchBotMode(payload);
+      setStatusDetail(r);
+      const start = Date.now();
+      const poll = async () => {
+        if (Date.now() - start > 120000) {
+          setPhase('failed'); setErrMsg('Timeout waiting for mode change (>120s)'); return;
+        }
+        try {
+          const s = await getModeChangeStatus();
+          setStatusDetail(s);
+          if (s.status === 'complete') { setPhase('complete'); setTimeout(() => setPhase('idle'), 5000); }
+          else if (s.status === 'failed') { setPhase('failed'); setErrMsg(JSON.stringify(s.result || s)); }
+          else setTimeout(poll, 3000);
+        } catch { setTimeout(poll, 3000); }
+      };
+      setTimeout(poll, 3000);
+    } catch (e: any) {
+      setPhase('failed');
+      setErrMsg(e?.response?.data?.detail || String(e));
     }
   };
 
-  const bg =
-    phase === 'pending'   ? '#666'   :
-    phase === 'failed'    ? '#660000':
-    phase === 'complete'  ? '#006633':
-    disabled              ? '#2a2a2a':
-    goingTo === 'live'    ? '#cc6600':
-                            '#0066aa';
-  const label =
-    phase === 'pending'   ? '⏳ Switching… (watchdog rewriting .env + restarting brain)' :
-    phase === 'failed'    ? `❌ Failed — ${errMsg.slice(0, 80)}` :
-    phase === 'complete'  ? `✅ Switched to ${goingTo.toUpperCase()}` :
-    disabled              ? `Live locked — need 2000 trades + Stage 4` :
-    goingTo === 'live'    ? '🔴 Switch to LIVE Trading' :
-                            '⬅ Switch to PAPER Trading';
+  const cancel = () => { setPhase('idle'); setErrMsg(''); };
+
+  const modeBtn = (t: 'live' | 'paper', emoji: string, title: string, sub: string,
+                   activeBg: string, idleBg: string) => {
+    const active = currentMode === t;
+    const locked = t === 'live' && !liveUnlocked;
+    return (
+      <button onClick={() => begin(t)}
+        disabled={active || locked || phase === 'pending'}
+        title={locked ? 'Locked — need 2000 paper trades + Stage 4' : ''}
+        style={{ flex:1, padding:'10px 8px', fontSize:12, border: active ? '2px solid #fff' : 'none',
+          borderRadius:4, lineHeight:1.3, textAlign:'left',
+          background: active ? activeBg : locked ? '#2a2a2a' : idleBg,
+          color:'#fff', cursor: (active || locked || phase === 'pending') ? 'default' : 'pointer',
+          opacity: locked ? 0.6 : 1 }}>
+        <div style={{ fontWeight:700 }}>{emoji} {title} {active && '✓ ACTIVE'}</div>
+        <div style={{ fontSize:10, color:'#ddd', marginTop:2 }}>
+          {locked ? '🔒 need 2000 trades + Stage 4' : sub}
+        </div>
+      </button>
+    );
+  };
 
   return (
     <div>
-      <button onClick={click} disabled={disabled || phase === 'pending'}
-        style={{ width:'100%', padding:8, fontSize:12, border:'none', borderRadius:4,
-          background: bg, color: '#fff',
-          cursor: (disabled || phase === 'pending') ? 'not-allowed' : 'pointer' }}>
-        {phase === 'confirming'
-          ? `⚠ Confirm: Switch to ${goingTo.toUpperCase()}? (closes all open trades)`
-          : label}
-      </button>
-      {phase === 'confirming' && goingTo === 'live' && (
-        <div style={{ marginTop:6, padding:8, background:'#1a0d0d',
-                      border:'1px solid #cc6600', borderRadius:4, fontSize:11 }}>
-          <div style={{ marginBottom:4, color:'#ffaa00' }}>
-            Set live trading envelope:
+      <div style={{ display:'flex', gap:8 }}>
+        {modeBtn('paper', '🧪', 'Live Trading — Paper Money',
+                 'Simulated money. No exchange risk.', '#1a7a4a', '#0a3a24')}
+        {modeBtn('live', '🔴', 'Live Trading — Real Money',
+                 'REAL Binance MAINNET funds.', '#aa2222', '#3a0d0d')}
+      </div>
+
+      {phase === 'confirming' && target === 'live' && (
+        <div style={{ marginTop:8, padding:8, background:'#1a0d0d',
+                      border:'1px solid #cc2222', borderRadius:4, fontSize:11 }}>
+          <div style={{ marginBottom:4, color:'#ff6666', fontWeight:700 }}>
+            ⚠ REAL MONEY — live Binance MAINNET orders. This spends actual funds.
           </div>
           <label>Starting capital (USDT)
-            <input style={inp} value={liveCapital}
-                   onChange={e => setLiveCapital(e.target.value)} />
+            <input style={inp} value={liveCapital} onChange={e => setLiveCapital(e.target.value)} />
           </label>
           <label>Max position per trade (USDT)
-            <input style={inp} value={liveMaxPos}
-                   onChange={e => setLiveMaxPos(e.target.value)} />
+            <input style={inp} value={liveMaxPos} onChange={e => setLiveMaxPos(e.target.value)} />
           </label>
-          <div style={{ marginTop:6, fontSize:10, color:'#aaa' }}>
-            Real Binance MAINNET orders. Click button again to commit.
+          <div style={{ display:'flex', gap:8, marginTop:8 }}>
+            <button onClick={commit} style={{ flex:1, padding:8, border:'none', borderRadius:4,
+              background:'#aa2222', color:'#fff', cursor:'pointer', fontWeight:700 }}>
+              ⚠ Commit REAL-MONEY switch (closes open trades)
+            </button>
+            <button onClick={cancel} style={{ padding:8, border:'none', borderRadius:4,
+              background:'#444', color:'#fff', cursor:'pointer' }}>Cancel</button>
           </div>
         </div>
       )}
-      {phase === 'confirming' && goingTo === 'paper' && (
-        <div style={{ marginTop:6, padding:6, background:'#0d0d1a',
-                      border:'1px solid #0066aa', borderRadius:4, fontSize:11, color:'#aaa' }}>
-          Closes any open Binance position, then restarts brain in paper mode.
-          Click again to commit.
+
+      {phase === 'confirming' && target === 'paper' && (
+        <div style={{ marginTop:8, padding:8, background:'#0d1a12',
+                      border:'1px solid #1a7a4a', borderRadius:4, fontSize:11, color:'#aaa' }}>
+          Switch to simulated (paper) money. Closes any open Binance position, then restarts brain in paper mode.
+          <div style={{ display:'flex', gap:8, marginTop:8 }}>
+            <button onClick={commit} style={{ flex:1, padding:8, border:'none', borderRadius:4,
+              background:'#1a7a4a', color:'#fff', cursor:'pointer', fontWeight:700 }}>
+              Confirm switch to Paper Money
+            </button>
+            <button onClick={cancel} style={{ padding:8, border:'none', borderRadius:4,
+              background:'#444', color:'#fff', cursor:'pointer' }}>Cancel</button>
+          </div>
+        </div>
+      )}
+
+      {phase === 'pending' && (
+        <div style={{ marginTop:6, fontSize:11, color:'#ffaa00' }}>
+          ⏳ Switching to {target.toUpperCase()}… (watchdog rewriting .env + restarting brain)
+        </div>
+      )}
+      {phase === 'failed' && (
+        <div style={{ marginTop:6, fontSize:11, color:'#ff6666' }}>
+          ❌ Switch failed — {errMsg.slice(0, 140)}
+        </div>
+      )}
+      {phase === 'complete' && (
+        <div style={{ marginTop:6, fontSize:11, color:'#21d07a' }}>
+          ✅ Switched to {target.toUpperCase()}
         </div>
       )}
       {(phase === 'pending' || phase === 'complete') && statusDetail && (
@@ -218,6 +244,8 @@ const ControlPanel: React.FC = () => {
   const [minOpen, setMinOpen]     = useState('');
   const [maxOpen, setMaxOpen]     = useState('');
   const [maxPos,  setMaxPos]      = useState('');
+  const [minPos,  setMinPos]      = useState('');
+  const [lev,     setLev]         = useState('');
   const [capital, setCapital]     = useState('');
   const [saved,   setSaved]       = useState(false);
   const [saveErr, setSaveErr]     = useState('');
@@ -233,6 +261,8 @@ const ControlPanel: React.FC = () => {
       if (s.min_open_trades)       setMinOpen(String(s.min_open_trades));
       if (s.max_open_trades)       setMaxOpen(String(s.max_open_trades));
       if (s.max_position_usdt)     setMaxPos(String(s.max_position_usdt));
+      if (s.min_position_usdt)     setMinPos(String(s.min_position_usdt));
+      if (s.leverage)              setLev(String(s.leverage));
       if (s.starting_capital_usdt) setCapital(String(s.starting_capital_usdt));
     }
     setSaved(!!s.settings_configured);
@@ -260,6 +290,8 @@ const ControlPanel: React.FC = () => {
         min_open_trades:       Number(minOpen),
         max_open_trades:       Number(maxOpen),
         max_position_usdt:     Number(maxPos),
+        min_position_usdt:     minPos ? Number(minPos) : 0,
+        leverage:              lev ? Number(lev) : undefined,
         starting_capital_usdt: Number(capital),
       });
       dirtyRef.current = false;  // clear dirty flag — refresh can now sync fields again
@@ -396,6 +428,20 @@ const ControlPanel: React.FC = () => {
           <input type="number" min="1" step="10" value={maxPos}
             onChange={e => { setMaxPos(e.target.value); markDirty(); }}
             placeholder="e.g. 200  (hard cap per trade)" style={inp} />
+        </label>
+
+        <label style={{ fontSize:12, color:'#aaa', display:'block', marginBottom:10 }}>
+          Min capital per single trade (USDT)
+          <input type="number" min="0" step="10" value={minPos}
+            onChange={e => { setMinPos(e.target.value); markDirty(); }}
+            placeholder="e.g. 25  (floor per trade — 0/blank = no floor)" style={inp} />
+        </label>
+
+        <label style={{ fontSize:12, color:'#aaa', display:'block', marginBottom:10 }}>
+          Leverage (x) — applied to every trade
+          <input type="number" min="1" max="20" step="1" value={lev}
+            onChange={e => { setLev(e.target.value); markDirty(); }}
+            placeholder="e.g. 5  (1–20; your value is used as-is)" style={inp} />
         </label>
 
         <div style={{ display:'grid', gridTemplateColumns:'1fr 1fr', gap:8, marginBottom:12 }}>

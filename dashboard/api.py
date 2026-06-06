@@ -196,6 +196,7 @@ async def bot_status():
         "min_open_trades": r.get("bot:min_open_trades"),
         "max_open_trades": r.get("bot:max_open_trades"),
         "max_position_usdt": r.get("bot:max_position_usdt"),
+        "min_position_usdt": r.get("bot:min_position_usdt"),
         "starting_capital_usdt": r.get("bot:starting_capital_usdt"),
         "virtual_balance": r.get("account:virtual_balance"),
         # cont. 66 — real Binance futures balance (account_risk.monitor writes
@@ -607,6 +608,7 @@ async def bot_settings(settings: dict):
     current_min     = r.get("bot:min_open_trades")
     current_max     = r.get("bot:max_open_trades")
     current_pos     = r.get("bot:max_position_usdt")
+    current_pos_min = r.get("bot:min_position_usdt")
     current_capital = r.get("bot:starting_capital_usdt")
 
     current_lev = r.get("bot:leverage")
@@ -614,6 +616,8 @@ async def bot_settings(settings: dict):
     min_t    = settings.get("min_open_trades",      int(current_min)     if current_min     else None)
     max_t    = settings.get("max_open_trades",      int(current_max)     if current_max     else None)
     max_pos  = settings.get("max_position_usdt",    float(current_pos)   if current_pos     else None)
+    # min_position_usdt is OPTIONAL (a per-trade floor). None/0 = no floor (engine keeps its $5 default).
+    min_pos  = settings.get("min_position_usdt",    float(current_pos_min) if current_pos_min else None)
     capital  = settings.get("starting_capital_usdt",float(current_capital) if current_capital else None)
     leverage = settings.get("leverage",             int(current_lev)     if current_lev     else 5)
 
@@ -630,6 +634,11 @@ async def bot_settings(settings: dict):
         errors.append("starting_capital_usdt must be ≥ 100 USDT")
     if max_pos and capital and float(max_pos) > float(capital):
         errors.append("max_position_usdt cannot exceed starting_capital_usdt")
+    if min_pos is not None and float(min_pos) > 0:
+        if float(min_pos) < 1:
+            errors.append("min_position_usdt must be ≥ 1 USDT")
+        if max_pos and float(min_pos) > float(max_pos):
+            errors.append("min_position_usdt cannot exceed max_position_usdt")
     if not (1 <= int(leverage) <= 20):
         errors.append("leverage must be between 1 and 20")
     if errors:
@@ -638,6 +647,9 @@ async def bot_settings(settings: dict):
     r.set("bot:min_open_trades",      int(min_t))
     r.set("bot:max_open_trades",      int(max_t))
     r.set("bot:max_position_usdt",    float(max_pos))
+    # 0 / unset clears the floor (engine falls back to its built-in $5 minimum).
+    if min_pos is not None:
+        r.set("bot:min_position_usdt", float(min_pos))
     r.set("bot:starting_capital_usdt", float(capital))
     r.set("bot:leverage",             int(leverage))
 
@@ -663,6 +675,7 @@ async def bot_settings(settings: dict):
         "min_open_trades": int(min_t),
         "max_open_trades": int(max_t),
         "max_position_usdt": float(max_pos),
+        "min_position_usdt": float(min_pos) if min_pos is not None else None,
         "starting_capital_usdt": float(capital),
         "leverage": int(leverage),
         "virtual_balance_reset": balance_reset,
@@ -1082,9 +1095,42 @@ async def analytics_equity_curve(all_history: bool = False):
     return points
 
 
+# cont. 70e2 — price-movement columns for the scanner + launch-pad tables.
+def _trailing_move(r, pair: str) -> dict:
+    """Live TRAILING price movement % over the last 15m/30m/1h, computed from the
+    1m candles in Redis (`{pair}:1m:candles`, newest-first: index 0 = latest).
+    Returns {trail_15m, trail_30m, trail_60m} (omits a window with no data)."""
+    import json as _json
+    out: dict = {}
+    try:
+        raw = r.lrange(f"{pair}:1m:candles", 0, 61)
+    except Exception:
+        return out
+    if not raw or len(raw) < 2:
+        return out
+
+    def _close(i: int) -> float:
+        try:
+            return float(_json.loads(raw[i]).get("c") or 0)
+        except Exception:
+            return 0.0
+
+    now_px = _close(0)
+    if now_px <= 0:
+        return out
+    for field, idx in (("trail_15m", 15), ("trail_30m", 30), ("trail_60m", 60)):
+        if len(raw) > idx:
+            then = _close(idx)
+            if then > 0:
+                out[field] = round((now_px - then) / then * 100.0, 3)
+    return out
+
+
 @app.get("/pairs/active", dependencies=[Depends(_verify_token)])
 async def pairs_active():
+    import redis_client
     from db import db_conn
+    r = redis_client.get()
     with db_conn() as conn:
         with conn.cursor() as cur:
             cur.execute("""
@@ -1095,7 +1141,11 @@ async def pairs_active():
                 ORDER BY composite_score DESC NULLS LAST
             """)
             cols = [d[0] for d in cur.description]
-            return [dict(zip(cols, row)) for row in cur.fetchall()]
+            rows = [dict(zip(cols, row)) for row in cur.fetchall()]
+    for p in rows:
+        sym = p.get("symbol") or ""
+        p.update(_trailing_move(r, sym))
+    return rows
 
 
 @app.get("/launchpad", dependencies=[Depends(_verify_token)])
@@ -1120,6 +1170,12 @@ async def launchpad():
             """)
             cols = [d[0] for d in cur.description]
             slots = [dict(zip(cols, row)) for row in cur.fetchall()]
+    # cont. 70e2 — attach trailing (live) + since-entry (maintainer-captured)
+    # movement % to each occupied slot.
+    for s in slots:
+        sym = s.get("symbol")
+        if sym:
+            s.update(_trailing_move(r, sym))
     return {
         "enabled": r.get(redis_keys.LAUNCHPAD_ENABLED) == "1",
         "depth": int(r.get(redis_keys.LAUNCHPAD_DEPTH) or 10),
@@ -1133,47 +1189,62 @@ async def launchpad():
 async def shadow_win_rate():
     """Blueprint 15.6: Shadow Win Rate panel element.
 
-    Returns Redis-cached stats PLUS staleness metadata so the UI can warn when
-    the sample is non-representative (e.g., 11/14 evaluated from the May 15-18
-    era while 134k recent signals haven't aged through the 72h CF window yet).
-    """
-    import redis_client, redis_keys, json
-    from db import db_conn
-    r = redis_client.get()
-    raw = r.get(redis_keys.SHADOW_WIN_RATE)
-    stats = json.loads(raw) if raw else {"total": 0, "won": 0, "rate": 0.0}
+    cont. 70g (2026-06-05) — computed LIVE from the counterfactuals table, not the
+    incremental Redis counter (which had drifted: counter said 41.8%/44912 while the
+    table is ~36.7%/94036). The table is the single source of truth.
 
-    sample_oldest = None
-    sample_newest = None
+    NOTE: the underlying `would_have_won` is a POINT-IN-TIME check at the 72h
+    checkpoint with NO stop-loss path modelling (peak_loss is structurally 0), so
+    this rate is an OPTIMISTIC upper bound — a path-aware win rate would be lower.
+    The `basis`/`note` fields tell the UI to label it as such.
+    """
+    from db import db_conn
+    won = total = 0
+    sample_oldest = sample_newest = None
     pending_eval = 0
     try:
         with db_conn() as conn:
             with conn.cursor() as cur:
                 cur.execute("""
-                    SELECT MIN(s.generated_at), MAX(s.generated_at)
+                    SELECT count(*) FILTER (WHERE c.would_have_won)          AS won,
+                           count(*) FILTER (WHERE c.would_have_won IS NOT NULL) AS total,
+                           MIN(s.generated_at), MAX(s.generated_at)
                     FROM counterfactuals c
                     JOIN signals s ON s.id = c.signal_id
                 """)
                 row = cur.fetchone()
                 if row:
-                    sample_oldest = row[0].isoformat() if row[0] else None
-                    sample_newest = row[1].isoformat() if row[1] else None
+                    won   = int(row[0] or 0)
+                    total = int(row[1] or 0)
+                    sample_oldest = row[2].isoformat() if row[2] else None
+                    sample_newest = row[3].isoformat() if row[3] else None
+                # Real backlog = rejected signals already PAST the 72h+slack maturity
+                # window that still have no counterfactual row. (Signals < ~84h old are
+                # not "stale" — they simply haven't matured yet, which is by design.)
                 cur.execute("""
                     SELECT COUNT(*)
                     FROM signals s
                     LEFT JOIN counterfactuals c ON c.signal_id = s.id
                     WHERE s.accepted = FALSE
-                      AND s.generated_at < NOW() - INTERVAL '72 hours'
+                      AND s.generated_at < NOW() - INTERVAL '84 hours'
                       AND c.signal_id IS NULL
                 """)
                 pending_eval = int(cur.fetchone()[0] or 0)
     except Exception:
         pass
 
-    stats["sample_oldest"] = sample_oldest
-    stats["sample_newest"] = sample_newest
-    stats["pending_eval"]  = pending_eval
-    return stats
+    return {
+        "won": won,
+        "total": total,
+        "rate": round(100.0 * won / total, 2) if total else 0.0,
+        "sample_oldest": sample_oldest,
+        "sample_newest": sample_newest,
+        "pending_eval": pending_eval,
+        # cont. 70g — honesty metadata for the UI.
+        "basis": "point_in_time_72h",
+        "optimistic": True,
+        "note": "Point-in-time at the 72h checkpoint; excludes stop-loss path → optimistic upper bound.",
+    }
 
 
 @app.get("/signals/acceptance_rate", dependencies=[Depends(_verify_token)])
@@ -1339,13 +1410,93 @@ if(T)show();setInterval(()=>{if(T)refresh()},5000);
 </script></div></body></html>"""
 
 
+# cont. 70g — path-aware counterfactual metrics for the Missed-Opportunities panel.
+# The stored `peak_profit_pct` is the point-in-time move at the 72h checkpoint (NOT a
+# true peak, no drawdown/stop path). Here we walk the actual 15m candle path over the
+# 72h window to surface the TRUE max favourable excursion AND the drawdown you'd have
+# had to sit through to reach it (so a "+19% miss" that first dipped -12% is exposed).
+# On-demand + Redis-cached (24h) + fapi-ban-guarded + best-effort → never breaks the
+# panel; only the ~10 displayed rows are ever computed, each once.
+_EXCH_CLIENT = None
+
+
+def _exchange_client():
+    global _EXCH_CLIENT
+    if _EXCH_CLIENT is None:
+        from exchange.client import BinanceClient
+        _EXCH_CLIENT = BinanceClient()
+    return _EXCH_CLIENT
+
+
+def _cf_path_metrics(pair: str, direction: str, signal_dt) -> dict | None:
+    """True MFE + drawdown-to-peak + MAE over the 72h window from 15m candles.
+    Returns None on any failure (caller falls back to the point-in-time numbers)."""
+    import redis_client, json as _json
+    if signal_dt is None or not pair or direction not in ("long", "short"):
+        return None
+    r = redis_client.get()
+    sig_ms = int(signal_dt.timestamp() * 1000)
+    ckey = f"cf:path:{pair}:{sig_ms}"
+    try:
+        cached = r.get(ckey)
+        if cached:
+            return _json.loads(cached)
+    except Exception:
+        pass
+    try:                                   # don't poke a banned fapi endpoint
+        if (r.get("fapi:ban_status") or "ok") not in ("ok", "none", "", None):
+            return None
+    except Exception:
+        pass
+    try:
+        kl = _exchange_client().get_historical_klines(
+            pair, "15m", sig_ms, sig_ms + 72 * 3600 * 1000)
+    except Exception:
+        return None
+    if not kl or len(kl) < 2:
+        return None
+    try:
+        entry = float(kl[0][1])            # first bar open ≈ price at signal time
+        if entry <= 0:
+            return None
+        peak = 0.0; dd_to_peak = 0.0; mae = 0.0; running_adv = 0.0
+        for k in kl:
+            hi, lo = float(k[2]), float(k[3])
+            if direction == "long":
+                fav = (hi - entry) / entry * 100.0
+                adv = (lo - entry) / entry * 100.0
+            else:
+                fav = (entry - lo) / entry * 100.0
+                adv = (entry - hi) / entry * 100.0
+            running_adv = min(running_adv, adv)
+            if fav > peak:
+                peak = fav
+                dd_to_peak = running_adv   # worst drawdown endured up to the new peak
+            mae = min(mae, adv)
+        out = {
+            "path_peak_pct": round(peak, 3),          # true max favourable excursion
+            "path_dd_to_peak_pct": round(dd_to_peak, 3),  # drawdown to reach that peak
+            "path_mae_pct": round(mae, 3),            # worst adverse over the window
+        }
+    except Exception:
+        return None
+    try:
+        r.setex(ckey, 86400, _json.dumps(out))
+    except Exception:
+        pass
+    return out
+
+
 @app.get("/signals/missed_opportunities", dependencies=[Depends(_verify_token)])
 async def signal_missed_opportunities(limit: int = 10):
     """Blueprint 15.6: Recent Missed Opportunities panel element.
 
     Returns rejected signals that were counterfactually profitable AND have a
-    decoded explanation from F9 Miss Decoder. The decoder writes the analysis
-    to `counterfactuals.miss_decode_reason`; this endpoint surfaces it.
+    decoded explanation from F9 Miss Decoder.
+
+    cont. 70g — each row is enriched (best-effort) with PATH-AWARE metrics from the
+    real candle path so the optimistic point-in-time `peak_profit_pct` can be shown
+    next to the true peak + the drawdown you'd have endured to reach it.
     """
     from db import db_conn
     lim = max(1, min(int(limit), 100))
@@ -1353,7 +1504,7 @@ async def signal_missed_opportunities(limit: int = 10):
         with conn.cursor() as cur:
             cur.execute("""
                 SELECT s.pair, s.direction, s.signal_strength,
-                       s.rejection_reason, s.market_regime,
+                       s.rejection_reason, s.market_regime, s.generated_at,
                        c.peak_profit_pct, c.peak_loss_pct,
                        c.miss_decode_reason, c.created_at AS evaluated_at
                 FROM counterfactuals c
@@ -1364,7 +1515,16 @@ async def signal_missed_opportunities(limit: int = 10):
                 LIMIT %s
             """, (lim,))
             cols = [d[0] for d in cur.description]
-            return [dict(zip(cols, row)) for row in cur.fetchall()]
+            rows = [dict(zip(cols, row)) for row in cur.fetchall()]
+    for row in rows:
+        try:
+            pm = _cf_path_metrics(row.get("pair"), row.get("direction"),
+                                  row.get("generated_at"))
+            if pm:
+                row.update(pm)
+        except Exception:
+            pass
+    return rows
 
 
 @app.get("/trades/closed/export", dependencies=[Depends(_verify_token)])

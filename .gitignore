@@ -1,8 +1,27 @@
+# Secrets
 .env
+.env.bak*
+.env.bak_*
+
+# Large data / models (restore separately)
 models/
 data/historical/
+data/external/
+data/trades.db
+hf_cache/
+
+# Logs & runtime
 logs/
+*.log
+
+# Python
 __pycache__/
 *.pyc
-.DS_Store
+*.pyo
 *.egg-info/
+.DS_Store
+
+# Node build output
+frontend/node_modules/
+frontend/dist/
+frontend/build/

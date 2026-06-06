@@ -135,14 +135,40 @@ forceOrder return SILENT NO-DATA on /ws and /stream; use **`wss://fstream.binanc
 - NOTE: cluster LEVELS half stays dormant (no provider keys) — pre-existing, out of scope; WS flow
       now carries the live liquidation entry signal. Paper-first per [[project_judge_replaces_entry_gates]].
 
-## REMAINING WS-migration steps (use /market/stream for all of these)
-- [ ] **Live candles for trading** (data_feed `_poll_candles`/`_poll_short_candles`, Redis CANDLES list)
-      → reuse kline_ws's WS feed (or extend it) so live-mode candle polling doesn't hit production fapi.
+## Step (live candles) ✅ DONE — verified 2026-06-04 (cont. 70d)
+- [x] **Live candles for trading** ALREADY migrated in data/feed.py (`_poll_candles`/`_poll_short_candles`
+      → `_collect_candles` builds CANDLES from klines:ws zset + WS-fed CSV corpus, REST gated cold-start
+      fallback only). Levers feed:candles:ws_enabled / feed:candles:rest_fallback_enabled; beacons
+      feed:candles:source:{itv} (ws|mixed|rest). The prior checklist mislabeled this as remaining.
+
+## Step (candle REST leak) ✅ FIXED + VERIFIED 2026-06-04 (cont. 70d)
+- [x] ROOT CAUSE: scanner rotates `scanner:active_pairs` every ~20 min, but data/kline_ws.py re-read the
+      universe ONLY on its 12h connection rotation → pairs rotating IN got no WS klines for up to 12h, so
+      `_poll_candles` fell back to production /fapi/v1/klines for them every cycle (the persistent
+      "candles_rest_fallback pairs=2" bleed). Same churn as the active-pairs-count question.
+- [x] FIX: data/kline_ws.py — added `_resubscribe_loop` (background task on the live socket) that diffs the
+      active set every `klines:ws:resubscribe_s` (default 45s) and SUBSCRIBEs newly-added streams; additive
+      within a session (12h rotation prunes). kline_ws.py is BIND-MOUNTED → `restart kline_ws` (no rebuild).
+- [x] VERIFIED: kline_ws reconnected 33 pairs/165 streams, klines:ws:closed incrementing (read loop intact);
+      candles_rest_fallback = 0 over 80s post-deploy (was firing ~every 5-min cycle before).
+
+## Step (24h ticker) ✅ DONE + VERIFIED 2026-06-04 (cont. 70d)
+- [x] **24h ticker** → `!ticker@arr` on /market/stream. NEW `_ws_ticker_loop` in data/feed.py writes the SAME
+      keys (TICKER_VOLUME_24H ← base vol `v`, TICKER_CHANGE_24H ← pct `P`) so scanner volume sort + dead-pair
+      filter are unchanged. REST /fapi/v1/ticker/24hr (weight 40) is now a STANDBY: data_loop calls it only
+      when beacon feed:ws_ticker:fresh (TTL 60s) is stale, with `ticker_rest_fallback` log + counter.
+- [x] data/feed.py is BAKED (data_feed mounts only models + historical:ro) → REBUILT trading-bot-app:latest,
+      verified IMAGE has new code (docker run grep = 7 hits), recreated data_feed.
+- [x] VERIFIED: ws_ticker_connected fstream.binance.com/market/stream?streams=!ticker@arr; feed:ticker:source
+      =ws, feed:ws_ticker:fresh=145; one cold-start ticker_rest_fallback BEFORE WS connect then 0 recurrence.
+      Production fstream (not testnet) is correct — market data needs real mainnet liquidity, zero weight.
+
+## REMAINING (only by-design REST left)
 - [ ] **Open interest** has NO Binance WS — keep openInterestHist REST (weight 0, separate 1000/5min pool;
       NOT the ban cause) or data.binance.vision daily metrics; Coinalyze (free 40/min) optional fallback.
-- [ ] Migrate mark/funding/liq into data_feed (baked → rebuild) or extend kline_ws; verify; confirm
-      production fapi weight stays ~0 with live-mode simulated.
-- [ ] Delete this file after the full migration is verified.
+      THIS IS BY DESIGN — not a leak. All other production fapi REST is now WS or gated cold-start fallback.
+- [ ] Final live-mode confirmation: re-verify production fapi weight ~0 once TRADING_MODE=live is flipped
+      (paper/testnet now). Then this file can be deleted.
 
 ## Handoff
 cont. 69x throttle is LIVE (signals/microstructure.scan_all, Redis levers micro:rest:*). This file is

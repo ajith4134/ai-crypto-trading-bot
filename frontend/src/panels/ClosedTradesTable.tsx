@@ -157,7 +157,7 @@ const ClosedTradesTable: React.FC = () => {
               return (
                 <tr key={t.id} style={{background:bgRow}}>
                   {/* Identity */}
-                  {td(<strong style={{color:'#00d4ff'}}>{t.pair}</strong>)}
+                  {td(<strong style={{color:'#00d4ff'}}>{t.pair}{t.entry_source === 'replay' && <small style={{color:'#ffaa00',fontSize:9,fontFamily:'monospace',fontWeight:'normal'}}> (replay)</small>}</strong>)}
                   {td(t.direction?.toUpperCase(), t.direction==='long'?'#00ff88':'#ff6666')}
                   {td(fmtTime(t.entry_time),'#888')}
                   {td(fmt6(t.entry_price))}

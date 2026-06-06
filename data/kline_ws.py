@@ -16,9 +16,18 @@ Uses the SUBSCRIBE control method (not a giant ?streams= URL) because 100+ pairs
 1024-streams/connection cap.
 
 Config (Redis):
-  klines:ws:enabled    "0" disables (sleep-loops)                 [default 1]
-  klines:ws:max_pairs  0 = all active pairs; N = top-N by 24h vol [default 0]
-  klines:ws:keep       closed candles retained per pair/interval  [default 500]
+  klines:ws:enabled        "0" disables (sleep-loops)                 [default 1]
+  klines:ws:max_pairs      0 = all active pairs; N = top-N by 24h vol [default 0]
+  klines:ws:keep           closed candles retained per pair/interval  [default 500]
+  klines:ws:resubscribe_s  re-read active set + SUBSCRIBE new pairs   [default 45]
+
+cont. 69x follow-up: the scanner rotates `scanner:active_pairs` every ~20 min, but this
+service used to re-read the universe only on the 12h connection rotation. Pairs that
+rotated IN therefore got no WS klines for up to 12h, so data/feed._poll_candles fell back
+to production /fapi/v1/klines REST for them every cycle (the persistent "candles_rest_fallback
+pairs=2" bleed). A background resubscribe loop now diffs the live active set every
+`resubscribe_s` and SUBSCRIBEs newly-added streams on the SAME socket (additive within a
+session; the 12h rotation prunes dropped pairs), closing the gap to ~45s.
 
 Run as docker-compose service `kline_ws`: `python -m data.kline_ws`.
 """
@@ -72,12 +81,54 @@ def _select_pairs(r, max_pairs: int) -> list[str]:
     return pairs[:max_pairs] if max_pairs > 0 else pairs
 
 
-async def _run_stream(pairs: list[str], stop_after_s: float) -> None:
+def _streams_for(pairs: list[str]) -> list[str]:
+    return [f"{p.lower()}@kline_{itv}" for p in pairs for itv in _INTERVALS]
+
+
+async def _resubscribe_loop(ws, subscribed: set[str], r, max_pairs: int,
+                            interval_s: float, started: float,
+                            stop_after_s: float) -> None:
+    """Every `interval_s`, re-read the active set and SUBSCRIBE any newly-added
+    streams on the live socket so kline_ws tracks the ~20-min scanner rotation
+    instead of waiting for the 12h connection cycle. Additive within a session
+    (no UNSUBSCRIBE) to avoid candle-continuity gaps from transient churn — the
+    12h rotation re-bases the subscription set and prunes dropped pairs."""
+    loop = asyncio.get_event_loop()
+    sub_id = 10_000
+    while time.time() - started < stop_after_s:
+        await asyncio.sleep(interval_s)
+        try:
+            pairs = await loop.run_in_executor(None, _select_pairs, r, max_pairs)
+        except Exception:
+            continue
+        if not pairs:
+            continue
+        new = sorted(set(_streams_for(pairs)) - subscribed)
+        if not new:
+            continue
+        for i in range(0, len(new), _SUB_CHUNK):
+            await ws.send(json.dumps({"method": "SUBSCRIBE",
+                                      "params": new[i:i + _SUB_CHUNK],
+                                      "id": sub_id}))
+            sub_id += 1
+            await asyncio.sleep(0.25)
+        subscribed.update(new)
+        log.info("kline_ws_resubscribed", added=len(new), total=len(subscribed))
+        try:
+            r.setex("klines:ws:subscribed_streams", 600, len(subscribed))
+        except Exception:
+            pass
+
+
+async def _run_stream(pairs: list[str], stop_after_s: float, max_pairs: int) -> None:
     """Subscribe kline streams for `pairs` and persist closed candles until
-    stop_after_s elapses or the socket drops."""
+    stop_after_s elapses or the socket drops. A background loop SUBSCRIBEs
+    pairs that rotate into the active set mid-session."""
     r = redis_client.get()
     keep = _cfg_int(r, "klines:ws:keep", 500)
-    streams = [f"{p.lower()}@kline_{itv}" for p in pairs for itv in _INTERVALS]
+    resub_s = float(_cfg_int(r, "klines:ws:resubscribe_s", 45))
+    streams = _streams_for(pairs)
+    subscribed: set[str] = set()
     started = time.time()
 
     async with websockets.connect(_WS_MARKET, ping_interval=20, ping_timeout=60,
@@ -89,43 +140,54 @@ async def _run_stream(pairs: list[str], stop_after_s: float) -> None:
                                       "id": sub_id}))
             sub_id += 1
             await asyncio.sleep(0.25)
+        subscribed.update(streams)
         log.info("kline_ws_connected", pairs=len(pairs), streams=len(streams))
 
-        n_closed = 0
-        async for raw in ws:
-            if time.time() - started > stop_after_s:
-                break
-            try:
-                m = json.loads(raw)
-                ev = m.get("data", m)            # /market/stream wraps as {stream,data}
-            except Exception:
-                continue
-            k = ev.get("k")
-            if not k or not k.get("x"):          # only CLOSED candles
-                continue
-            try:
-                sym = (k.get("s") or ev.get("s") or "").upper()
-                itv = k.get("i")
-                ts = int(k["t"])
-                row = json.dumps([ts, k["o"], k["h"], k["l"], k["c"], k["v"]])
-            except (TypeError, ValueError, KeyError):
-                continue
-            if not sym or not itv:
-                continue
-            key = f"klines:ws:{sym}:{itv}"
-            try:
-                pipe = r.pipeline()
-                pipe.zadd(key, {row: ts})
-                pipe.zremrangebyrank(key, 0, -(keep + 1))   # keep newest `keep`
-                pipe.execute()
-            except Exception:
-                continue
-            n_closed += 1
-            if n_closed % 200 == 0:
+        refresh_task = asyncio.create_task(
+            _resubscribe_loop(ws, subscribed, r, max_pairs, resub_s,
+                              started, stop_after_s))
+        try:
+            n_closed = 0
+            async for raw in ws:
+                if time.time() - started > stop_after_s:
+                    break
                 try:
-                    r.setex("klines:ws:closed", 300, n_closed)
+                    m = json.loads(raw)
+                    ev = m.get("data", m)        # /market/stream wraps as {stream,data}
                 except Exception:
-                    pass
+                    continue
+                k = ev.get("k")
+                if not k or not k.get("x"):       # only CLOSED candles
+                    continue
+                try:
+                    sym = (k.get("s") or ev.get("s") or "").upper()
+                    itv = k.get("i")
+                    ts = int(k["t"])
+                    row = json.dumps([ts, k["o"], k["h"], k["l"], k["c"], k["v"]])
+                except (TypeError, ValueError, KeyError):
+                    continue
+                if not sym or not itv:
+                    continue
+                key = f"klines:ws:{sym}:{itv}"
+                try:
+                    pipe = r.pipeline()
+                    pipe.zadd(key, {row: ts})
+                    pipe.zremrangebyrank(key, 0, -(keep + 1))   # keep newest `keep`
+                    pipe.execute()
+                except Exception:
+                    continue
+                n_closed += 1
+                if n_closed % 200 == 0:
+                    try:
+                        r.setex("klines:ws:closed", 300, n_closed)
+                    except Exception:
+                        pass
+        finally:
+            refresh_task.cancel()
+            try:
+                await refresh_task
+            except (asyncio.CancelledError, Exception):
+                pass
         log.info("kline_ws_stream_ended", closed=n_closed)
 
 
@@ -145,7 +207,7 @@ async def main() -> None:
             await asyncio.sleep(30)
             continue
         try:
-            await _run_stream(pairs, stop_after_s=rotate_s)
+            await _run_stream(pairs, stop_after_s=rotate_s, max_pairs=max_pairs)
         except Exception as exc:
             log.warning("kline_ws_stream_error", error=str(exc)[:200])
             await asyncio.sleep(5)          # backoff before reconnect

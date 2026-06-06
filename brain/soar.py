@@ -35,6 +35,18 @@ class MasterBrain:
         self._stage = 1
         self._paper_closed = 0
         self._running = False
+        # cont.70 SAFETY: publish the REAL order-routing mode (the one that
+        # decides paper-vs-real-money, = config.TRADING_MODE at process start)
+        # so the dashboard's cosmetic `bot:mode` flag can never silently
+        # misrepresent it. See project_paper_live_switch_bug.
+        try:
+            _r = redis_client.get()
+            _r.set("bot:actual_trading_mode", config.TRADING_MODE)
+            _r.set("bot:actual_engine", type(self._engine).__name__)
+            log.info("brain_routing_mode", actual_mode=config.TRADING_MODE,
+                     engine=type(self._engine).__name__)
+        except Exception as exc:
+            log.warning("actual_mode_publish_failed", error=str(exc))
 
     # ------------------------------------------------------------------
     # X-02: Global Workspace — shared market snapshot
@@ -377,6 +389,21 @@ class MasterBrain:
                 check_dca_triggers(trade, self._engine)
             except Exception as exc:
                 log.warning("dca_check_failed", trade_id=trade.get("id"), error=str(exc))
+
+        # cont.70 SAFETY INTERLOCK — paper/live mislabel guard.
+        # The dashboard `/bot/mode` toggle is COSMETIC (sets bot:mode only); real
+        # routing is config.TRADING_MODE (env, fixed at brain start). If the operator
+        # set the label to "paper" while routing is actually LIVE, they believe no real
+        # money is at risk while the engine places real orders (the 2026-06-04 incident).
+        # REFUSE to open and force-stop. See project_paper_live_switch_bug.
+        if config.TRADING_MODE == "live" and (r.get("bot:mode") or "paper") == "paper":
+            r.set("bot:running", "0")
+            r.incr("safety:paper_live_mislabel_halt_count")
+            log.error("paper_live_mislabel_halt",
+                      actual_mode=config.TRADING_MODE,
+                      label_mode=r.get("bot:mode"),
+                      action="forced bot:running=0; refusing to open real trades")
+            return
 
         # Dashboard Stop button — gate new signal-driven entries on bot:running.
         # Existing-position management (trailing SL in monitor_trailing_sl task, DCA above,

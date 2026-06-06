@@ -27,7 +27,10 @@ const OpenTradesTable: React.FC = () => {
     const mark = +(t.current_mark_price ?? t.entry_price ?? 0);
     const stratName = t.strategy_name || '—';
     return [
-    t.pair, t.direction?.toUpperCase(),
+    (t.entry_source === 'replay'
+      ? <span>{t.pair} <small style={{color:'#ffaa00',fontSize:9,fontFamily:'monospace'}}>(replay)</small></span>
+      : t.pair),
+    t.direction?.toUpperCase(),
     <span style={{color:stratName === '—' ? '#555' : '#aa88ff', fontSize:10, fontFamily:'monospace'}}>{stratName}</span>,
     `$${(+t.entry_price||0).toLocaleString(undefined,{maximumFractionDigits:6})}`,
     `$${(+(t.average_entry||t.entry_price)||0).toLocaleString(undefined,{maximumFractionDigits:6})}`,

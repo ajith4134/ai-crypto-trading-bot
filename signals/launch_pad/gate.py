@@ -108,18 +108,38 @@ def on_open(r, pair: str, slot: int, trade_id) -> None:
     counter. The P4 maintainer refills the freed slot on its next tick.
     Best-effort: a failure here must never unwind an already-open trade.
     """
+    from . import store
+    _is_replay = store.is_replay_slot(slot)
     try:
         from db import db_conn
-        from . import store
         with db_conn() as conn:
             store.clear_slot(conn, r, slot, exit_reason="fired", trade_id=trade_id)
+            # cont. 70d — tag the trade row so the dashboard shows "(replay)" next
+            # to the symbol in BOTH open and closed views (entry_source flows
+            # through SELECT * / SELECT t.*). trades.id is uuid → pass as text.
+            if _is_replay and trade_id is not None:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "UPDATE trades SET entry_source = 'replay' WHERE id = %s",
+                        (str(trade_id),),
+                    )
     except Exception as exc:
         log.warning("launchpad_on_open_clear_failed",
                     pair=pair, slot=slot, error=str(exc)[:160])
+    # cont. 70d — a replay slot that actually opened a trade is the true "consume"
+    # event the replay pool's consume_count tracks. The history row (written by
+    # clear_slot above) carries source='replay' + trade_id for the reliability study.
+    if _is_replay:
+        try:
+            from signals import replay_pool
+            replay_pool.mark_consumed()
+        except Exception:
+            pass
     try:
         secs = int(r.get(redis_keys.LAUNCHPAD_COOLDOWN_SECONDS) or _DEFAULT_COOLDOWN_S)
         r.zadd(redis_keys.LAUNCHPAD_COOLDOWN, {pair: time.time() + secs})
         r.incr(redis_keys.LAUNCHPAD_OPEN_COUNT)
-        log.info("launchpad_open", pair=pair, slot=slot, trade_id=trade_id)
+        log.info("launchpad_open", pair=pair, slot=slot, trade_id=trade_id,
+                 source=("replay" if _is_replay else "scanner"))
     except Exception:
         pass

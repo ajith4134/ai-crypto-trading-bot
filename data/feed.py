@@ -100,8 +100,25 @@ def _ws_mark_fresh(r) -> int:
         return 0
 
 
+def _ws_ticker_fresh(r) -> int:
+    """Number of symbols the WS 24h-ticker feed is currently tracking, or 0 if its
+    freshness beacon (set by _ws_ticker_loop, TTL 60s) has expired.
+
+    cont. 69x item 3 — drives the REST /fapi/v1/ticker/24hr standby in data_loop:
+    while the !ticker@arr WS feed is alive this returns >0 and the production-fapi
+    24h-ticker poll never fires; if the WS drops for >60s the beacon expires and
+    REST takes over as a visible fallback (Silent Rejection Rule)."""
+    try:
+        v = r.get("feed:ws_ticker:fresh")
+        return int(v) if v is not None else 0
+    except (TypeError, ValueError):
+        return 0
+
+
 def _poll_24h_tickers(r) -> None:
-    """K-02: 24h ticker data (volume, change) — poll every 30s."""
+    """K-02: 24h ticker data (volume, change). cont. 69x item 3: now a STANDBY
+    fallback — data_loop calls this only when the !ticker@arr WS beacon is stale.
+    REST /fapi/v1/ticker/24hr is weight 40 on the production fapi pool."""
     try:
         resp = requests.get(f"{FUTURES_BASE}/fapi/v1/ticker/24hr", timeout=10)
         resp.raise_for_status()
@@ -636,7 +653,18 @@ async def data_loop() -> None:
                 except Exception:
                     pass
         if count and tick_counter % 6 == 0:   # every ~30s
-            _poll_24h_tickers(r)
+            # cont. 69x item 3 — REST /fapi/v1/ticker/24hr is now a STANDBY. While
+            # the !ticker@arr WS feed is alive (_ws_ticker_loop sets the beacon) the
+            # production-fapi 24h poll never fires; only a >60s WS gap triggers REST,
+            # logged + countered so the fallback is never silent.
+            if _ws_ticker_fresh(r) <= 0:
+                _poll_24h_tickers(r)
+                log.warning("ticker_rest_fallback", reason="ws_ticker_stale")
+                try:
+                    r.setex("feed:ticker:rest_fallback", 120, 1)
+                    r.set("feed:ticker:source", "rest_fallback")
+                except Exception:
+                    pass
         if count and tick_counter % 2 == 0:   # every ~10s
             _compute_microstructure(r)
         if tick_counter % 12 == 0:            # every ~60s — F48 1min candles
@@ -825,6 +853,71 @@ async def _ws_mark_price_loop() -> None:
             delay = min(delay * 2, 60)
 
 
+async def _ws_ticker_loop() -> None:
+    """cont. 69x item 3 — WebSocket 24h rolling-window ticker for all USDT-M
+    symbols via `!ticker@arr` on the routed /market/stream endpoint. Replaces the
+    30s REST /fapi/v1/ticker/24hr poll (production fapi weight 40) — writes the
+    SAME Redis keys (TICKER_VOLUME_24H ← base vol `v`, TICKER_CHANGE_24H ←
+    pct change `P`) so the scanner / dead-pair filter / volume sort are unchanged.
+
+    !ticker@arr pushes (every ~1s) an array of only the symbols whose 24h stats
+    changed; over a few seconds the whole active universe is refreshed. The beacon
+    feed:ws_ticker:fresh (TTL 60s) gates the REST standby in data_loop.
+
+    Routed /market/stream is mandatory: !ticker is a /market stream and the legacy
+    unrouted /ws path was decommissioned 2026-04-23 (silent no-data). Testnet vs
+    prod endpoint mirrors _ws_mark_price_loop.
+    """
+    import websockets
+    import config as _config
+    r = redis_client.get()
+
+    if _config.BINANCE_TESTNET:
+        ws_url = "wss://stream.binancefuture.com/market/stream?streams=!ticker@arr"
+    else:
+        ws_url = "wss://fstream.binance.com/market/stream?streams=!ticker@arr"
+
+    delay = 1
+    while True:
+        try:
+            async with websockets.connect(ws_url,
+                                          ping_interval=30,
+                                          ping_timeout=10,
+                                          close_timeout=10) as ws:
+                log.info("ws_ticker_connected", url=ws_url)
+                delay = 1
+                async for raw in ws:
+                    try:
+                        msg = json.loads(raw)
+                        items = msg.get("data", msg) if isinstance(msg, dict) else msg
+                        if not isinstance(items, list):
+                            continue
+                        pipe = r.pipeline(transaction=False)
+                        n = 0
+                        for item in items:
+                            pair = item.get("s", "")
+                            if not pair.endswith("USDT"):
+                                continue
+                            vol = item.get("v")   # 24h base-asset volume (== REST `volume`)
+                            chg = item.get("P")   # 24h price-change percent
+                            if vol is not None:
+                                pipe.set(redis_keys.TICKER_VOLUME_24H.replace("{pair}", pair), vol)
+                            if chg is not None:
+                                pipe.set(redis_keys.TICKER_CHANGE_24H.replace("{pair}", pair), chg)
+                            n += 1
+                        if n:
+                            pipe.setex("feed:ws_ticker:fresh", 60, n)
+                            pipe.set("feed:ticker:source", "ws")
+                        pipe.execute()
+                    except Exception as parse_exc:
+                        log.debug("ws_ticker_parse_failed", error=str(parse_exc)[:120])
+        except Exception as exc:
+            log.warning("ws_ticker_disconnected",
+                        error=str(exc)[:200], reconnect_in_s=delay)
+            await asyncio.sleep(delay)
+            delay = min(delay * 2, 60)
+
+
 async def _account_metrics_loop() -> None:
     """cont. 47 — Lag-1 fix: refresh ACCOUNT_BALANCE every 30s.
 
@@ -860,6 +953,7 @@ async def _main_data_pipeline() -> None:
     await asyncio.gather(
         data_loop(),
         _ws_mark_price_loop(),
+        _ws_ticker_loop(),
         _account_metrics_loop(),
         return_exceptions=True,
     )

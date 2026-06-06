@@ -42,6 +42,15 @@ _DEFAULT_FLIP_CAP = 2
 _DEFAULT_DISPLACE_MARGIN = 0.10
 _DEFAULT_RANK_METRIC = "mv_realized"
 
+# cont. 70d — replay-pool integration Redis keys. Defined locally (not via
+# redis_keys) because only ./signals is bind-mounted into the maintainer worker;
+# redis_keys.py is baked into the image, so referencing new attrs there would need
+# a full image rebuild. Mirror of the redis_keys.LAUNCHPAD_REPLAY_* additions.
+_REPLAY_ENABLED_KEY      = "launchpad:replay_slots_enabled"
+_REPLAY_MAX_SLOTS_KEY    = "launchpad:replay_max_slots"
+_REPLAY_STAGED_COUNT_KEY = "launchpad:replay:staged_count"
+_REPLAY_EXPIRE_COUNT_KEY = "launchpad:replay:expire_count"
+
 
 # ── config helpers ───────────────────────────────────────────────────────────
 
@@ -153,6 +162,7 @@ def _process_occupied(conn, r, slot: dict) -> None:
                 return
 
     # --- expiry: stale + never confirmed green → cooldown ---
+    # (clear_slot DELETEs replay slots and resets base slots — cont. 70d.)
     ttl = slot.get("ttl_expires_at")
     now = _dt.datetime.now(_dt.timezone.utc)
     if ttl is not None and not slot.get("qualified"):
@@ -160,6 +170,11 @@ def _process_occupied(conn, r, slot: dict) -> None:
         if ttl_aware < now:
             store.clear_slot(conn, r, slot["slot"], exit_reason="expired")
             _add_cooldown(r, symbol)
+            if store.is_replay_slot(slot["slot"]):
+                try:
+                    r.incr(_REPLAY_EXPIRE_COUNT_KEY)
+                except Exception:
+                    pass
             return
 
     # --- re-qualify (refresh the open-green flag + movement columns) ---
@@ -246,10 +261,14 @@ def run() -> dict:
             )
             in_buffer.add(ev["symbol"]); filled += 1
 
-        # displacement: remaining candidates vs weakest NON-qualified occupants
+        # displacement: remaining candidates vs weakest NON-qualified occupants.
+        # Replay slots (cont. 70d) are excluded — they are additive extras, never
+        # displaced by the base scanner flow (and a scanner candidate must never
+        # overwrite a replay slot id).
         margin = _float(r, redis_keys.LAUNCHPAD_DISPLACE_MARGIN, _DEFAULT_DISPLACE_MARGIN)
         remaining = candidates[ci:]
-        occ = [s for s in store.read_occupied(conn) if not s.get("qualified")]
+        occ = [s for s in store.read_occupied(conn)
+               if not s.get("qualified") and not store.is_replay_slot(s["slot"])]
         for ev in remaining:
             if not occ:
                 break
@@ -272,6 +291,15 @@ def run() -> dict:
             else:
                 break   # candidates are sorted; none after this beats the weakest
 
+        # cont. 70d — stage recoverable rejected signals from the replay pool as
+        # ADDITIVE extra slots (id >= REPLAY_SLOT_BASE) on top of the base depth.
+        # No-op unless launchpad:replay_slots_enabled == "1".
+        try:
+            staged_replay = _sync_replay_slots(conn, r, in_buffer, cooldown)
+        except Exception as exc:
+            log.debug("launchpad_replay_sync_failed", error=str(exc)[:160])
+            staged_replay = 0
+
     # telemetry
     try:
         r.incr(redis_keys.LAUNCHPAD_MAINTAIN_COUNT)
@@ -285,4 +313,113 @@ def run() -> dict:
 
     flips = int(r.get(redis_keys.LAUNCHPAD_FLIP_COUNT) or 0) - flips0
     return {"status": "ok", "filled": filled, "displaced": displaced,
-            "flips": flips, "metric": metric}
+            "flips": flips, "staged_replay": staged_replay, "metric": metric}
+
+
+# ── replay-pool integration (cont. 70d) ──────────────────────────────────────
+
+def _replay_slots_enabled(r) -> bool:
+    """Replay→launch-pad staging is active only when BOTH its own switch is on
+    AND the launch-pad is the live funnel (launchpad:enabled=1). When the funnel
+    is off, the engine's legacy replay consumer (engine.py:1783) owns the pool, so
+    staging here would double-consume into a table nothing opens from."""
+    if (r.get(_REPLAY_ENABLED_KEY) or "0") != "1":
+        return False
+    return r.get(redis_keys.LAUNCHPAD_ENABLED) == "1"
+
+
+def _sync_replay_slots(conn, r, in_buffer: set[str], cooldown: set[str]) -> int:
+    """Pull recoverable rejected signals from the replay pool and stage them as
+    additive replay slots (id >= store.REPLAY_SLOT_BASE), tagged source='replay'.
+
+    The replay entry DICTATES direction (the original signal's). Each staged entry
+    is removed from the pool so it is not re-staged; it then lives in the launch-pad
+    like any slot (shadow-tracked, re-qualified, flip/expiry-managed) and — when it
+    qualifies green — is opened by the SAME engine funnel (gate.funnel_pairs reads
+    every mirror slot), preserving the funnel-only-opens invariant (D1).
+
+    Returns the count newly staged. Capped at launchpad:replay_max_slots."""
+    if not _replay_slots_enabled(r):
+        return 0
+    try:
+        from signals import replay_pool
+    except Exception:
+        return 0
+
+    # cont. 70d — cap <= 0 means DYNAMIC / unlimited (owner request): stage ALL
+    # fresh replay signals onto the table, however many there are. Naturally
+    # bounded by the replay pool's own size (REPLAY_POOL max_entries, default 100).
+    cap = _int(r, _REPLAY_MAX_SLOTS_KEY, 0)
+    existing = [s for s in store.read_slots(conn)
+                if store.is_replay_slot(s["slot"]) and s.get("symbol")]
+    used_ids = {int(s["slot"]) for s in existing}
+    existing_syms = {s["symbol"] for s in existing}
+    if cap > 0:
+        room = cap - len(existing)
+        if room <= 0:
+            return 0
+        fetch_limit = max(cap * 2, 10)
+    else:
+        room = 1_000_000            # dynamic — effectively unlimited
+        fetch_limit = 500           # covers the whole pool (max_entries 100)
+
+    try:
+        fresh = replay_pool.fetch_fresh_entries(limit=fetch_limit)
+    except Exception:
+        return 0
+
+    staged = 0
+    for entry in fresh:
+        if room <= 0:
+            break
+        sym = entry.get("pair")
+        direction = entry.get("direction")
+        raw = entry.get("_raw")
+        if not sym or direction not in ("long", "short"):
+            continue
+        # Already on-deck (base or replay) or cooling down → drop the dup from the
+        # pool so it isn't re-pulled every tick.
+        if sym in in_buffer or sym in existing_syms or sym in cooldown:
+            if raw:
+                replay_pool.remove_entry(raw)
+            continue
+        mark = shadow.mark_price(r, sym)
+        if mark is None:
+            continue
+        slot_id = store.REPLAY_SLOT_BASE
+        while slot_id in used_ids:
+            slot_id += 1
+        mm = qualify.movement_metrics(r, sym)
+        ok, _reason = qualify.qualify(r, sym, direction)
+        try:
+            store.create_replay_slot(
+                conn, r, slot_id, symbol=sym, direction=direction,
+                table_entry_price=mark, last_mark=mark,
+                mv_candlenet=mm["mv_candlenet"], mv_predicted=mm["mv_predicted"],
+                mv_realized=mm["mv_realized"],
+                regime=(r.get(redis_keys.CURRENT_REGIME) or None),
+                ttl_expires_at=_ttl_at(r),
+                state=("confirmed_green" if ok else "staged"),
+                replay_reason=entry.get("rejection_reason"),
+                replay_strength=entry.get("strength"),
+            )
+        except Exception as exc:
+            log.debug("launchpad_replay_stage_failed", symbol=sym,
+                      error=str(exc)[:160])
+            continue
+        if raw:
+            replay_pool.remove_entry(raw)
+        used_ids.add(slot_id)
+        existing_syms.add(sym)
+        in_buffer.add(sym)
+        staged += 1
+        room -= 1
+
+    if staged:
+        try:
+            r.incrby(_REPLAY_STAGED_COUNT_KEY, staged)
+        except Exception:
+            pass
+        log.info("launchpad_replay_staged", staged=staged,
+                 active_replay_slots=len(existing) + staged)
+    return staged

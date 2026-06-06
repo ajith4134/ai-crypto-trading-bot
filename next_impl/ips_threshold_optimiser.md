@@ -209,11 +209,15 @@ Per-bucket schema add:
 
 ## I. Checklist
 
-- [ ] `metacognition/ips_optimiser.py` (new).
-- [ ] `celery_app.py` — `compute_ips_thresholds` task + beat at 04:30 UTC.
-- [ ] PROGRESS.md cont. 64 follow-up entry.
-- [ ] `next_impl/f9_f12_revolutionary_uses.md` — mark Idea 3 SHIPPED.
-- [ ] Rebuild `celery_worker` + `celery_beat`.
-- [ ] One-shot manual trigger to populate `ips_optimal_delta_raw` immediately.
+> **✅ VERIFIED SHIPPED — 2026-06-05 (Rule-2 live audit).** `metacognition/ips_optimiser.py`
+> exists (264 lines) and is feeding F9: `brain:filter_overrides` carries live
+> `ips_optimal_delta_raw=-20.0` with `ips_n_evidence=1087` on the bull|40-44 bucket.
+
+- [x] `metacognition/ips_optimiser.py` (new). — SHIPPED.
+- [x] `celery_app.py` — `compute_ips_thresholds` task + beat. — SHIPPED.
+- [x] PROGRESS.md cont. 64 follow-up entry. — done.
+- [x] `next_impl/f9_f12_revolutionary_uses.md` — mark Idea 3 SHIPPED. — done (2026-06-05).
+- [x] Rebuild `celery_worker` + `celery_beat`. — done (overrides populating).
+- [x] One-shot manual trigger to populate `ips_optimal_delta_raw`. — populated (live value -20.0).
 
 ---

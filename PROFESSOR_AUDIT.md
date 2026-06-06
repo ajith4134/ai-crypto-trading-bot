@@ -292,6 +292,92 @@ were added in different `cont.XX` sessions, each with its own Redis toggle + thr
   rest of the rebuild.**
 
 ## ────────────────────────────────────────────────────────────────────────────
+## PHASE 1 — EMPIRICAL BASELINE (2026-06-04, instrument = tools/professor_metrics.sql)
+## ────────────────────────────────────────────────────────────────────────────
+Source: 10,240 closed trades (2026-05-16..06-04), `trades`/`signals`/`counterfactuals`. READ-ONLY.
+
+- **F-028 (FACT, HIGHEST-VALUE):** Lifetime net = **−$837**, expectancy −$0.082/trade, profit factor
+  **0.982** (<1 = losing), winrate 52.7% (avg_win $8.55 < |avg_loss| $9.71), Sharpe/trade ≈ 0,
+  max drawdown **$4,933** (> peak equity $3,471). The negative expectancy with >50% winrate is the
+  empirical proof that winrate is the wrong target.
+- **F-029 (FACT, THE EDGE MAP — direction×regime):** The ENTIRE loss is one cell.
+  bear+short = **−$3,524** (4,156 trades, exp −0.85). Every other cell is ≈breakeven-to-positive:
+  bull+long +$1,424, bull+short +$1,100, turbulent+short +$304, bear+long +$59, turbulent+long −$87,
+  unknown −$115. **Excluding bear+short flips the system from −$837 to +$2,687.** Note the regime
+  logic is BACKWARDS for shorts: bull+short (counter-regime, fading rallies) WINS; bear+short
+  (with-regime) LOSES — the bot shorts into bear-market squeeze bounces. This empirically indicts the
+  regime over-counting (F-008/F-021): regime confluence pushes shorts toward the losing cell and
+  suppresses the winning one.
+- **F-030 (FACT):** Accept rate = **7.11%** (23,424 / 329,632 signals) → ~93% killed, confirming the
+  multiplicative gauntlet (F-007). Top kills: signal_too_weak 38.7%, **MemRL low_wr ~37% combined**
+  (F35 — supposedly default-OFF; was heavily active historically), regime_whitelist 6.3%,
+  prediction_not_ready 5.7%, marl_minute_skip 2.7%, sentiment_blocks_short cluster.
+- **F-031 (EVIDENCE, treat as directional — peak-based, not exit-modeled):** Counterfactual
+  would_have_won by reject reason shows several gates block frequently-profitable signals:
+  sentiment_*_blocks_short 73–79%, marl_minute_skip 76% (8,207 signals), prediction_not_ready 73%.
+  CAVEAT: would_have_won = signal ever reached a profit PEAK in the window, NOT net of SL/exit
+  (these also had avg_peak_loss −4..−5%), so it OVERSTATES net wins — but flags strong ablation
+  candidates. By contrast signal_too_weak (33% wld-win, avg peak −2.6%) and pair_suspended (4%) are
+  blocking correctly. F-028/F-029 use ACTUAL net PnL and are rock-solid; F-031 is suggestive.
+- **F-032 (FACT):** Walk-forward by week: 05-11 +$1,545, 05-18 +$272, **05-25 −$3,181**, 06-01 +$528.
+  The damage is concentrated in one bear week, not chronic → regime-conditional, fixable.
+
+## ────────────────────────────────────────────────────────────────────────────
+## PHASE 2 — A/B LAB RESULTS (2026-06-04, brain/ab_lab.py, READ-ONLY)
+## ────────────────────────────────────────────────────────────────────────────
+Replayed a data-fitted interpretable score over 4,270 real closed trades (have full
+feature_vector + actual net_pnl), TimeSeriesSplit OOF (train older → test newer).
+
+- **F-033 (FACT, decisive for rebuild):** Per-trade outcome is **near-unpredictable** from the
+  current feature set. OOF AUC = **0.548** (0.5 = no edge). Univariate Spearman vs net_pnl: the
+  strongest is vol_unit +0.070; **`ofi` ≈ 0 (rho −0.003, p=0.85) despite being the highest-weighted
+  (0.25) component of the old `signal_strength`**; candlenet `cn_*` mostly insignificant (empirically
+  confirms F-014). The logistic's large candlenet coeffs have alternating signs across TFs =
+  multicollinearity/overfit noise. Only stable predictors: dir_acc, xsmom_7d/rank, vol_unit,
+  regime_align (all small). **`funding_contra` is NEGATIVE → the bot's crowd-fade funding prior is
+  backwards in this data.** Implication: a complex entry scorer is NOT the lever; the 8-component/
+  40-gate machinery was elaborate structure over near-random per-trade signal.
+- **F-034 (FACT):** Entry-score FILTER sim: the middle is all noise (PF<1 at 80/60/50/40/30% kept);
+  only the **top ~20%/10%** flips positive (+$262 / +$316, PF 1.11 / 1.28). → a SELECTIVE, lower-
+  frequency posture is what the data supports (matches owner goal "only highly profitable trades").
+  By direction: longs profitable (+$473; filter helps); **shorts lose even at top-50% (−$398, exp
+  −0.47) — per-trade scoring cannot rescue shorts.**
+- **PHASE-2 IMPLICATION (course-correction):** Net PnL is dominated by (a) direction/regime selection
+  and (b) EXITS, NOT entry scoring. The collapsed core should be SIMPLE (few real features + structural
+  direction/regime gate + selective threshold). The higher-value lever is likely the SL/TP exit logic
+  (recall F-025: 775 lines of it are DEAD). Caveat (Rule 9): this subset is pre-redesign-heavy
+  (3520 pre / 750 post) and is the worse cohort (−$1761); direction/era is confounded — treat
+  "shorts lose" as strong-but-era-confounded, "per-trade edge is tiny" as robust (it's OOS).
+
+## ────────────────────────────────────────────────────────────────────────────
+## SL/TP1/TP2 DEEP REVIEW (2026-06-04, read-only; refines F-018/F-019)
+## ────────────────────────────────────────────────────────────────────────────
+Live config: `risk:capital_ladder_enabled` unset→ON; `tp1=0.08`, `tp2=0.16`, `activation=0.04` SET; bot:leverage=5.
+
+LIVE SL/TP spec (what actually executes): TP1=+8% capital (~+1.6% px @5x), TP2=+16% (~+3.2%);
+initial SL=−50% capital (~−10% px @5x); trail ladder (capital%): hold −50% until peak≥+4% →
+SL=50%×peak (→TP1) → max(8%,75%×peak) (→TP2) → max(16%,85%×peak). TP1/TP2 = peak-crossed latch →
+SL jumps to TP price. Then SL-hit close + 48h barrier (pre-TP1) + dead-trade (45min/6h) + frontier
+force-close. This live path is clean, consistent, and capital-anchored. Phase-0 leverage cut is
+consistent here (leverage threaded through qty/SL/TP; only price distances rescaled).
+
+- **F-025 (FACT, SL ROOT CAUSE — sharpens F-019):** The capital-ladder block (`monitor_trailing_sl`
+  ~1228-1271) ends in `continue`, so **lines 1272–2047 (~775 lines) are DEAD CODE while the ladder
+  is ON (default + live).** Dead = entire Path A/B/C/D/E ratchet, Chandelier exit, **`profit_lock_tiers`
+  (the config block does NOTHING)**, DCA-breakeven, AND **hedge logic** (`check_and_open_hedge` /
+  `maybe_lock_hedge_breakeven` at line ~2022 never run → `risk/hedge.py` 351 lines INERT). This is why
+  SL felt unfixable: most code read/edited in this function is off the live path.
+- **F-026 (FACT, latent landmine):** `compute_tp_targets` defaults TP1/TP2 = 0.15/0.30 but the ladder
+  defaults them = 0.08/0.16 — SAME Redis keys (`risk:tp1/tp2_capital_pct`), different fallbacks.
+  Consistent today ONLY because the keys are explicitly set. A Redis wipe → TP target prices (15/30)
+  and SL rungs (8/16) silently diverge.
+- **F-027 (FACT, subtle semantics):** (a) TP "lock" uses a peak-crossed latch, so "lock TP1" does NOT
+  guarantee a TP fill — if price wicks past TP then reverts before the next tick, SL is force-set to the
+  TP price (above mark for a long) and the SL-hit market-closes at the CURRENT lower price. (b) Two TP
+  detectors coexist (`_tp_confirmed` wickless-debounce vs `_tp_peak_crossed` latch); checkpoints use the
+  latch → the 30s wickless path is largely vestigial.
+
+## ────────────────────────────────────────────────────────────────────────────
 ## VERDICT  (after full static audit, 2026-06-04)
 ## ────────────────────────────────────────────────────────────────────────────
 

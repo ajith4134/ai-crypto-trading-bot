@@ -6,6 +6,372 @@ we don't try the same approach again.
 
 ---
 
+## CONT. 70g — SIGNAL-MONITOR METRIC FIXES (2026-06-05)
+
+Audit found the Signal Monitor panel was overstating/mislabeling. Fixed all three
+(dashboard now bind-mounted → api.py changes are restart-only; frontend npm-built):
+
+**#1 Shadow Win Rate — was DRIFTED.** Panel read an incremental Redis counter
+(`SHADOW_WIN_RATE`, 41.8% / 44912) that never reconciled to the table. Rewrote
+`/signals/shadow_win_rate` to compute LIVE from the counterfactuals table →
+**36.68% (34494/94036)**, the single source of truth. Added `optimistic`/`note`
+metadata. Also fixed `pending_eval` to use an 84h window (72h maturity + slack) so
+the by-design maturity lag isn't counted as a backlog (now 0).
+
+**#2 Path-aware Missed Opportunities.** Stored `peak_profit_pct` is a point-in-time
+move at the 72h checkpoint (no peak, no drawdown, no stop path). Added `_cf_path_metrics`
+that walks the real 15m candle path over the 72h window to surface TRUE
+`path_peak_pct` (MFE) + `path_dd_to_peak_pct` (drawdown endured to reach it) +
+`path_mae_pct` (worst adverse). On-demand, Redis-cached 24h (`cf:path:{pair}:{ms}`),
+fapi-ban-guarded, best-effort (never breaks the panel; only the ~10 shown rows, each
+computed once). Live proof: HYPE chkpt +19.66% → true peak +21.6% / dd -0.2% (real
+clean miss); SKYAI peak +9.3% but -35% MAE; JTO needed -6% dd for +7.7% (stop-killers).
+
+**#3 Relabel + staleness fix (SignalMonitor.tsx).** Shadow Win Rate now tagged
+"point-in-time, excl. stop-loss (optimistic)"; missed-opps show chkpt (optimistic)
+beside true peak + drawdown; the "Newest sample 72h ago → stale" false alarm fixed
+(72h is the by-design maturity edge; only warns >96h or real backlog).
+
+NOT changed: the all-LONG miss pattern (model long under-conviction) is the kline-retrain
+track, not a metric bug. The table's `would_have_won` itself is still point-in-time
+(full path-aware recompute of all 94k rows would need hot-loop kline fetches → API-ban
+risk; deferred). Bundle main.72a1ce2f.js. Deploy: restart dashboard + npm build.
+
+---
+
+## CONT. 70f — PRICE-MOVEMENT COLUMNS on scanner + launch tables (2026-06-05)
+
+**Goal (owner):** show each pair's price movement % over 15m/30m/1h in BOTH the Pair
+Scanner table and the Launch-Pad table.
+
+**Delivered:** TRAILING (rolling, last 15m/30m/1h) movement % columns on both tables,
+computed LIVE at the dashboard API from the 1m candles in Redis (`{pair}:1m:candles`,
+newest-first; idx N = N minutes ago; 65 retained → 1h ok). Helper `_trailing_move(r,pair)`
+in `dashboard/api.py`; `/pairs/active` + `/launchpad` enrich each row. Frontend:
+`PairScanner.tsx` + `LaunchPad.tsx` add `15m/30m/1h` coloured cells.
+
+**Scope change (same session):** owner first asked for BOTH trailing AND since-entry
+checkpoints; a since-entry path was built (maintainer wrote `scanner:move:{pair}` /
+`launchpad:move:{slot}` Redis hashes, frozen at 15/30/60m marks) then **REMOVED on owner
+request** ("remove since slot entry columns"). Reverted: dropped the `↪` columns from both
+panels, `_since_move` from api.py, `_refresh_movement` from maintainer.py, and deleted the
+orphaned Redis hashes. Trailing-only remains.
+
+**Deploy infra change:** added `- ./dashboard:/app/dashboard` bind-mount to the dashboard
+service in docker-compose.yml → **api.py is now restart/recreate-editable, NO 34GB image
+rebuild** (mirrors the ./signals + ./memory pattern). One-time `docker compose up -d
+dashboard` to apply the mount; thereafter `restart dashboard` picks up api.py edits.
+Frontend deploys via `npm run build` (./frontend/build is bind-mounted into nginx).
+
+**Verified:** `/pairs/active` + `/launchpad` return `trail_15m/30m/60m` only (no since_*);
+SUIUSDT launch slot −0.68/−1.95/−2.79%; orphan move keys = 0 and not regenerating
+(confirms new maintainer code live); dashboard up; bundle main.4dd24180.js.
+(Note: very thin pairs with flat/stale 1m candles read 0.00% — data property, not a bug.)
+
+---
+
+## CONT. 70e — P1 REPLAY → LAUNCH-PAD INTEGRATION (2026-06-05)
+
+**Goal (owner):** stop the replay pool being dead (consume_count=0); surface recoverable
+rejected signals as EXTRA slots on top of the base 10 ("table grows to 11, 12, …"), tagged
+permanently as replay so they're visible now AND auditable later (how did replay signals do).
+
+**Reconciled root cause (Rule 9):** consume_count=0 was NOT full-deploy slot starvation
+(the cont.69s theory). With launchpad:enabled=1 the engine HARD-BYPASSES the legacy replay
+consumer (engine.py:1783 `[] if _lp_mode`) — the funnel is the sole opener (D1). Producer
+kept writing (produce_count 5446→10330) into a pool nothing read.
+
+**Implementation (additive replay slots, id ≥ 1001):**
+- DB: `source`/`replay_reason`/`replay_strength` added to `launch_pad` + `launch_pad_history`.
+- `store.py`: REPLAY_SLOT_BASE=1001, `is_replay_slot`, `create_replay_slot` (INSERT),
+  `delete_slot`, clear_slot DELETEs replay slots (base slots still reset to empty),
+  insert_history carries the source tag.
+- `maintainer.py`: `_sync_replay_slots` stages fresh recoverable pool entries as extra
+  slots (same qualify gate, replay entry dictates direction), capped at
+  launchpad:replay_max_slots (5); base displacement excludes replay ids; replay expiry →
+  DELETE + counter. Guard: active only when BOTH launchpad:replay_slots_enabled=1 AND
+  launchpad:enabled=1 (else engine's legacy consumer owns the pool → no double-consume).
+- `gate.py`: a replay slot that fires → `replay_pool.mark_consumed()` (consume_count finally
+  moves) + history row source='replay'+trade_id. funnel_pairs already reads ALL mirror slots,
+  so replay slots open through the SAME gate (D1 preserved). No engine.py change needed.
+- `redis_keys.py`: LAUNCHPAD_REPLAY_* added BUT bypassed at runtime via local string consts
+  in maintainer.py — only ./signals is bind-mounted; redis_keys is baked in the image, so a
+  redis_keys attr ref would need a 34GB rebuild. (The redis_keys entries activate on next
+  image rebuild; harmless until then.)
+
+**Deploy:** ALTER TABLE (done) + restart brain + celery_worker_candlenet (both bind-mount
+./signals — NO image rebuild). Enabled on paper: launchpad:replay_slots_enabled=1,
+launchpad:replay_max_slots=5.
+
+**Verified end-to-end (Rule 2/4):** controlled inject of 6 active non-buffer pairs → 5
+staged into slots 1001-1005 (cap respected), table grew to 15, one qualified green + visible
+to funnel_pairs, ZERO symbol dup vs base buffer (dedup works), base maintainer unaffected
+(10 slots healthy, tasks succeeding), history insert with new cols OK. Synthetic test slots
++ test-inflated counters cleaned afterward.
+
+**Honest limitation:** under launchpad-only mode the pool is fed mostly by pairs ALREADY in
+the base buffer (only buffer pairs reach the reject path) → dedup-skipped → organic staging
+is modest (mainly when a recoverable pair is displaced/expired out of its base slot, second
+chance within 15-min TTL). Higher yield when launchpad is OFF.
+
+**Enhancements (owner request, same day):**
+- **Dynamic cap:** `launchpad:replay_max_slots` now treats `0` as UNLIMITED — stage ALL
+  fresh replay signals (10, 15, …), naturally bounded by the pool's own max_entries (100).
+  Set to 0 live. Verified: injected 8 → all 8 staged (slots 1001-1008, table→18).
+- **"(replay)" trade tag:** added `trades.entry_source` (default 'scanner'); `gate.on_open`
+  sets it to 'replay' for replay-slot opens (trades.id is uuid → cast). Surfaces in BOTH
+  open + closed views ("SYMBOL (replay)") — `OpenTradesTable.tsx`/`ClosedTradesTable.tsx`
+  render a badge when `entry_source==='replay'`; flows through `SELECT *`/`SELECT t.*` so
+  NO api.py change (api baked, but memory/ + frontend/build are bind-mounted → frontend
+  rebuilt via `npm run build`, nginx serves new bundle, no 34GB image rebuild). Verified
+  live: NEARUSDT short opened from a replay slot → tagged entry_source='replay'.
+- **BUG FIX (pre-existing cont.70):** `launch_pad_history.trade_id` was `bigint` but
+  `trades.id` is `uuid` → EVERY fired-slot history insert silently failed
+  (`launchpad_on_open_clear_failed`), leaving 1664 history rows with NULL trade_id and
+  breaking the reliability-study join for BOTH scanner AND replay. Retyped to `uuid`
+  (all rows were NULL → safe). Functional-tested: fired+replay history row w/ uuid inserts.
+
+**Revert:** `redis-cli SET launchpad:replay_slots_enabled 0` (instant, code-safe).
+The study join now works: `SELECT h.*, t.net_pnl_usdt FROM launch_pad_history h JOIN
+trades t ON t.id=h.trade_id WHERE h.source='replay'` (and trades view: filter entry_source).
+
+---
+
+## CONT. 70d — LIVE AUDIT: SCANNER / LAUNCHPAD / F9-F12 (2026-06-05, no code change)
+
+Read-only health audit (Rule-2 live state, Rule-9 disconfirm). No trading behaviour
+changed; only next_impl docs + this log updated.
+
+**1. Pair scanner "200 → 33" — NOT a bug.** Categorised mode reranks every ~20 min;
+the active count is whatever survives the mover-filter cascade, not a fixed cap. Live
+logs: `rejections={'vol':239,'mcap':33,'blacklist':2}` → the $150M 24h-quote-volume
+floor (`scanner:min_quote_volume_usd`, default since cont.51) rejects 239 of ~306 perps
+in today's low-volume down-market (e.g. ARB qv=$41.8M < $150M). CoinGecko buckets
+gaming/lst/depin map to 0 perps so the 100-core only fills ~25; tail-padding re-applies
+the same $150M filter → lands at ~32. Volume is real (not stale). Lever to widen:
+`redis-cli SET scanner:min_quote_volume_usd 50000000`. Left at $150M (quality-over-qty).
+
+**2. Launch pad — HEALTHY end-to-end.** Maintainer alive (`maintain_count=5730`,
+ran <30s ago), `launchpad:enabled=1`, all 10 slots full (9 green/1 staged), 9 open
+paper positions matching slots. `open_count=229`, displace=1559, refill=62, flips=38.
+Gates all emit counters (candle_close_no_confirm=52631, dir_mismatch=5374, etc.).
+*Verified-not-a-bug:* slots past `ttl_expires_at` (AIUSDT 6.5h) persist by design —
+TTL only evicts `not qualified` slots (maintainer.py:158). Caveats: 8/9 open are short
+(market-driven, −4..−5% day); `mv_predicted` anti-correlated with `mv_realized`
+(known degenerate-model / kline-corpus issue, upstream of launchpad).
+
+**3. F9/F12 "help open better trades" — WORKING (loop closed + actuating).**
+Postmortem RAG → actuator → engine is live. `brain:filter_overrides` carries real
+bucketed deltas (bull|40-44 `min_signal_strength_delta=-10`, n=532, ips_n=1087,
+ips_optimal_delta_raw=-20); `brain:scorer_overrides`={regime:-0.15,tft:-0.15,ofi:+0.15};
+engine consumes via get_bucket_delta (engine.py:1240) + get_scorer_overrides (768) +
+confidence (risk/manager.py:1961). **Open design decision (left unchanged):** all
+filter deltas are `bull|*` and no `_global_fallback` is set → F9 filter-loosening is
+DORMANT in the current `turbulent` regime (scorer side still active). Choose: keep
+regime-gated (safer) vs add conservative global fallback.
+
+**4. CF pipeline — HEALTHY (Rule-9 correction).** Initially read as "201k unevaluated
+backlog"; age-split query disconfirmed it: mature (>84h) NULL backlog = **0**; the 201k
+NULLs are immature rows inside the 72–84h maturity window (oldest 62h). 28k/day created
+= 28k/day evaluated. The cont.69s June-2 fix holds. The signal_monitor next_impl file's
+2026-06-02 audit table (CF row "12 days behind") was stale — corrected with a 2026-06-05
+re-verification block.
+
+**Docs touched:** next_impl/f9_f12_revolutionary_uses.md (checklist ticked + open item),
+ips_threshold_optimiser.md (checklist ticked), signal_monitor_replay_pool.md (2026-06-05
+re-verify block). Only genuinely-open work surfaced: P1 replay pool consumer-starved
+under full_deploy_mode (needs slot-carve decision).
+
+---
+
+## CONT. 70 / 70b — LIVE SL WEDGE ROOT-CAUSED & FIXED (2026-06-04)
+
+**User symptoms (LIVE):** SL stops moving after a trade crosses TP1/TP2; profit never
+locked; dashboard 2 open vs Binance 1; new-trade Peak +/- column blank; Binance balance
+not shown on dashboard.
+
+**TRUE ROOT CAUSE (cont. 70b — verified empirically):** Binance routes futures
+STOP_MARKET trigger orders through the **CONDITIONAL/algo order system**. The create
+response carries `algoId` (NOT `orderId`); these orders are **invisible to
+`futures_get_open_orders`** (live only in `futures_get_open_algo_orders`); and a 2nd
+`closePosition` algo stop is rejected `APIError(-4130) "... with GTE and closePosition ...
+existing"`. Because `execution/live.py::_arm_stop` read `order.get("orderId")` (always
+None) it never stored the pointer, never cancelled the prior stop, and `cancel_order`
+(orderId) can't cancel an algo order anyway → every SL move hit -4130. `_backoff_call`
+RAISES on -4130; the per-trade loop (`risk/manager.py:525`) had **no per-iteration
+try/except** (only handler OUTSIDE the loop at :2041) → one trade's -4130 **aborted the
+whole SL-monitor tick for every position** → frozen SL, dead profit-lock, blank peak,
+~1 -4130/sec hammering the live API. Live-only (paper never places real stops).
+
+**FIX (bind-mount deploy, no rebuild):**
+- `exchange/client.py`: + `get_open_algo_orders()` and `cancel_algo_order(algo_id)`
+  (the conditional-order list/cancel endpoints). `place_stop_market_order` unchanged
+  (still closePosition — fine once cancel works).
+- `execution/live.py::_arm_stop`: cancel prior + SWEEP via the ALGO endpoints; capture
+  `order.get("algoId") or orderId` and store as the `sl_order_id` pointer; **wrong-side
+  guard** (never place a stop on the profit side of mark → skips arm, logs
+  `live_stop_wrongside_skip`). `modify_sl` made **best-effort** (exchange-arm failure is
+  caught + counted `trail:modify_sl_arm_failed_count`; DB `trailing_sl_level` always
+  written so the mark-monitor close still works → can never wedge the loop again).
+  `close_trade` cancels the stop via `cancel_algo_order` + algo sweep.
+- `risk/manager.py`: wrapped the TP1 + TP2 checkpoint `engine.modify_sl` calls in
+  try/except (blast-radius containment, defense in depth).
+- `docker-compose.yml`: bind-mount `./execution` + `./exchange` into brain (were baked;
+  that's why the FIRST restart didn't pick up the live.py edit — bind-mount-map rule).
+
+**VERIFIED end-to-end on live:** forced re-arm of SOLUSDT → `live_stop_armed
+order_id=1000001857071509` (real algoId), Redis pointer stored, exactly ONE algo stop
+left (old swept, new placed), **0 -4130 / 0 sl_monitor_error** since deploy, loop healthy
+(`n_trades=2`), SOL+HYPE protected by exchange algo stops. ADA exited near breakeven
+(-$0.56 trailing_sl — its +10.6% peak had already retraced before the fix; nothing
+recoverable). WLD -$0.47.
+
+**Also done/flagged this session:**
+- **TAO ghost** (DB open, Binance flat): closed on Binance 15:09 @219.77, realized
+  -$3.77; reconciled DB via `write_trade_close` (reason `trailing_sl`). **No
+  position-reconciliation loop exists** in the codebase — ghosts never auto-close
+  (future work: add a periodic DB-vs-`positionAmt` reconciler).
+- **Exit-reason disables (user mandate "only SL should exit"):** set
+  `risk:dead_trade_disabled=1` and `risk:filtered_obi_force_exit_enabled=0` (live Redis,
+  no restart). OTHER non-SL exits still active (time_barrier_max_hold @48h, mtf_15m
+  reversal, other frontier force_close features, regime_flip) — pending user decision.
+- **Dashboard Binance balance blank:** data is fine (`account:balance_usdt`≈144,
+  api returns `real_balance`, `bot:mode=live`). The SERVED React bundle
+  (`frontend/build/static/js/main.2d90f0e0.js`) is STALE — zero refs to `real_balance`;
+  the "Binance Balance" tile in `frontend/src/panels/SummaryBar.tsx` was never rebuilt.
+  Fix = `npm run build` in `frontend/` + redeploy. NOT done.
+
+## CONT. 70c — LIVE FEES NOT RECORDED + DASHBOARD BALANCE + DB↔BINANCE MISMATCH (2026-06-04)
+
+**User:** closed-table total doesn't match real Binance loss (~$7 actual vs ~$3 shown);
+fees not shown; Binance balance missing from dashboard.
+
+**Findings (Binance income = source of truth, live today):** realized -5.02, commission
+-1.33, funding +0.01 → **NET -6.34**. The "$3 vs $7" was the TAO ghost (-$3.77) missing from
+the closed table until reconciled (cont. 70).
+
+1. **Live trades recorded fees_usdt=0** (root): `execution/live.py` read
+   `order.get("commission")` off the market-order ACK, which is always 0. FIX: added
+   `BinanceClient.get_account_trades()` + `LiveExecutionEngine._resolve_order_commission()`
+   (sums real commission from the fills by orderId); `open_trade` stashes entry fee in
+   `trade:{id}:entry_fee_usdt`, `close_trade` totals entry+exit → `fees_usdt`, `net_pnl`.
+   Bind-mount deploy + brain restart. Backfilled the 8 live closed trades from Binance
+   (fees ≈0.10-0.15 each; live closed now gross -7.66 / fees 1.05 / net -8.70).
+2. **Dashboard Binance-balance tile missing** (root): `frontend/src/App.tsx` *imported*
+   `SummaryBar` but never RENDERED `<SummaryBar/>` → webpack tree-shook it out (bundle was
+   byte-identical every rebuild, no `real_balance`). FIX: render `<SummaryBar/>` at top of
+   App; `npm run build` → new bundle `main.4ff32de2.js` (contains the tile); nginx
+   bind-mounts `frontend/build` so it's live after a hard refresh. Data/API were always fine
+   (`account:balance_usdt`, `/bot/status`→`real_balance`, `bot:mode=live`).
+3. **DB ≠ Binance — MISSING LIVE TRADES (unresolved):** Binance has an **ARB +$3.99 live
+   win** and more ONDO (-1.53) that have NO DB record at all (likely opens that placed a
+   Binance order but failed the DB write during the -4130 chaos). So even after fee backfill
+   the DB live net (-8.70) ≠ Binance net (-6.34); gap = the missing ARB win (+3.91) + ONDO
+   (~-1.4). There is **no Binance→DB reconciler** — RECOMMENDED next: a periodic job that
+   syncs closed trades / realized PnL / fees from `futures_income_history` as source of truth.
+   Did NOT hand-insert trades.
+
+## CONT. 70d — GHOST: SL-HIT TRADE STAYS "OPEN" IN DB (already-flat close) (2026-06-04)
+
+**User:** HYPEUSDT hit its SL and closed on Binance but the dashboard kept showing it OPEN.
+
+**Root cause:** the exchange-native (algo) stop flattens the position FIRST; the bot's
+mark-monitor then also hits the SL and calls `close_trade`, which places a `reduceOnly`
+market order → Binance rejects `-2022 "ReduceOnly Order is rejected"` (no position) →
+`_backoff_call` RAISES. `_guarded_close` had set `trade:{id}:closing` (120s TTL) BEFORE the
+throw and never cleared it (delete was after the throwing call), and the top-of-loop
+`if r.get(_closing_key): continue` then SKIPPED the trade for 120s. So: close throws → DB
+row never written → flag stuck → trade skipped 120s → flag expires → retry → -2022 again.
+Infinite 120s loop, permanent ghost (DB OPEN, Binance FLAT). Confirmed: -2022 every 2 min.
+
+**Fix (bind-mount, restart):**
+- `execution/live.py::close_trade`: wrap the reduce-only order; on `-2022/-2021/-4131/"no
+  position"` treat as **already flat** (don't raise), set `order={}`, resolve exit_price
+  from `trailing_sl_level` (the stop trigger) else mark, and PROCEED to `write_trade_close`
+  → the DB row is closed instead of ghosting.
+- `risk/manager.py::_guarded_close`: `try/except/finally` — close failures can't escape the
+  per-trade loop and the `closing` flag is ALWAYS cleared.
+
+**Verified:** HYPE auto-closed on the next tick (`live_close_position_already_flat` →
+`trailing_sl`), 0 -2022 after, open trades = {SOL} = Binance. Backfilled HYPE to Binance
+truth (realized -4.00, comm -0.15, net -4.15; the stop filled with slippage below trigger).
+
+**Still recommended:** a Binance→DB reconciler. The mark-monitor only self-heals this ghost
+while mark is still past the SL; if price recovers above the SL before the monitor catches
+it (mark>SL for a long), the DB row would stay open. A periodic positionAmt/income sync is
+the robust fix (also covers the missing ARB +3.99 / ONDO opens from cont. 70c).
+
+## CONT. 70e — BINANCE→DB RECONCILER BUILT (2026-06-04)
+
+Closes the whole class of DB↔Binance drift (the HYPE ghost, the missing ARB +3.99 win,
+the ONDO gap). New module `risk/reconciler.py`, launched as a background asyncio task from
+`risk.manager.monitor_trailing_sl` (main.py is baked → spawning from bind-mounted risk/ is
+restart-only). **Binance is the source of truth.** Every 120s, live mode only:
+1. **GHOSTS** — any `is_paper=false` trade still `open` in the DB whose Binance
+   `positionAmt==0` → closed on the exchange but never recorded → `write_trade_close` with
+   REAL realized/commission/funding from `futures_income_history` (exit_reason
+   `reconciled_exchange`, added to `trades_exit_reason_check`). 90s grace period so a
+   just-placed order isn't mistaken for a ghost. ONLY mutation it makes.
+2. **DRIFT** — Binance net (realized+comm+funding, 24h) vs DB net of is_paper=false closed
+   (24h); logs `reconciler_drift_detected` + stores `reconciler:{binance_net_24h,db_net_24h,
+   drift_24h}` in Redis when |drift| > `reconciler:drift_alert_usdt` (default 1.0). Report
+   only — does NOT fabricate entry data for unknown trades.
+Toggles: `reconciler:enabled` (default on), `:grace_s` (90), `:drift_check_enabled` (on),
+`:drift_alert_usdt` (1.0). Counter `reconciler:ghosts_closed_count`.
+
+**Verified:** dry-run left the legit SOL open position untouched (positionAmt>0 → skipped),
+0 false closes; drift detector reported binance_net -10.51 vs db_net -12.85 → drift -2.35
+(the missing ARB win + gaps). Deployed: `reconciler_started interval_s=120`, brain healthy.
+
+NOTE: part 2 only REPORTS missing trades (e.g. ARB). Auto-creating DB records for trades that
+executed on Binance with no DB row (guessed entry/capital) is deferred — too risky. If wanted,
+v2 could synthesize closed rows from `futures_account_trades` entry/exit fills.
+
+## PROFESSOR AUDIT — PHASE 0 FREEZE & DE-RISK (2026-06-04)
+
+Full impartial static audit completed → `/opt/trading-bot/PROFESSOR_AUDIT.md` (24 findings
+F-001..F-024 + verdict + sequenced fix-manual). Verdict: **plumbing is fine, rebuild the decision
+core; keep infrastructure.** Owner approved Phase 0 (reversible freeze + de-risk) and an A/B rebuild.
+
+**Applied (all reversible, no image rebuild):**
+1. **Leverage 20x → 5x.** `risk/manager.py::assign_leverage` was config-baked with NO Redis override
+   (F-024). Added `risk:leverage_min`/`risk:leverage_max` Redis override (fallback to config); set
+   `risk:leverage_min=3`, `risk:leverage_max=5`; `restart brain` (risk/ is bind-mounted). Revert:
+   delete the two Redis keys.
+2. **Froze 10 autonomous self-modification beat tasks** (F-023/F-015/F-009) via a `.pop()` block
+   appended after `beat_schedule` in `celery_app.py` (bind-mounted to celery_beat); recreated
+   celery_beat. Frozen: feature-governance-check, refresh-bayes-threshold, ga-evolve-params,
+   dgm-code-rewrite, ai-scientist-hypotheses, update-pair-lists-from-decoder, metacog-daily-eval,
+   decode-pending-misses, decode-pending-mismatches, evolve-strategy-pool. Verified absent (68 tasks
+   left, beat clean). Pure learning/monitoring tasks left ON. Revert: delete the block + recreate.
+3. **Redis switches:** `prediction:gate_auto_arm=0` (stop autonomous predict-gate arming),
+   `brain:llm_macro_veto_enabled=0` (pinned advisory).
+4. **Snapshots:** git tag `pre-rebuild-baseline`; redis BGSAVE; gate-key snapshot +
+   pinned flags → `/opt/trading-bot/audit_snapshots/`.
+
+**Verified:** brain restarted clean + SOAR loop cycling every 5s at 5x; celery_beat clean; leverage
+keys live (3/5). The CancelledError traceback at restart = graceful shutdown of the prior brain, not
+a crash. NOT YET DONE (deferred deliberately — Phase 0 freezes drift, does not re-tune): collapsing
+the ~40-gate gauntlet, single threshold, regime-counted-once, SL-monolith rewrite, ablation.
+Next: Phase 1 (decision ledger + backtest harness) then A/B core rebuild.
+
+## PROFESSOR AUDIT — PHASE 1 MEASUREMENT INSTRUMENT (2026-06-04)
+
+Built `tools/professor_metrics.sql` — read-only scoreboard over `trades`/`signals`/`counterfactuals`
+(no hot-path change). Run: `docker exec -i trading-bot-postgres-1 psql -U botuser -d trading_bot <
+tools/professor_metrics.sql`. Findings F-028..F-032 in PROFESSOR_AUDIT.md. Headlines:
+- Lifetime: −$837 net over 10,240 closed, PF 0.982, winrate 52.7%, maxDD $4,933 → NEGATIVE expectancy
+  despite >50% winrate (proves winrate is the wrong target).
+- **EDGE MAP: the entire loss is bear+short (−$3,524). Excluding it → +$2,687 (profitable).**
+  Regime logic is backwards for shorts: bull+short WINS (+$1,100), bear+short LOSES (shorts into
+  bear bounces). bull+long +$1,424 best.
+- Accept rate 7.11% (~93% killed). Top kills: signal_too_weak 38.7%, MemRL ~37%, regime 6.3%.
+- Over-blocking (peak-based, suggestive): sentiment_blocks_short / marl_minute_skip /
+  prediction_not_ready block 73–79% frequently-profitable signals.
+- Damage concentrated in ONE bear week (05-25 −$3,181); 3/4 weeks positive → regime-conditional.
+NEXT: decide whether to add a single "no bear+short" guard now (reversible de-risk, biggest single
+win) vs hold for the collapsed-core ablation; then build the A/B core.
+
 ## cont. 69x item 2 (2026-06-03) — Real-time liquidation flow (!forceOrder@arr WS) → full F58 entry+exit wiring; deadlock-independent
 
 WS-migration item 2 (next_impl/micro-ws-partial-depth-migration.md). Owner chose full F58
@@ -12080,3 +12446,56 @@ RESIDUAL/RECOMMENDED: decide is advisory (macro-veto demoted) yet still runs a
 10-25s synchronous LLM call every cycle, worst-case ~25s grazes the timeout under
 load. Robust next step = THROTTLE decide to ~1/min (restart-only now). Reversible:
 revert config.yaml models to phi3:mini; del llm:decide_timeout_s; remove brain mount.
+
+--------------------------------------------------------------------------------
+cont. (2026-06-04 ~08:12) — DECIDE LLM THROTTLED → DISABLED (advisory, slow box)
+--------------------------------------------------------------------------------
+After the model switch, the throttle (1/min) still left residual 500s: a warm
+real decide prompt runs 6-26s on this 6-CPU box (huge variance under load;
+OLLAMA_NUM_PARALLEL=2 queues concurrent calls), routinely exceeding any timeout →
+500 → cloud fallback. Chasing the timeout is futile. Since the verdict is ADVISORY
+(macro-veto demoted, gates nothing), added a MASTER SWITCH `llm:decide_enabled`
+(Redis, default "0"=OFF) in soar.py _decide. OFF → skip the local LLM entirely,
+verdict=ML_ONLY, ZERO ollama calls/500s, loop ~5-6s/cycle (was ~33s with phi3
+per-cycle). Throttle (`llm:decide_interval_s`=60) + timeout (`llm:decide_timeout_s`)
+machinery preserved for re-enable on a faster box.
+SIDE EFFECT (good): with verdict=ML_ONLY (llm_available=False), _act skips the
+macro-veto branch entirely (advisory_count stops climbing) → straight to
+process_signals. VERIFIED clean window: 0 brain /api/generate, 0 ollama_failure,
+decisions every ~5-6s, 6 trades opened/30min, turbulence_index=1.119 (fix live,
+no longer stuck 1.0). All Redis-tunable + restart-only (brain bind-mounted).
+
+────────────────────────────────────────────────────────────────────────────
+2026-06-04 (cont. 71) — PROFESSOR SESSION PARTIALLY REVERTED (owner request)
+────────────────────────────────────────────────────────────────────────────
+Owner: "revert all changes done by the professor session, bring bot to its
+original state before professor" — with two constraints added mid-task:
+(1) leave live/paper toggle + real-money config alone; (2) keep PROFESSOR_AUDIT.md
+and the phase1 next_impl md.
+
+REFUSED a git revert (surfaced the conflict): professor commit cf13bb1 = 359
+files / 265,058 insertions, bundling ALL May16→Jun4 work into one commit (parent
+ef82e0a dated 2026-05-16). git reset/revert would have destroyed ~3 weeks of kept
+work (SL Capital Ladder, predict-all, launch_pad, kline corpus, cont.70b SL fix).
+
+SURGICAL revert performed instead:
+ • UNFROZE 10 self-mod beat tasks — removed _PHASE0_FROZEN_TASKS .pop() block from
+   celery_app.py (bind-mounted). Verified live: 78 scheduled tasks, all 10 present
+   (feature-governance-check, refresh-bayes-threshold, ga-evolve-params,
+   dgm-code-rewrite, ai-scientist-hypotheses, update-pair-lists-from-decoder,
+   metacog-daily-eval, decode-pending-misses, decode-pending-mismatches,
+   evolve-strategy-pool). Deploy: docker compose restart celery_beat.
+ • REMOVED professor code scaffolding — rm -rf brain/professor/ (incl. Phase-1
+   ledger/backtest/metrics/xsmom + Phase-2.1 shadow), audit_snapshots/,
+   tools/professor_metrics.sql. Removed the log_shadow hook in signals/engine.py
+   (~L2542). Deploy: docker compose restart brain. Verified clean (no ImportError;
+   online_learner/pending_entry/SL monitor all running).
+ • KEPT: PROFESSOR_AUDIT.md, next_impl/phase1_decision_ledger_backtest.md.
+ • LEVERAGE LEFT AT 5x (bot:leverage=5) — NOT reverted to 20x: owner's don't-touch
+   constraint + 20x breaks the kept 5x-derived SL ladder + F-024 survival risk.
+ • Live/paper toggle, execution/live.py, live-auth (verify_prod_auth.py,
+   .env.bak.prelive, exchange/client.py auth), ControlPanel live/paper UI: untouched.
+
+Net state: Phase-0 FREEZE undone (autonomy restored), Phase-1/2.1 instruments
+removed, 5x leverage de-risk RETAINED. git tags pre-rebuild-baseline* unchanged.
+No image rebuild (both files bind-mounted). py_compile OK on both edited files.

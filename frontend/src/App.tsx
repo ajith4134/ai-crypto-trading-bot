@@ -88,6 +88,7 @@ const App: React.FC = () => {
         <div style={{background:'#1a1a2e',padding:'4px 16px',fontSize:11,color:wsOk?'#00ff88':'#ff8800',borderBottom:'1px solid #2a2a4a'}}>
           {wsOk?'● Live':'○ Connecting...'} &nbsp;|&nbsp; AI Crypto Trading Bot
         </div>
+        <div style={{padding:'12px 12px 0'}}><SummaryBar /></div>
         <div style={{padding:12,display:'grid',gap:12,gridTemplateColumns:'repeat(auto-fit, minmax(380px, 1fr))'}}>
           <ControlPanel />
           <BrainStatus />

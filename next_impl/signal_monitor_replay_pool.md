@@ -20,7 +20,62 @@
 
 ---
 
-## ⚑ VERIFIED STATUS — 2026-06-02 (cont. 69s, Rule 2 audit)
+## ✅ RE-VERIFIED — 2026-06-05 (Rule-2 + Rule-9 live audit)
+
+Supersedes the CF-pipeline row in the 2026-06-02 table below (that table was written
+just BEFORE this file's own 2026-06-02 fix and never updated — it is now stale).
+
+- **CF pipeline: HEALTHY.** Real mature backlog = **0** (`would_have_won IS NULL AND
+  created_at < now()-84h` = 0). The 201,138 rows that look "unevaluated" are all inside
+  the 72–84h maturity window (oldest NULL = 62h old) and will evaluate on schedule.
+  Fresh flow is fully caught up: 28,196 created in last 24h = 28,196 evaluated. The
+  June-2 redesign (bulk-retire stale + [72h,84h] matured-band sweep) is working.
+  *Rule-9 note: an interim read of "201k backlog never drains" was disconfirmed by the
+  age-split query — it was immature-by-design, not a backlog.*
+- **F9 fed with fresh CF data** → `brain:filter_overrides` actively written (bull bands).
+- **P4 util_calib**: now emits a recommendation (per the IMPLEMENTED block above, T=55).
+- **P1 replay pool**: ✅ RESOLVED 2026-06-05 (cont. 70d) — see below.
+
+---
+
+## ✅ P1 REPLAY RESOLVED — 2026-06-05 (cont. 70d) — replay→launch-pad integration
+
+**Real root cause (reconciled, Rule 9):** `consume_count=0` was NOT full-deploy slot
+starvation. With `launchpad:enabled=1` the engine HARD-BYPASSES the legacy replay
+consumer (`engine.py:1783` `[] if _lp_mode`) — the launch-pad funnel is the sole
+opener (D1). The producer kept writing (`produce_count` 5446→10330) into a pool nothing
+read.
+
+**Fix (owner design, 2026-06-05):** the launch-pad maintainer now stages recoverable
+replay-pool signals as **ADDITIVE extra slots** (id ≥ `store.REPLAY_SLOT_BASE`=1001) on
+top of the base depth — "the table grows to 11, 12, …". They go through the SAME qualify
+gate and the SAME engine funnel (`gate.funnel_pairs` reads every mirror slot), so the
+funnel-only-opens invariant (D1) holds. Tagged `source='replay'` + `replay_reason` +
+`replay_strength` **permanently** (survives into `launch_pad_history` + `trade_id`→trades
+for the reliability study). On fire → `replay_pool.mark_consumed()` (consume_count finally
+moves) + history row; on TTL → DELETE (never left empty, never refilled by the base flow).
+
+Files: `store.py` (create_replay_slot/delete_slot/source cols/clear delete-branch),
+`maintainer.py` (`_sync_replay_slots`), `gate.py` (replay consume), `redis_keys.py`
+(LAUNCHPAD_REPLAY_* — bypassed at runtime via local consts since redis_keys is baked in
+the image). DB: `source`/`replay_reason`/`replay_strength` on launch_pad + _history.
+
+Kill switch: `launchpad:replay_slots_enabled` (default 0), cap `launchpad:replay_max_slots`
+(default 5). Enabled on paper 2026-06-05. **Verified end-to-end:** controlled inject of 6
+active non-buffer pairs → 5 staged into slots 1001-1005 (cap respected), one qualified
+green + visible to funnel, no symbol dup vs base buffer, base maintainer unaffected,
+history insert with new cols OK. Synthetic test slots cleaned afterward.
+
+**Honest limitation (Rule 4):** under launchpad-only mode the pool is fed almost entirely
+by pairs ALREADY in the base buffer (only buffer pairs reach the reject path), which are
+dedup-skipped — so ORGANIC staging is modest, happening mainly when a recoverable pair is
+displaced/expired out of its base slot and gets a second chance within the 15-min TTL.
+Higher yield when launchpad is OFF (legacy flow feeds the pool from the full scan; the
+engine's own consumer then handles it — my guard prevents double-consume).
+
+---
+
+## ⚑ VERIFIED STATUS — 2026-06-02 (cont. 69s, Rule 2 audit)  *(CF row superseded — see 2026-06-05 above)*
 
 Live-state audit (Redis + Postgres + engine.py/celery_app.py read). What actually
 contributes to the open-trade accept/reject decision TODAY:

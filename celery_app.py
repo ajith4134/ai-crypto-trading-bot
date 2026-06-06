@@ -619,29 +619,11 @@ app.conf.beat_schedule = {
     },
 }
 
-# ─────────────────────────────────────────────────────────────────────────────
-# PHASE 0 FREEZE (professor audit 2026-06-04) — disable the autonomous
-# self-modification loops so the running system stops mutating its own code,
-# parameters, prompts, thresholds, feature-flags, pair-lists, and strategies.
-# This makes behavior STATIC + reproducible so it can be measured (see
-# PROFESSOR_AUDIT.md F-023). FULLY REVERSIBLE: delete this block + recreate
-# celery_beat to restore every task. Pure-learning/monitoring tasks (pattern
-# mining, candle training, shadow ablation, forecasts, scanner) are left ON.
-# ─────────────────────────────────────────────────────────────────────────────
-_PHASE0_FROZEN_TASKS = (
-    "feature-governance-check",      # auto feature on/off on FAKE attribution (F-015)
-    "refresh-bayes-threshold",       # autonomous entry-threshold drift (F-009)
-    "ga-evolve-params",              # genetic param evolution (F-009)
-    "dgm-code-rewrite",              # DGM rewrites the bot's own code (F-023)
-    "ai-scientist-hypotheses",       # autonomous hypothesis->code (F-023)
-    "update-pair-lists-from-decoder",# autonomous pair-list mutation (F-023)
-    "metacog-daily-eval",            # writes live scorer/threshold deltas (F-009/F-013)
-    "decode-pending-misses",         # F9 decoder -> live scorer/threshold deltas
-    "decode-pending-mismatches",     # F12 decoder -> live scorer/threshold deltas
-    "evolve-strategy-pool",          # autonomous strategy lineage evolution
-)
-for _frozen in _PHASE0_FROZEN_TASKS:
-    app.conf.beat_schedule.pop(_frozen, None)
+# Phase-0 self-modification FREEZE reverted (cont. 71, owner request) — the 10
+# autonomous self-mod beat tasks (feature-governance, bayes-threshold, GA evolve,
+# DGM code-rewrite, ai-scientist, pair-list decoder, metacog, F9/F12 decoders,
+# strategy-pool evolution) are RESTORED to beat_schedule above. Background returned
+# to its pre-professor autonomous state. Context: PROFESSOR_AUDIT.md F-023.
 
 
 @app.task(bind=True, max_retries=3, default_retry_delay=300, queue="airllm")
@@ -2776,11 +2758,99 @@ def sweep_pending_counterfactuals() -> dict:
 
 
 @app.task(queue="default")
+import functools as _functools
+
+
+@_functools.lru_cache(maxsize=256)
+def _corpus_rows_cached(pair: str, interval: str, mtime: float):
+    """Read data/historical/{pair}/{interval}.csv → tuple of (ts_ms, high, low, close).
+    cont. 70g2 — the corpus is the BAN-FREE price source (data.binance.vision bulk +
+    WS top-up; NO fapi REST). Cached by (pair, interval, file-mtime) so a sweep of many
+    signals on one pair reads the CSV once. Returns () when missing/unreadable."""
+    import csv as _csv
+    path = f"/app/data/historical/{pair}/{interval}.csv"
+    rows = []
+    try:
+        with open(path, newline="") as f:
+            rd = _csv.reader(f)
+            next(rd, None)  # header
+            for x in rd:
+                if len(x) >= 6:
+                    try:
+                        rows.append((int(x[0]), float(x[2]), float(x[3]), float(x[4])))
+                    except (TypeError, ValueError):
+                        continue
+    except Exception:
+        return ()
+    rows.sort()
+    return tuple(rows)
+
+
+def _corpus_window(pair: str, start_ms: int, end_ms: int, interval: str = "15m"):
+    import os as _os
+    path = f"/app/data/historical/{pair}/{interval}.csv"
+    try:
+        mt = _os.path.getmtime(path)
+    except OSError:
+        return []
+    return [x for x in _corpus_rows_cached(pair, interval, mt)
+            if start_ms <= x[0] <= end_ms]
+
+
+def _cf_path_eval(pair, direction, start_ms, window_h, target_pct, stop_pct):
+    """Walk the corpus candle path over [start, start+window_h]; return path-aware
+    counterfactual metrics. CONSERVATIVE intrabar rule: the adverse extreme is assumed
+    hit before the favourable one within each bar (worst case for would_have_won, since
+    a 15m bar's high/low order is unknown). Returns None when the corpus does not span
+    the window (caller falls back to the point-in-time mark comparison)."""
+    end_ms = start_ms + int(window_h * 3600 * 1000)
+    win = _corpus_window(pair, start_ms, end_ms, "15m")
+    if len(win) < 2:
+        return None
+    entry = win[0][3]
+    if entry <= 0:
+        return None
+    if win[-1][0] < end_ms - 2 * 3600 * 1000:   # corpus ends >2h short → not covered
+        return None
+    mfe = mae = dd_to_peak = running_adv = 0.0
+    realistic_exit = None
+    won_path = None
+    for ts, hi, lo, close in win:
+        if direction == "long":
+            fav = (hi - entry) / entry * 100.0
+            adv = (lo - entry) / entry * 100.0
+        else:
+            fav = (entry - lo) / entry * 100.0
+            adv = (entry - hi) / entry * 100.0
+        running_adv = min(running_adv, adv)
+        if fav > mfe:
+            mfe = fav
+            dd_to_peak = running_adv
+        mae = min(mae, adv)
+        if realistic_exit is None:                 # first TP/SL touch wins (adverse-first)
+            if adv <= -stop_pct:
+                realistic_exit, won_path = -stop_pct, False
+            elif fav >= target_pct:
+                realistic_exit, won_path = target_pct, True
+    if realistic_exit is None:                     # neither hit → 72h time exit
+        final = win[-1][3]
+        realistic_exit = ((final - entry) / entry * 100.0) if direction == "long" \
+            else ((entry - final) / entry * 100.0)
+        won_path = realistic_exit > 0
+    return {"mfe": round(mfe, 4), "mae": round(mae, 4),
+            "dd_to_peak": round(dd_to_peak, 4),
+            "realistic_exit": round(realistic_exit, 4), "won_path": bool(won_path)}
+
+
 def track_counterfactual(signal_id: str, pair: str) -> None:
     """T-04: Track a rejected signal 72h after rejection.
     Blueprint: compare signal direction vs actual price movement.
     'direction' = long and price went UP → would_have_won = True.
     'direction' = short and price went DOWN → would_have_won = True.
+
+    cont. 70g2 — now PATH-AWARE from the corpus (true MFE/MAE + SL-aware TP-before-SL
+    outcome), falling back to the legacy point-in-time mark comparison when the corpus
+    doesn't cover the window. Toggle: counterfactual:path_aware_enabled (default 1).
     """
     import json
     import redis_client, redis_keys

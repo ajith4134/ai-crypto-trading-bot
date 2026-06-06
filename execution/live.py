@@ -57,9 +57,70 @@ class LiveExecutionEngine(ExecutionEngine):
             pass
         return 0.0
 
+    def _resolve_order_commission(self, order: dict, pair: str) -> float:
+        """Sum the real USDT commission for a filled order. cont. 70c — the
+        market-order ACK response carries commission=0, so live trades were
+        recording fees_usdt=0 and net_pnl=gross. Query the actual fills by
+        orderId and sum their commission (BNB-paid commission is converted to
+        USDT-notional via the fill price as a best-effort)."""
+        try:
+            c = float(order.get("commission") or 0)
+            if c > 0:
+                return c
+        except (TypeError, ValueError):
+            pass
+        oid = order.get("orderId")
+        if not oid:
+            return 0.0
+        for _ in range(3):
+            try:
+                fills = self._client.get_account_trades(pair, order_id=oid)
+                if fills:
+                    total = 0.0
+                    for f in fills:
+                        comm = float(f.get("commission") or 0)
+                        if f.get("commissionAsset") == "USDT":
+                            total += comm
+                        else:
+                            # BNB (or other) — approximate in USDT via fill price.
+                            total += comm * float(f.get("price") or 0)
+                    return total
+            except Exception:
+                pass
+            time.sleep(0.3)
+        return 0.0
+
     def open_trade(self, params: dict) -> str:
         """N-05: Set leverage, place market order, wait for fill, write real
         fill price, and arm the exchange-native initial STOP_MARKET."""
+        # cont.70 SAFETY (defense-in-depth, the money-touching line): never place
+        # a REAL order unless the operator-facing label ALSO says live. This is the
+        # last guard behind the brain's _act interlock — even a future entry path
+        # that reaches here while the dashboard shows "paper" cannot open real money.
+        # Legit live sets bot:mode="live" (mode_switch step 3), so this never blocks
+        # intended live trading. Fails OPEN only if Redis is unreadable (a blip must
+        # not break legit live; the mislabel case always has Redis up). See
+        # project_paper_live_switch_bug.
+        try:
+            import redis_client
+            _r = redis_client.get()
+            _label = _r.get("bot:mode")
+        except Exception as _exc:
+            _r = None
+            _label = "live"
+            log.warning("live_open_mode_check_failed", error=str(_exc)[:120])
+        if _label != "live":
+            if _r is not None:
+                try:
+                    _r.incr("safety:live_open_blocked_count")
+                except Exception:
+                    pass
+            log.error("live_open_blocked_label_not_live", label=_label,
+                      pair=params.get("pair"),
+                      action="refused REAL order — bot:mode != 'live'")
+            raise RuntimeError(
+                f"live_open_blocked: bot:mode={_label!r} != 'live' — refusing real "
+                f"order for {params.get('pair')} (paper/live mislabel guard)")
         # cont. 69: set per-trade leverage on the exchange BEFORE ordering.
         # Without this, Binance uses the account's existing symbol leverage
         # (often 20x default), not the bot's intended leverage → wrong margin /
@@ -91,6 +152,17 @@ class LiveExecutionEngine(ExecutionEngine):
         params["is_paper"] = False
 
         trade_id = write_trade_open(params)
+
+        # cont. 70c — capture the real ENTRY commission (ACK response has none)
+        # and stash it so close_trade can total entry+exit fees. Best-effort.
+        try:
+            _entry_fee = self._resolve_order_commission(order, params["pair"])
+            if _entry_fee:
+                redis_client.get().set(
+                    f"trade:{trade_id}:entry_fee_usdt", _entry_fee)
+        except Exception as _ef_exc:
+            log.debug("live_entry_fee_capture_skipped", trade_id=trade_id,
+                      error=str(_ef_exc)[:120])
 
         # cont. 69: arm the initial exchange-native stop so the position is
         # protected even if the bot/host dies. Uses the initial SL the engine
@@ -124,18 +196,65 @@ class LiveExecutionEngine(ExecutionEngine):
         one is placed (closePosition stops are one-per-side, and we must move the
         trigger price). cont. 69."""
         r = redis_client.get()
+        stop_side = "SELL" if direction == "long" else "BUY"
+
+        # cont. 70 — wrong-side guard. A protective stop must sit on the LOSS
+        # side of the current mark (long → below, short → above). When price
+        # retraces back below a peak-based lock the requested level lands on the
+        # PROFIT side; Binance then rejects it as a GTE/closePosition take-profit
+        # (-4130) and the SL monitor used to wedge. Skip the exchange order in
+        # that case — modify_sl still writes the DB level and the mark-based
+        # monitor in risk.manager closes the trade if the level is hit.
+        try:
+            _mark = float(r.get(redis_keys.MARK_PRICE.replace("{pair}", pair)) or 0)
+        except (TypeError, ValueError):
+            _mark = 0.0
+        if _mark > 0 and (
+                (direction == "long" and stop_price >= _mark) or
+                (direction == "short" and stop_price <= _mark)):
+            log.info("live_stop_wrongside_skip", trade_id=trade_id, pair=pair,
+                     stop_price=stop_price, mark=_mark, direction=direction)
+            try:
+                r.incr("trail:stop_wrongside_skip_count")
+            except Exception:
+                pass
+            return
+
+        # Cancel the prior stop, then SWEEP any remaining trigger stop for this
+        # symbol+side. cont. 70b — these are CONDITIONAL/algo orders (algoId, not
+        # orderId; invisible to futures_get_open_orders; a 2nd closePosition algo
+        # → -4130), so we MUST use the algo list/cancel endpoints. The tracked
+        # `sl_order_id` now holds the algoId.
         prev_id = r.get(self._sl_order_key(trade_id))
         if prev_id:
             try:
-                self._client.cancel_order(pair, int(prev_id))
+                self._client.cancel_algo_order(int(prev_id))
             except Exception as _c_exc:
                 # Already filled/cancelled/gone — fine, just log at debug.
                 log.debug("live_stop_cancel_skipped", trade_id=trade_id,
-                          order_id=prev_id, error=str(_c_exc)[:100])
-        stop_side = "SELL" if direction == "long" else "BUY"
+                          algo_id=prev_id, error=str(_c_exc)[:100])
+        try:
+            for _o in self._client.get_open_algo_orders():
+                if (_o.get("symbol") == pair
+                        and _o.get("side") == stop_side
+                        and _o.get("orderType") in ("STOP_MARKET",
+                                                    "TAKE_PROFIT_MARKET")):
+                    try:
+                        self._client.cancel_algo_order(int(_o["algoId"]))
+                    except Exception:
+                        pass
+        except Exception as _sw_exc:
+            log.debug("live_stop_sweep_skipped", trade_id=trade_id,
+                      error=str(_sw_exc)[:100])
+
         order = self._client.place_stop_market_order(
             pair=pair, side=stop_side, stop_price=stop_price)
-        oid = order.get("orderId")
+        # cont. 70b — the trigger order is a CONDITIONAL/algo order: its id is
+        # `algoId`, not `orderId`. Capturing it is what makes the next
+        # cancel/replace work (the lost pointer was the whole -4130 wedge).
+        oid = None
+        if isinstance(order, dict):
+            oid = order.get("algoId") or order.get("orderId")
         if oid is not None:
             r.set(self._sl_order_key(trade_id), int(oid))
         log.info("live_stop_armed", trade_id=trade_id, pair=pair,
@@ -149,34 +268,80 @@ class LiveExecutionEngine(ExecutionEngine):
         safely on Binance instead of opening a reverse-direction position.
         """
         trade = self._get_trade(trade_id)
-        # cont. 69: cancel the resting exchange-native stop first so it can't
-        # fire a second reduce-only order against an already-flat position.
+        # cont. 69/70b: cancel the resting CONDITIONAL/algo stop first so it
+        # can't fire a second reduce-only order against an already-flat position.
+        # The stop is an algo order (algoId), so cancel via the algo endpoint and
+        # sweep any leftover for this symbol+side in case the pointer was lost.
         try:
             _r0 = redis_client.get()
             _prev_sl = _r0.get(self._sl_order_key(trade_id))
             if _prev_sl:
-                self._client.cancel_order(trade["pair"], int(_prev_sl))
+                self._client.cancel_algo_order(int(_prev_sl))
                 _r0.delete(self._sl_order_key(trade_id))
+            _cl_side = "SELL" if trade["direction"] == "long" else "BUY"
+            for _o in self._client.get_open_algo_orders():
+                if (_o.get("symbol") == trade["pair"]
+                        and _o.get("side") == _cl_side
+                        and _o.get("orderType") in ("STOP_MARKET",
+                                                    "TAKE_PROFIT_MARKET")):
+                    try:
+                        self._client.cancel_algo_order(int(_o["algoId"]))
+                    except Exception:
+                        pass
         except Exception as _csl_exc:
             log.debug("live_close_stop_cancel_skipped", trade_id=trade_id,
                       error=str(_csl_exc)[:100])
         close_side = "SELL" if trade["direction"] == "long" else "BUY"
-        order = self._client.place_market_order(
-            pair=trade["pair"], side=close_side, qty=float(trade["quantity"]),
-            reduce_only=True,
-        )
-        exit_price = self._resolve_fill_price(order, trade["pair"])
+        # cont. 70d — the exchange-native (algo) stop may have ALREADY flattened
+        # the position. The reduce-only close then fails -2022 "ReduceOnly Order
+        # is rejected" (or -2021/-4131). That used to THROW → the DB row was
+        # never closed → ghost (DB shows OPEN forever, retrying every 120s). Treat
+        # "already flat" as a completed close and record it from the stop/mark.
+        _already_flat = False
+        try:
+            order = self._client.place_market_order(
+                pair=trade["pair"], side=close_side, qty=float(trade["quantity"]),
+                reduce_only=True,
+            )
+        except Exception as _ord_exc:
+            _msg = str(_ord_exc)
+            if any(code in _msg for code in ("-2022", "ReduceOnly", "-2021",
+                                             "-4131", "no position", "not exist")):
+                log.warning("live_close_position_already_flat",
+                            trade_id=trade_id, pair=trade["pair"],
+                            error=_msg[:140])
+                order = {}
+                _already_flat = True
+            else:
+                raise
+        exit_price = 0.0 if _already_flat else self._resolve_fill_price(
+            order, trade["pair"])
         if exit_price <= 0:
             # Position is closed on Binance but we couldn't resolve the exit
-            # price. Fall back to current mark so PnL math doesn't break — log
-            # the discrepancy for manual reconciliation.
+            # price. cont. 70d — if the stop already flattened us, the fill was
+            # at ~the stop trigger (trailing_sl_level); prefer that, else fall
+            # back to current mark so PnL math doesn't break.
             import redis_client as _rc
             r = _rc.get()
-            exit_price = float(r.get(redis_keys.MARK_PRICE.replace("{pair}", trade["pair"])) or 0)
-            log.warning("live_close_fill_price_fallback_to_mark",
-                        trade_id=trade_id, mark=exit_price,
+            _sl_lvl = float(trade.get("trailing_sl_level") or 0)
+            if _already_flat and _sl_lvl > 0:
+                exit_price = _sl_lvl
+            else:
+                exit_price = float(r.get(redis_keys.MARK_PRICE.replace("{pair}", trade["pair"])) or 0)
+            log.warning("live_close_fill_price_fallback",
+                        trade_id=trade_id, exit_price=exit_price,
+                        already_flat=_already_flat,
                         order_id=order.get("orderId"))
-        fees = float(order.get("commission") or 0)
+        # cont. 70c — real fees = ENTRY commission (stashed at open) + EXIT
+        # commission (fetched from the close order's fills). The ACK response
+        # carries commission=0, which is why live trades recorded fees_usdt=0.
+        _exit_fee = self._resolve_order_commission(order, trade["pair"])
+        try:
+            _entry_fee = float(
+                redis_client.get().get(f"trade:{trade_id}:entry_fee_usdt") or 0)
+        except (TypeError, ValueError):
+            _entry_fee = 0.0
+        fees = _exit_fee + _entry_fee
 
         entry = float(trade["average_entry"] or trade["entry_price"])
         qty = float(trade["quantity"])
@@ -367,7 +532,22 @@ class LiveExecutionEngine(ExecutionEngine):
         # order per trail. Now: cancel/replace an exchange-native STOP_MARKET so
         # it triggers only when price actually reaches the stop (true SL),
         # matching paper's mark-monitored close while adding crash protection.
-        self._arm_stop(trade_id, trade["pair"], direction, new_sl_price)
+        #
+        # cont. 70 — BEST-EFFORT. An exchange-arm failure (e.g. Binance -4130)
+        # must NEVER propagate: it previously escaped the per-trade loop in
+        # risk.manager and aborted the SL monitor for EVERY open position. The
+        # DB trailing_sl_level (written below) + the mark-based close are the
+        # authoritative safety net, so we always persist the level even if the
+        # exchange order could not be (re)placed.
+        try:
+            self._arm_stop(trade_id, trade["pair"], direction, new_sl_price)
+        except Exception as _arm_exc:
+            log.warning("live_modify_sl_arm_failed", trade_id=trade_id,
+                        new_sl=new_sl_price, error=str(_arm_exc)[:160])
+            try:
+                redis_client.get().incr("trail:modify_sl_arm_failed_count")
+            except Exception:
+                pass
 
         write_trade_update(trade_id, {"trailing_sl_level": new_sl_price})
         # Blueprint Section 15.4: record Brain intervention.

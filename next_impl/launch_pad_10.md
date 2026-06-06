@@ -135,6 +135,121 @@ project_launch_pad. Update PROGRESS.md.
 behaviour live with ZERO trading impact for a few days) → then P5 flip-on → P6 panel. R8 footer each step.
 Kill switch `launchpad:enabled=0` instantly reverts to current behaviour.
 
+## ══════════════════════════════════════════════════════════════════════════
+## CENTER-CORE REDESIGN — Launch-Pad as the bot's PRIMARY decision core (cont. 71)
+## ══════════════════════════════════════════════════════════════════════════
+Status: **DESIGN LOCKED ON PAPER — owner chose "write full plan, no code yet"** (cont. 71).
+Owner intent (verbatim): make the Launch-Pad the CENTER feature — totally independent of all
+other features; ALL trades (symbol + direction + entry) chosen ONLY from the funnel. Authorized
+full use of the box: **8 cores + 20 GB RAM**. "Next-level ultra-advanced, be creative."
+
+### PREREQUISITE / HONEST BLOCKER (Rule 9 — load-bearing, read first)
+The funnel is an AMPLIFIER, not a brain. `qualify.decide_direction()` is just CandleNet `dir3`
+consensus → the funnel inherits model degeneracy. Promoting it to center AMPLIFIES whatever the
+models say. The real blockers are unchanged: predict-all/CandleNet quality ([[project_kline_corpus]])
++ the degenerate-short bias. Live-table diagnosis (cont. 71, regime=turbulent):
+  - 9 SHORT / 1 LONG = NOT 10 edges → ONE BTC-beta short cloned 9× (LINK/AVAX/BNB/SOL/XRP/TON/PEPE
+    all correlated). = concentration risk, not diversification.
+  - Columns DISAGREE: LINK mvPred 7.64 (model screams) vs mvReal -2.277 (already fell 2.3 ATR);
+    lone-long BTC has mvReal -1.008 (momentum AGAINST it) yet "confirmed_green".
+  ⇒ Only L3 (de-correlation + direction balance) helps DESPITE bad models. L1/L2 need shadow data.
+  ⇒ Ties to PROFESSOR_AUDIT verdict: rebuild decision core / keep infra. This redesign IS that
+    rebuild — replace ~40 serial veto gates with parallel continuous scoring + pre-validated buffer.
+
+### THE 7 LAYERS
+- **L0 — Parallel universe scorer (8 cores).** `maintainer._eval_candidates` scores 160 pairs
+  SERIALLY today → make it ProcessPoolExecutor(8) fan-out, sub-second full-market scoring. 20 GB =
+  per-pair rolling candle/feature frames resident in RAM (no per-feature Redis round-trip).
+- **L1 — Learned p(open-green) model (replaces binary qualify gate).** `shadow.py` is ALREADY a
+  self-labeling generator: every staged setup records realized peak_loss_pct(MAE)/peak_profit_pct(MFE)
+  from table_entry_price. After weeks → train GBM `P[low-MAE green start | features, dir, regime]`.
+  Gate becomes calibrated probability, not `consensus AND candle-close AND exhaustion`. Zero new
+  data plumbing — the data is already being stored.
+- **L2 — 3-column arbiter (resolves D5 "don't blend" WITH data).** Compute each column's information
+  coefficient from shadow outcomes (does high mv_X predict green?), weight per-regime. Resolves the
+  LINK-style mvPred-vs-mvReal disagreement empirically (turbulent→mv_realized may dominate; trending
+  →mv_predicted). Keeps the 3 columns observable; adds a learned blend ON TOP.
+- **L3 — De-correlation + direction balance (kills 9-short concentration). DO FIRST.**
+  (a) Correlation-cluster cap: HDBSCAN cluster the universe ([[project_predict_all_before_open]]
+      already uses it), cap slots/cluster (e.g. ≤2–3). No 9 copies of BTC-beta.
+  (b) Cross-sectional direction: reuse existing `signals/xsmom.py` — long relative-strongest / short
+      relative-weakest (RELATIVE, not absolute) → structurally prevents 100%-short degeneracy.
+- **L4 — Tick-level entry ("open green" at execution).** Re-arm PPO Entry-Timing Agent
+  (ml/entry_timing_agent.py, models/entry_timing_agent.zip; action 0=wait/1=enter/2=skip) for
+  CONFIRMED-GREEN slots only at fire time → picks the exact entry tick to minimize MAE. Buffer =
+  which+direction; agent = when.
+- **L5 — Buffer owns SIZING.** size_frac = Kelly_frac × p(green)[L1] × conviction[L2], capped by
+  cluster budget[L3]. Makes the funnel own symbol+dir+entry+SIZE = "totally independent".
+- **L6 — Online self-recalibration (the autonomous loop).** Each FIRED slot → real trade → real
+  outcome; compare shadow-predicted MAE vs realized MAE → continuously recalibrate L1 model + L2
+  weights. Full loop: scout→stage→shadow→qualify→fire→measure→recalibrate. Self-contained,
+  kill-switchable.
+
+### COMPUTE BUDGET (8 cores / 20 GB)
+  4–6 cores → L0 parallel scorer (160 pairs/tick) · 1 core → maintainer + L3 clustering ·
+  1 core → shadow + L6 recalibration · idle cores → L1 (re)training off-peak ·
+  ~20 GB → in-RAM feature/candle cache + correlation matrix + model artifacts.
+
+### "MAKE IT THE CENTER" STRUCTURAL CHANGE
+Today: engine.process_signals runs capital-gate → capacity-gate → … → launchpad funnel (DEAD; it's
+behind the gates — root cause of "enabled on paper but never opens", see [[project_launch_pad]]).
+Center version: `gate.funnel_pairs()` runs FIRST (sole origin) → L5 size → open. Vetoes become
+SCORES feeding the L1/L2 ranking, not serial kill-switches.
+
+### PHASING (all behind launchpad:enabled=0 / kill switches; silent-rejection counters on every skip)
+- **Phase α (do first): L3** — correlation cap + cross-sectional direction. Cheapest, paper-safe,
+  helps DESPITE degenerate models. Target: table 9S/1L → ~balanced across uncorrelated clusters.
+- **Phase β: lift funnel above gates** (sole origin) — PAIR WITH L3 (without L3 it just opens the
+  9-short bet for real).
+- **Phase γ: L0** parallelize scorer (8 cores) — perf/coverage, no behaviour change.
+- **Phase δ: L1+L2** — let shadow data accrue NOW at launchpad:enabled=0; train p(green) + IC arbiter.
+- **Phase ε: L4 + L5** — re-arm entry-timing agent for slots + buffer-owned sizing.
+- **Phase ζ: L6** — online recalibration from real fired-slot outcomes.
+
+### CLAUDE'S ADDITIONS (cont. 71 — own ideas, owner-invited)
+- **A1 — Two-sided shadow staging (better than the D8 flip).** Shadow BOTH directions per symbol
+  (2 cheap shadow rows); fire whichever side has the superior live MAE/MFE at trigger time. Makes
+  the flip rule obsolete (no flip-cap whipsaw) — the symbol is never "committed" to a wrong side.
+- **A2 — Reserved exploration slot (anti-mono).** Hold 1 of the 10 as an ε-greedy / Thompson
+  contrarian slot (reuse signals/slot_selector.py bandit) so the buffer can't fully collapse into
+  the model's consensus. Direct counter to the PROFESSOR_AUDIT mono-behaviour finding.
+- **A3 — Counterfactual regret tracking.** Keep shadowing symbols for ~N min AFTER they're
+  displaced/expired/fired; measure opportunity cost (what we skipped vs took) → auto-tune
+  displace_margin + TTL from regret instead of hand-set constants.
+- **A4 — Microstructure fire-trigger.** Final tick gate using OFI/VPIN (already collected): only
+  fire a green slot when order-flow imbalance confirms in-direction (don't open into a thinning/
+  adverse book). Rule-based complement to the L4 PPO agent.
+- **A5 — Liquidation-cascade opportunism.** Consume the !forceOrder@arr stream
+  ([[reference_binance_data_sources]]): a liquidation spike in a buffered symbol's direction = a
+  high-quality continuation fire trigger. Creative reuse of data we already ingest.
+- **A6 — Regime-breathing buffer depth.** Buffer size + qualify strictness flex with
+  turbulence_index: turbulent → fewer slots / tighter gate / more cash; trending → deeper / looser.
+  The "10" becomes a ceiling, not a quota (kills the "force-fill into a bad tape" failure).
+- **A7 — Capital-aware staging (anti-starvation).** Buffer reads available capital under
+  [[feedback_full_deploy_mode]] and won't confirm-green more setups than can actually be funded →
+  no confirmed-green slots that can never open (a silent-starvation trap).
+- **A8 — Pre-warmed SL.** Since the buffer knows entry well ahead, pre-compute the Capital-Ladder SL
+  params per slot ([[feedback_profit_lock]]); the instant a slot fires, the STOP_MARKET is placed
+  with no compute gap → closes the SL-freeze window from [[project_sl_algo_order_fix]].
+- **A9 — Trade provenance / explainability.** Stamp every fired trade with its buffer lineage
+  (chosen column, score, cluster, p(green), regime) onto the trade row → feeds
+  [[project_postmortem_rag_shipped]] with human-readable "why we took this".
+- **A10 — Shadow-vs-real drift alarm.** Monitor realized MAE vs shadow-predicted MAE; if real is
+  systematically worse (adverse selection / slippage), auto-widen qualify thresholds. Self-protecting
+  calibration guard (pairs with L6).
+- **A11 — Offline buffer backtest harness.** Replay historical klines ([[project_kline_corpus]])
+  through qualify/maintainer to measure the funnel's edge BEFORE paper → satisfies the Phase-1
+  ledger+backtest gate from [[project_professor_audit_phase0]].
+
+### DEPLOY / OPS NOTES (carry-over)
+- Maintainer runs in celery_worker/celery_beat → NOT bind-mounted → **REBUILD required**; verify the
+  ACTUAL executor before trusting deploy ([[feedback_verify_task_executor]]).
+- Real money still blocked: testnet key loaded ([[project_live_trading_blocked]]) + the prod API key
+  needs withdrawals OFF + IP restricted before going live (cont. 71 security finding).
+- Keep launchpad:enabled kill switch + per-skip Redis counters + qualify deadlock auto-disable.
+
 ## Related memory
 [[project_predict_all_before_open]] [[feedback_profit_lock]] [[feedback_silent_rejection]]
 [[feedback_rl_deadlock_detector]] [[project_judge_replaces_entry_gates]] [[feedback_verify_task_executor]]
+[[project_kline_corpus]] [[project_professor_audit_phase0]] [[project_launch_pad]]
+[[project_live_trading_blocked]]

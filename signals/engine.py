@@ -2862,6 +2862,25 @@ async def process_signals(pairs: list[str], brain_state: dict, engine) -> list[s
                                  capital_after=capital_usdt,
                                  max_pos_cap=_max_pos_final)
 
+                    # Per-trade MIN floor (bot:min_position_usdt). Mirrors the max clamp:
+                    # each trade deploys AT LEAST the user's floor (no dust trades). Optional —
+                    # unset/0 keeps the built-in $5 minimum. Clamped not to exceed the max cap.
+                    try:
+                        _min_pos_final = float(r.get("bot:min_position_usdt") or 0)
+                    except (TypeError, ValueError):
+                        _min_pos_final = 0.0
+                    if _min_pos_final > 0:
+                        if _max_pos_final and _max_pos_final > 0:
+                            _min_pos_final = min(_min_pos_final, _max_pos_final)
+                        if capital_usdt < _min_pos_final:
+                            _before_min = capital_usdt
+                            capital_usdt = round(_min_pos_final, 2)
+                            log.info("capital_min_pos_floored",
+                                     pair=pair,
+                                     capital_before=_before_min,
+                                     capital_after=capital_usdt,
+                                     min_pos_floor=_min_pos_final)
+
                     # cont. 61 audit fix — Borderline liquidity → halve capital.
                     # The entry gate (accept_or_reject) flagged pairs with
                     # $10M-$50M 24h volume as borderline. Reduce capital here

@@ -38,6 +38,8 @@ const LaunchPad: React.FC = () => {
     fmt(s.mv_predicted, 3),
     fmt(s.mv_realized, 3),
     s.flips_count ?? 0,
+    // cont. 70e2 — trailing price movement (last 15m/30m/1h, live)
+    pnlCell(s.trail_15m), pnlCell(s.trail_30m), pnlCell(s.trail_60m),
   ]);
 
   const filled = slots.filter((s: any) => s.symbol).length;
@@ -55,10 +57,15 @@ const LaunchPad: React.FC = () => {
         </span>
       </h3>
       <Table
-        cols={['Slot', 'Symbol', 'Dir', 'State', 'Green', 'Shadow', 'Peak+', 'MAE', 'mvCN', 'mvPred', 'mvReal', 'Flips']}
+        cols={['Slot', 'Symbol', 'Dir', 'State', 'Green', 'Shadow', 'Peak+', 'MAE',
+               'mvCN', 'mvPred', 'mvReal', 'Flips',
+               '15m', '30m', '1h']}
         rows={rows}
         maxH={300}
       />
+      <div style={{ fontSize: 10, color: '#888', marginTop: 4 }}>
+        15m/30m/1h = trailing price move (last N minutes).
+      </div>
     </div>
   );
 };

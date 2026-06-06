@@ -37,12 +37,13 @@ const SignalMonitor: React.FC = () => {
   }, [evt]);
 
   const noShadow = !shadowWR.total;
-  // Staleness: warn when the newest sample is more than 24h old (sweeper backed up
-  // or recent rejections haven't yet aged past the 72h CF window).
+  // cont. 70g — a signal needs ~72h to mature before it can be counterfactually
+  // evaluated, so the newest sample is ALWAYS ~72h old BY DESIGN (not staleness).
+  // Only flag it when well past that (>96h) or when there's a real backlog.
   const newestAgeHrs = shadowWR.sample_newest
     ? (Date.now() - new Date(shadowWR.sample_newest).getTime()) / 3600000
     : null;
-  const stale = newestAgeHrs !== null && newestAgeHrs > 24;
+  const stale = newestAgeHrs !== null && newestAgeHrs > 96;
   const lowN = shadowWR.total > 0 && shadowWR.total < 30;
   const fmtTime = (iso?: string) => {
     if (!iso) return '';
@@ -76,6 +77,11 @@ const SignalMonitor: React.FC = () => {
                 <span style={{color:'#555',marginLeft:6}}>
                   ({shadowWR.won}/{shadowWR.total})
                 </span>
+                {shadowWR.optimistic &&
+                  <span style={{color:'#777',marginLeft:6,fontSize:10}}
+                        title={shadowWR.note || ''}>
+                    ⓘ point-in-time, excl. stop-loss (optimistic)
+                  </span>}
               </>
           }
         </span>
@@ -98,6 +104,9 @@ const SignalMonitor: React.FC = () => {
         <div style={{marginBottom:8}}>
           <div style={{fontSize:11,color:'#888',marginBottom:3}}>
             Recent Missed Opportunities ({missed.length})
+            <span style={{color:'#666',fontSize:9,marginLeft:6}}>
+              chkpt = move at 72h (optimistic) · peak/dd = true path
+            </span>
           </div>
           <div style={{maxHeight:90,overflowY:'auto',fontSize:10}}>
             {missed.map((m, i) => (
@@ -105,8 +114,24 @@ const SignalMonitor: React.FC = () => {
                 display:'flex',gap:6,alignItems:'flex-start'}}>
                 <span style={{color:'#00d4ff',minWidth:90}}>{m.pair}</span>
                 <span style={{minWidth:36}}>{m.direction?.toUpperCase()}</span>
-                <span style={{color:'#888',minWidth:60}}>
+                {/* point-in-time 72h-checkpoint move (optimistic) */}
+                <span style={{color:'#777',minWidth:54}} title="move at the 72h checkpoint (optimistic, no stop-loss path)">
                   {m.peak_profit_pct != null ? `+${(+m.peak_profit_pct).toFixed(2)}%` : ''}
+                </span>
+                {/* true path-aware peak + the drawdown you'd have endured to reach it */}
+                <span style={{minWidth:120}}>
+                  {m.path_peak_pct != null
+                    ? <>
+                        <span style={{color:'#21d07a'}} title="true max favourable excursion">
+                          pk +{(+m.path_peak_pct).toFixed(1)}%
+                        </span>
+                        {m.path_dd_to_peak_pct != null &&
+                          <span style={{color: m.path_dd_to_peak_pct <= -5 ? '#ff5470' : '#888', marginLeft:4}}
+                                title="drawdown you'd have sat through before reaching that peak (a stop-loss may have closed it first)">
+                            (dd {(+m.path_dd_to_peak_pct).toFixed(1)}%)
+                          </span>}
+                      </>
+                    : <span style={{color:'#555'}}>—</span>}
                 </span>
                 <span style={{color:'#aaa',flex:1,lineHeight:1.3}}>
                   {m.miss_decode_reason || `(rejected: ${m.rejection_reason})`}

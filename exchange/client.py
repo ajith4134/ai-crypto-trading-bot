@@ -257,6 +257,39 @@ class BinanceClient:
         _track_weight(1)
         return _backoff_call(self._client.futures_cancel_order, symbol=pair, orderId=order_id)
 
+    def get_open_orders(self, pair: str) -> list:
+        """All currently-resting REGULAR orders for a symbol (weight=1)."""
+        _track_weight(1)
+        return _backoff_call(self._client.futures_get_open_orders, symbol=pair)
+
+    def get_open_algo_orders(self) -> list:
+        """cont. 70b — Binance routes futures STOP_MARKET/TAKE_PROFIT_MARKET
+        trigger orders through the CONDITIONAL/algo system: the create response
+        carries `algoId` (not `orderId`), they are INVISIBLE to
+        futures_get_open_orders, and a second closePosition algo stop is rejected
+        with -4130. List them here so the SL re-arm can cancel orphans."""
+        _track_weight(1)
+        res = _backoff_call(self._client.futures_get_open_algo_orders)
+        if isinstance(res, dict):
+            return res.get("orders", []) or []
+        return res or []
+
+    def cancel_algo_order(self, algo_id: int) -> dict:
+        """Cancel a CONDITIONAL/algo trigger order by algoId (cont. 70b).
+        futures_cancel_order(orderId) does NOT work on these."""
+        _track_weight(1)
+        return _backoff_call(self._client.futures_cancel_algo_order, algoId=algo_id)
+
+    def get_account_trades(self, pair: str, order_id: int = None) -> list:
+        """User trade fills for a symbol (weight=5), optionally for one orderId.
+        cont. 70c — the real commission is here, NOT on the market-order ACK
+        response (which carries commission=0), so live fees were recorded as 0."""
+        _track_weight(5)
+        kw = {"symbol": pair}
+        if order_id is not None:
+            kw["orderId"] = order_id
+        return _backoff_call(self._client.futures_account_trades, **kw)
+
     def get_order_status(self, pair: str, order_id: int) -> dict:
         _track_weight(1)
         return _backoff_call(self._client.futures_get_order, symbol=pair, orderId=order_id)

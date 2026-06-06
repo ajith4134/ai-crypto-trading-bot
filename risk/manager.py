@@ -517,6 +517,17 @@ async def monitor_trailing_sl(engine) -> None:
     """
     r = redis_client.get()
     import time as _time_mod_loop
+
+    # cont. 70e — launch the Binance→DB reconciler as a sibling background task
+    # (main.py is baked into the image; risk/ is bind-mounted, so spawning it
+    # here makes it a restart-only deploy). It closes ghosts (DB open / Binance
+    # flat) and reports DB↔Binance net drift. No-op in paper mode.
+    try:
+        from risk.reconciler import reconcile_loop
+        asyncio.ensure_future(reconcile_loop(engine))
+    except Exception as _rec_exc:
+        log.warning("reconciler_launch_failed", error=str(_rec_exc)[:160])
+
     while True:
         try:
             trades = get_open_trades()
@@ -582,16 +593,25 @@ async def monitor_trailing_sl(engine) -> None:
                 direction = trade["direction"]
 
                 def _guarded_close(reason: str) -> None:
-                    """Set the close-in-flight flag, then call engine.close_trade."""
+                    """Set the close-in-flight flag, then call engine.close_trade.
+                    cont. 70d — close failures must NOT escape (they used to abort
+                    the whole monitor tick) and the flag must ALWAYS be cleared
+                    (a stuck flag skipped the trade for 120s, so a failed close
+                    retried forever and left the DB row open = ghost)."""
                     try:
                         r.setex(_closing_key, 120, "1")
                     except Exception:
                         pass
-                    engine.close_trade(trade["id"], reason=reason)
                     try:
-                        r.delete(_closing_key)
-                    except Exception:
-                        pass
+                        engine.close_trade(trade["id"], reason=reason)
+                    except Exception as _gc_exc:
+                        log.error("guarded_close_failed", trade_id=trade["id"],
+                                  reason=reason, error=str(_gc_exc)[:180])
+                    finally:
+                        try:
+                            r.delete(_closing_key)
+                        except Exception:
+                            pass
 
                 # cont. 57 — Inline final-tick peak update. Called immediately
                 # before any SL/TP/MTF-15m exit `continue` so the final tick's
@@ -848,7 +868,14 @@ async def monitor_trailing_sl(engine) -> None:
                              tp1=tp1, tp2=tp2, new_sl=tp2,
                              tp1_already=_tp1_already_locked)
                     _capture_final_peak(mark)
-                    engine.modify_sl(trade["id"], tp2)
+                    try:
+                        engine.modify_sl(trade["id"], tp2)
+                    except Exception as _tp2_exc:
+                        # cont. 70 — never let one trade's SL move abort the
+                        # whole monitor loop (one outer handler at func bottom).
+                        log.warning("tp2_checkpoint_modify_failed",
+                                    trade_id=trade["id"],
+                                    error=str(_tp2_exc)[:160])
                     r.set(f"trade:{trade['id']}:tp1_locked", "1")
                     r.set(f"trade:{trade['id']}:tp2_locked", "1")
                     try:
@@ -890,7 +917,13 @@ async def monitor_trailing_sl(engine) -> None:
                                  trade_id=trade["id"], mark=mark,
                                  tp1=tp1, new_sl=tp1)
                         _capture_final_peak(mark)
-                        engine.modify_sl(trade["id"], tp1)
+                        try:
+                            engine.modify_sl(trade["id"], tp1)
+                        except Exception as _tp1_exc:
+                            # cont. 70 — contain blast radius (see TP2 above).
+                            log.warning("tp1_checkpoint_modify_failed",
+                                        trade_id=trade["id"],
+                                        error=str(_tp1_exc)[:160])
                         r.set(f"trade:{trade['id']}:tp1_locked", "1")
                         try:
                             from memory.write import write_trade_update as _wtu_tp1
@@ -2367,6 +2400,21 @@ def assign_leverage(potential_score: float, volatility: float) -> int:
             lev_min = int(float(_lm))
         if _lx:
             lev_max = int(float(_lx))
+    except (TypeError, ValueError):
+        pass
+
+    # USER DASHBOARD LEVERAGE (bot:leverage) is AUTHORITATIVE when set: the owner's
+    # explicit choice from the dashboard pins leverage to that FIXED value (clamped to
+    # the 1-20 hard cap), overriding both the config default and the Phase-0 risk:* band.
+    # The drawdown throttle below still applies on top (protective reduction in losses).
+    # Previously assign_leverage never read bot:leverage, so the dashboard value was
+    # silently ignored (auto score->leverage within the risk:* band). Fixes that.
+    try:
+        _ulev = r.get("bot:leverage")
+        if _ulev:
+            _uv = max(1, min(20, int(float(_ulev))))
+            lev_min = _uv
+            lev_max = _uv
     except (TypeError, ValueError):
         pass
 

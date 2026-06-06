@@ -115,6 +115,12 @@ services:
       # timeout) now bind-mounted so iterating on the brain loop is restart-only,
       # not a 13-min image rebuild. Keep host brain/ as the source of truth.
       - ./brain:/app/brain
+      # cont. 70 (2026-06-04) — execution/ + exchange/ bind-mounted so the live
+      # SL re-arm fix (best-effort modify_sl, wrong-side guard, orphan-stop
+      # cancel-sweep, reliable orderId capture) deploys without a rebuild. These
+      # run in brain's SL monitor; the -4130 closePosition wedge lived here.
+      - ./execution:/app/execution
+      - ./exchange:/app/exchange
     depends_on:
       - postgres
       - redis
@@ -266,6 +272,10 @@ services:
       # _purge_trade_row; mount ./memory so the predictions-FK purge fix
       # (else trades stay stuck 'open') is live here too, not just in brain.
       - ./memory:/app/memory
+      # cont. 70e2 — bind-mount the dashboard package so api.py endpoint changes
+      # deploy with a recreate/restart instead of a full 34GB image rebuild
+      # (mirrors the ./signals + ./memory pattern used by brain/candlenet).
+      - ./dashboard:/app/dashboard
     depends_on:
       - redis
       - postgres

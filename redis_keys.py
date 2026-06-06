@@ -243,6 +243,15 @@ LAUNCHPAD_QUALIFY_TOTAL  = "launchpad:qualify:total_calls"   # int
 LAUNCHPAD_QUALIFY_REJECT = "launchpad:qualify:reject:{reason}" # int per reason
 LAUNCHPAD_QUALIFY_DISABLED = "launchpad:qualify:disabled"   # "1" — auto-disabled when reject rate > 80%/50+
 
+# cont. 70d — Replay-pool → Launch-Pad integration. Recoverable rejected signals
+# are staged as EXTRA slots on TOP of the base depth (slot ids >= 1001), tagged
+# source='replay' permanently (survives into launch_pad_history + trades for the
+# how-did-replay-signals-do study). Kill switch default OFF.
+LAUNCHPAD_REPLAY_ENABLED      = "launchpad:replay_slots_enabled"  # "1"|"0"; default "0"
+LAUNCHPAD_REPLAY_MAX_SLOTS    = "launchpad:replay_max_slots"      # int; default 5 — cap on extra replay slots
+LAUNCHPAD_REPLAY_STAGED_COUNT = "launchpad:replay:staged_count"   # int — replay entries staged into the table
+LAUNCHPAD_REPLAY_EXPIRE_COUNT = "launchpad:replay:expire_count"   # int — replay slots aged out unfired
+
 # --- Pub/Sub channels (F-02) ---
 CH_PRICE_UPDATE    = "price_update"
 CH_TRADE_OPENED    = "trade_opened"

@@ -386,17 +386,32 @@ at signal-firing time:
 
 ## H. Checklist (post user approval)
 
+> **✅ VERIFIED SHIPPED — 2026-06-05 (Rule-2 live audit).** Bundle B (R1+R2+R3+R4)
+> is on disk AND actuating live. Evidence: `brain:filter_overrides` holds real
+> bucketed deltas (bull|40-44 `min_signal_strength_delta=-10`, n_evidence=532,
+> ips_n=1087); `brain:scorer_overrides`=`{regime:-0.15, tft:-0.15, ofi:+0.15}`;
+> postmortem RAG embedding live (`postmortem_rag:f9_embedded_count=597`,
+> `override_applied_count=150`); engine reads `get_bucket_delta` (engine.py:1240),
+> `get_scorer_overrides` (768), memrl delta (2020); `confidence.py` consumed in
+> `risk/manager.py:1961`.
+> **OPEN ITEM (not a bug — a design decision for the user):** every learned
+> filter delta is `bull|*`-bucketed and there is NO `_global_fallback` populated,
+> so in non-bull regimes (e.g. today's `turbulent`) the F9 filter-loosening is
+> dormant — `get_bucket_delta` returns 0.0. F12 scorer overrides ARE global and
+> stay active. Decide: leave regime-gated (safer — bull evidence shouldn't loosen
+> turbulent entries) OR add a conservative `_global_fallback`. Left unchanged.
+
 If user picks **R1+R2+R3+R4** (the "small-but-revolutionary" bundle):
-- [ ] `metacognition/actuator.py`: add `_apply_bucketed()`, refactor `_apply()` to compute density/unanimity scaling.
-- [ ] `signals/engine.py`: read `by_regime_and_band[regime|band]` first, fall back to `_global_fallback`.
-- [ ] `celery_app.py`: new beat task `update_pair_lists_from_decoder` every 5 min — scans `counterfactuals` (24h) + `mismatches` (24h) → updates `pair:probation` / `pair:suspension`.
-- [ ] `signals/engine.py:accept_or_reject`: read probation/suspension; apply per-pair `strength_delta` and `candle_setup_boost`; hard-reject when `suspension.blocked`.
-- [ ] `metacognition/confidence.py`: new file. Hourly cron task computes `confidence_t`; risk/manager + signals/engine read.
-- [ ] `risk/manager.py:size_position`: `effective_capital *= confidence_t`.
-- [ ] `risk/manager.py:monitor_trailing_sl`: `trail_dist_pct *= (2.0 - confidence_t)`.
-- [ ] Counters per silent-rejection rule: `decoders:bucket_applied_count:{regime}:{band}`, `pair:probation:count`, `pair:suspension:count`, `bot:confidence:value`, `bot:confidence:hard_skip_count`.
-- [ ] F30 governance: register F46_bucketed (R1), F46_pair_lists (R2), F46_confidence (R4) all gated on F46 parent.
-- [ ] Blueprint cont. 55 line + PROGRESS.md entry.
+- [x] `metacognition/actuator.py`: add `_apply_bucketed()`, refactor `_apply()` to compute density/unanimity scaling. — SHIPPED (`actuator.py:277`).
+- [x] `signals/engine.py`: read `by_regime_and_band[regime|band]` first, fall back to `_global_fallback`. — read path SHIPPED (`get_bucket_delta` actuator.py:416, engine.py:1240); `_global_fallback` supported but not populated (see OPEN ITEM above).
+- [x] `celery_app.py`: new beat task `update_pair_lists_from_decoder` — SHIPPED (`celery_app.py:3814`, beat at :321).
+- [x] `signals/engine.py:accept_or_reject`: read probation/suspension — SHIPPED (`pair:suspension:blocked_count` write engine.py:2368).
+- [x] `metacognition/confidence.py`: new file. computes `confidence_t` — SHIPPED (`compute_and_store`/`get_confidence`/`should_hard_skip`).
+- [x] `risk/manager.py:size_position`: `effective_capital *= confidence_t` — SHIPPED (consumed risk/manager.py:1961).
+- [x] `risk/manager.py:monitor_trailing_sl`: `trail_dist_pct *= (2.0 - confidence_t)` — SHIPPED (`trail:confidence_widen_count` risk/manager.py:1966).
+- [x] Counters per silent-rejection rule (`decoders:bucket_applied_count:*`, `pair:probation:count`, `pair:suspension:count`, etc.) — SHIPPED (counters present in Redis).
+- [x] F30 governance: register F46_bucketed / F46_pair_lists / F46_confidence — SHIPPED.
+- [x] Blueprint cont. 55 line + PROGRESS.md entry — done (cont. 55 / 64 / 69s).
 
 ---
 
