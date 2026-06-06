@@ -282,7 +282,102 @@ rsync -avz --progress /opt/trading-bot/data/historical/ root@NEW_VPS_IP:/opt/tra
 
 ---
 
-## 17. Troubleshooting
+## 17. Retraining ML Models From Scratch
+
+If you cannot rsync models from the old VPS, follow these steps in order.
+**The bot can trade without ML models** (rule-based signals still work), but retraining restores full prediction power.
+
+### Step 1 — Download the Kline Corpus (historical candle data)
+
+This downloads 1m/5m/15m/30m/1h candles for all active pairs from data.binance.vision (static CDN — no rate limits, no bans). Takes 30–90 minutes depending on VPS speed.
+
+```bash
+# Make sure the corpus directory is owned by uid 999 (container user)
+sudo chown -R 999:999 /opt/trading-bot/data/historical/
+
+# Run the deep backfill inside the cn_train container (has corpus mounts)
+docker compose exec celery_worker_cn_train python -m ml.klines_corpus backfill --pairs active
+```
+
+Check progress — it will log each pair/timeframe as it downloads:
+```bash
+docker compose logs celery_worker_cn_train -f
+```
+
+### Step 2 — Retrain the XGBoost Kline Predictor
+
+This is the main directional prediction model (predict-all). Trigger it manually:
+
+```bash
+docker compose exec celery_worker_cn_train python -c "
+from celery_app import retrain_kline_predictor_task
+retrain_kline_predictor_task()
+print('Done')
+"
+```
+
+Takes ~10–30 minutes. When complete you will see model files appear in `/opt/trading-bot/models/`.
+
+### Step 3 — Retrain CandleNet Models (all timeframes)
+
+CandleNet is a neural network trained per-timeframe. Trigger all 5 retrains:
+
+```bash
+docker compose exec celery_worker_candlenet python -c "
+from celery_app import retrain_candlenet_1m, retrain_candlenet_5m, retrain_candlenet_15m, retrain_candlenet_30m, retrain_candlenet_1h
+retrain_candlenet_1m()
+retrain_candlenet_5m()
+retrain_candlenet_15m()
+retrain_candlenet_30m()
+retrain_candlenet_1h()
+print('Done')
+"
+```
+
+Each takes 5–20 minutes. The weekly scheduler will also retrain automatically every Sunday.
+
+### Step 4 — Retrain Other Models (HMM, MARL)
+
+These run automatically on schedule, but can be triggered manually:
+
+```bash
+docker compose exec celery_worker python -c "
+from celery_app import retrain_hmm, retrain_marl_day
+retrain_hmm()
+retrain_marl_day()
+print('Done')
+"
+```
+
+### Step 5 — Verify Models Loaded
+
+```bash
+# Check models directory has files
+ls -lh /opt/trading-bot/models/
+
+# Check Redis for prediction output (means model is running)
+docker exec trading-bot-redis-1 redis-cli keys "prediction:*" | head -10
+
+# Check brain logs for model load confirmation
+docker compose logs brain --tail=30 | grep -i "model\|predict\|candlenet"
+```
+
+### Retraining Timeline Summary
+
+| Model | Time | Command container |
+|-------|------|-------------------|
+| Kline corpus download | 30–90 min | `celery_worker_cn_train` |
+| XGBoost kline predictor | 10–30 min | `celery_worker_cn_train` |
+| CandleNet 1m | 5–20 min | `celery_worker_candlenet` |
+| CandleNet 5m/15m/30m/1h | 5–20 min each | `celery_worker_candlenet` |
+| HMM + MARL | 5–15 min | `celery_worker` |
+| **Total from scratch** | **~3–5 hours** | |
+
+> After retraining, the bot auto-uses new models. No restart needed.
+
+---
+
+## 18. Troubleshooting
 
 | Problem | Fix |
 |---------|-----|
