@@ -56,6 +56,7 @@ class BinanceClient:
             api_key=config.BINANCE_API_KEY,
             api_secret=config.BINANCE_API_SECRET,
             testnet=config.BINANCE_TESTNET,
+            ping=False,
         )
         log.info("binance_client_ready", testnet=config.BINANCE_TESTNET)
 
@@ -299,6 +300,37 @@ class BinanceClient:
         _track_weight(1)
         result = _backoff_call(self._client.futures_open_interest, symbol=pair)
         return float(result.get("openInterest", 0))
+
+    # --- Priority 2 (cont. 74): OI velocity / Long-Short / Taker ratio ---
+    # All are PRODUCTION-only /futures/data endpoints (verified absent on testnet);
+    # the client here is built testnet=False. Each returns an ascending time series
+    # so the caller derives z-scores inline (no Redis rolling window needed).
+
+    def get_open_interest_hist(self, pair: str, period: str = "5m",
+                               limit: int = 30) -> list[dict]:
+        """OI history: each row has sumOpenInterest (base) + sumOpenInterestValue
+        (USD notional). price = value/oi is derivable from the same call."""
+        _track_weight(1)
+        return _backoff_call(self._client.futures_open_interest_hist,
+                             symbol=pair, period=period, limit=limit) or []
+
+    def get_longshort_ratio(self, pair: str, period: str = "5m",
+                            limit: int = 30, top: bool = False) -> list[dict]:
+        """Long/short ratio series. top=False → global ACCOUNT ratio (retail
+        crowd); top=True → top-trader POSITION ratio (smart money). Each row has
+        longShortRatio, longAccount, shortAccount."""
+        _track_weight(1)
+        fn = (self._client.futures_top_longshort_position_ratio if top
+              else self._client.futures_global_longshort_ratio)
+        return _backoff_call(fn, symbol=pair, period=period, limit=limit) or []
+
+    def get_taker_ratio(self, pair: str, period: str = "5m",
+                        limit: int = 30) -> list[dict]:
+        """Taker buy/sell volume series. Each row has buySellRatio, buyVol,
+        sellVol — who is the aggressor (>1 = buyers lifting offers)."""
+        _track_weight(1)
+        return _backoff_call(self._client.futures_taker_longshort_ratio,
+                             symbol=pair, period=period, limit=limit) or []
 
     # --- G-03: All USDT-M futures symbols ---
 

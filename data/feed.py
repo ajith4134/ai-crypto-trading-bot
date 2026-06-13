@@ -296,6 +296,29 @@ def _corpus_csv_candles(pair: str, interval: str, need: int) -> dict[int, list]:
     return out
 
 
+def _stored_list_candles(r, pair: str, interval: str, need: int) -> dict[int, list]:
+    """Newest `need` candles ALREADY in the live CANDLES list → {ts:[ts,o,h,l,c,v]}.
+
+    cont. 75 — merging this back into each rebuild lets a pair PRESERVE accumulated depth
+    (including a prior REST backfill) instead of every poll DELETE+rewriting from a thin
+    WS-only payload. Without it a freshly rotated-in pair could never grow history beyond
+    live WS accumulation (1h gains only 1 closed bar/hour)."""
+    out: dict[int, list] = {}
+    key = redis_keys.CANDLES.replace("{pair}", pair).replace("{interval}", interval)
+    try:
+        items = r.lrange(key, 0, need - 1)
+    except Exception:
+        return out
+    for it in (items or []):
+        try:
+            c = json.loads(it)
+            ts = int(c["t"])
+            out[ts] = [ts, c["o"], c["h"], c["l"], c["c"], c.get("v", 0)]
+        except (TypeError, ValueError, KeyError, json.JSONDecodeError):
+            continue
+    return out
+
+
 def _fetch_rest(pair: str, interval: str, limit: int) -> list[str]:
     """Cold-start fallback: /fapi/v1/klines → oldest-first JSON-dict strings (production weight).
     Binance kline: [openTime, open, high, low, close, volume, closeTime, ...]."""
@@ -321,7 +344,8 @@ def _build_candles_ws(r, pair: str, interval: str, need: int) -> list[str]:
     """CANDLES payload (oldest-first JSON-dict strings) from corpus CSV + WS zset.
     Newest closed bars (zset) win over corpus for any overlapping ts. [] if both empty."""
     merged = _corpus_csv_candles(pair, interval, need)
-    merged.update(_ws_zset_candles(r, pair, interval, need))
+    merged.update(_stored_list_candles(r, pair, interval, need))   # cont.75 — preserve depth
+    merged.update(_ws_zset_candles(r, pair, interval, need))       # freshest WS wins on overlap
     if not merged:
         return []
     ordered = [merged[ts] for ts in sorted(merged)][-need:]
@@ -331,13 +355,52 @@ def _build_candles_ws(r, pair: str, interval: str, need: int) -> list[str]:
     ]
 
 
+# cont. 75 — per-interval "enough bars" target. Below this a pair is treated as THIN and
+# gets a one-off REST backfill (1h needs 168 for HMM/regime; short TFs 60 for the modules).
+_MIN_BARS_TARGET = {"1m": 60, "5m": 60, "15m": 60, "30m": 60, "1h": 168}
+_BACKFILL_COOLDOWN_S = 7200   # re-backfill a (pair,interval) at most once / 2h
+_BACKFILL_WINDOW_S = 30       # global rate window
+_BACKFILL_PER_WINDOW = 20     # max REST backfills per window → request-weight safe
+
+
+def _backfill_allowed(r, pair: str, interval: str) -> bool:
+    """Rate-gate thin-history REST backfills so seeding can never trip the /fapi weight ban:
+    a per-(pair,interval) cooldown (no repeat within 2h) AND a global per-window token budget
+    (≤ _BACKFILL_PER_WINDOW per 30s across all pairs/TFs). Reserves the token only when it
+    actually grants the backfill."""
+    cd_key = f"feed:candles:backfilled:{pair}:{interval}"
+    try:
+        if r.get(cd_key):
+            return False
+        win = "feed:candles:backfill_window"
+        n = r.incr(win)
+        if n == 1:
+            r.expire(win, _BACKFILL_WINDOW_S)
+        if n > _BACKFILL_PER_WINDOW:
+            return False
+        r.setex(cd_key, _BACKFILL_COOLDOWN_S, "1")
+        return True
+    except Exception:
+        return False
+
+
 def _collect_candles(r, pair: str, interval: str, need: int,
                      use_ws: bool, rest_allowed: bool) -> tuple[list[str], str]:
-    """Returns (oldest-first payload, source) — source in {ws, rest, none}."""
-    if use_ws:
-        payload = _build_candles_ws(r, pair, interval, need)
-        if payload:
-            return payload, "ws"
+    """Returns (oldest-first payload, source) — source in {ws, rest, none}.
+
+    cont. 75 — backfills a THIN history from REST, not only an empty one. A freshly
+    rotated-in pair accumulates higher-TF bars slowly over WS (1h = 1 bar/hr), so returning
+    the few-bar partial payload starved the modules/forecasts (e.g. hmm_regime needs 168×1h).
+    The backfill is rate-gated (_backfill_allowed) and the merge in _build_candles_ws then
+    keeps the seeded depth, so each pair needs REST at most once."""
+    payload = _build_candles_ws(r, pair, interval, need) if use_ws else []
+    target = _MIN_BARS_TARGET.get(interval, need)
+    if rest_allowed and len(payload) < target and _backfill_allowed(r, pair, interval):
+        rp = _fetch_rest(pair, interval, need)
+        if rp and len(rp) > len(payload):
+            return rp, "rest"
+    if payload:
+        return payload, "ws"
     if rest_allowed:
         rp = _fetch_rest(pair, interval, need)
         if rp:
@@ -508,30 +571,63 @@ async def _poll_short_candles_and_log(r, interval: str, limit: int = 65) -> None
 
 
 async def _poll_patchtst_forecasts_and_log(r) -> None:
-    """F20: refresh PatchTST forecasts for top active pairs.
-    Runs as a create_task'd coroutine so model inference doesn't block the data loop.
-    Inference is sequential (PatchTST is a heavyweight model — parallel CPU inference
-    would thrash the container). Caps at 10 pairs per cycle to keep wall time bounded."""
+    """F20: refresh PatchTST forecasts. cont. 74 — now BATCHED: one forward pass over
+    the whole active set (chunked) instead of ~6-9s/pair sequential. This makes
+    full-universe coverage feasible (the old loop capped at 30 pairs = 211s/cycle).
+    Runs the batch in the executor so the heavy forward pass doesn't block the loop.
+    patchtst:poll_cap (default 0 = all active) bounds the set if ever needed."""
     import time as _time
     t0 = _time.time()
-    from ml.patchtst import get_longsequence_forecast
-    # Was top-10 — caused F20 status to fluctuate (poll covers 10 pairs every
-    # 7 min, TTL 30 min → only 30 pairs ever have fresh keys at once, out of
-    # ~100 active). Bump to 30 to keep most of the active set warm.
-    active = list(r.smembers(redis_keys.ACTIVE_PAIRS))[:30]
+    from ml.patchtst import get_longsequence_forecast_batch
+    active = sorted(p.decode() if isinstance(p, bytes) else p
+                    for p in r.smembers(redis_keys.ACTIVE_PAIRS))
+    try:
+        _cap = int(r.get("patchtst:poll_cap") or 0)
+    except Exception:
+        _cap = 0
+    if _cap > 0:
+        active = active[:_cap]
+    if not active:
+        return
     loop = asyncio.get_event_loop()
-    count_ok = 0
-    for pair in active:
+    try:
+        results = await loop.run_in_executor(None, get_longsequence_forecast_batch, active)
+    except Exception as exc:
+        log.error("patchtst_batch_failed", error=str(exc)[:200])
+        return
+    log.info("patchtst_polled", ok=len(results), attempted=len(active),
+             elapsed_s=round(_time.time() - t0, 2), mode="batched")
+
+
+async def _poll_tft_forecasts(r) -> None:
+    """F19: cont. 74 — pre-warm TFT quantile forecasts across the active set AND multiple
+    timeframes via BATCHED inference, so tft_score covers the full universe and (once the
+    consumer is wired) multiple horizons — not just 1h on the funnel pairs. Timeframes
+    tunable via tft:poll_tfs (default '5m,15m,1h'). Batched → bounded cost."""
+    import time as _time
+    t0 = _time.time()
+    from ml.tft import get_price_forecast_batch
+    active = sorted(p.decode() if isinstance(p, bytes) else p
+                    for p in r.smembers(redis_keys.ACTIVE_PAIRS))
+    if not active:
+        return
+    _raw = r.get("tft:poll_tfs")
+    _raw = (_raw.decode() if isinstance(_raw, bytes) else _raw) if _raw else "5m,15m,1h"
+    tfs = [x.strip() for x in _raw.split(",") if x.strip()]
+    # Per-TF context: 1h keeps 100 (matches the live single-path 1h so the cached value
+    # the engine reads is unchanged); short TFs use 50 (their candle lists hold ~65).
+    _ctx = {"1m": 50, "5m": 50, "15m": 50, "30m": 50, "1h": 100, "2h": 80, "4h": 60}
+    loop = asyncio.get_event_loop()
+    total = 0
+    for tf in tfs:
         try:
-            # Run sync forecast in executor so we don't block the event loop
-            res = await loop.run_in_executor(None, get_longsequence_forecast, pair)
-            if res:
-                count_ok += 1
+            res = await loop.run_in_executor(
+                None, get_price_forecast_batch, active, tf, _ctx.get(tf, 60))
+            total += len(res)
         except Exception as exc:
-            log.warning("patchtst_forecast_pair_failed", pair=pair, error=str(exc)[:100])
-    log.info("patchtst_polled",
-             ok=count_ok, attempted=len(active),
-             elapsed_s=round(_time.time() - t0, 2))
+            log.error("tft_batch_poll_failed", tf=tf, error=str(exc)[:160])
+    log.info("tft_polled", ok=total, pairs=len(active), tfs=len(tfs),
+             elapsed_s=round(_time.time() - t0, 2), mode="batched")
 
 
 def _poll_fear_greed(r) -> None:
@@ -692,6 +788,8 @@ async def data_loop() -> None:
                     _spawn(_refresh_transfer_entropy())
                 if _fg_active("F20"):
                     _spawn(_poll_patchtst_forecasts_and_log(r))
+                if _fg_active("F19"):           # cont. 74 — batched multi-TF TFT pre-warm
+                    _spawn(_poll_tft_forecasts(r))
             except Exception as exc:
                 log.warning("model_refresh_skipped", error=str(exc))
 
@@ -946,15 +1044,43 @@ async def _account_metrics_loop() -> None:
         await asyncio.sleep(30)
 
 
+async def _supervise(coro_factory, name: str) -> None:
+    """cont. 74 — NEVER let a pipeline loop die silently. Root cause of the 13h
+    data_feed zombie: gather(return_exceptions=True) swallowed a stale-pool
+    ConnectionError when redis got a new IP; data_loop() died while the process
+    + other loops stayed up, so Docker showed 'healthy'. This wraps each loop:
+    on any crash, log LOUDLY + bump a Redis counter (Rule 12), rebuild the redis
+    client (fresh DNS), back off, and RESTART the loop. A loop can no longer die.
+    """
+    backoff = 1
+    while True:
+        try:
+            await coro_factory()
+            log.warning("data_loop_exited_normally", loop=name)  # infinite loops shouldn't
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            log.error("data_loop_crashed_restarting", loop=name,
+                      error=str(exc)[:200], backoff_s=backoff)
+            try:
+                redis_client.reinit()  # fresh pool → re-resolve `redis` hostname/IP
+                redis_client.get().incr(f"data_feed:loop_restart:{name}")
+            except Exception:
+                pass
+        await asyncio.sleep(backoff)
+        backoff = min(30, backoff * 2)
+
+
 async def _main_data_pipeline() -> None:
     """Run the legacy REST polling loop AND the new WS + account metrics
     loops concurrently. WS handles realtime mark prices; REST polling stays
-    on as a safety net + provides 24h ticker / candles that aren't streamed."""
+    on as a safety net + provides 24h ticker / candles that aren't streamed.
+    cont. 74 — each loop is supervised so a transient redis blip can't zombie it."""
     await asyncio.gather(
-        data_loop(),
-        _ws_mark_price_loop(),
-        _ws_ticker_loop(),
-        _account_metrics_loop(),
+        _supervise(data_loop, "data_loop"),
+        _supervise(_ws_mark_price_loop, "ws_mark"),
+        _supervise(_ws_ticker_loop, "ws_ticker"),
+        _supervise(_account_metrics_loop, "account_metrics"),
         return_exceptions=True,
     )
 

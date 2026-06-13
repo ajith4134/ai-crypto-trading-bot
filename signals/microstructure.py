@@ -93,7 +93,13 @@ def compute_book_features(bids, asks, prev_ofi: float | None) -> dict | None:
         denom = bid_q + ask_q
         if denom <= 0:
             return None
-        ofi = (bid_q - ask_q) / denom                       # [-1, 1]
+        ofi = (bid_q - ask_q) / denom                       # [-1, 1] top-N depth
+        # L1 (top-of-book) imbalance — best bid vs best ask resting size only.
+        # Distinct from `ofi` (top-N depth): captures the most aggressive queue
+        # pressure, the canonical `bid_ask_imbalance` feature (was dead/0-fill).
+        bb_q = float(bids[0][1]); ba_q = float(asks[0][1])
+        l1_denom = bb_q + ba_q
+        bid_ask_imbalance = (bb_q - ba_q) / l1_denom if l1_denom > 0 else 0.0
         spread = (best_ask - best_bid) / mid
         # Depth-weighted VWAP-to-mid: where is the resting liquidity centered vs mid.
         vwap = (sum(float(b[0]) * float(b[1]) for b in bids) +
@@ -122,7 +128,8 @@ def compute_book_features(bids, asks, prev_ofi: float | None) -> dict | None:
 
     return {"ofi": round(ofi, 4), "spread": round(spread, 6),
             "ofi_accel": round(ofi_accel, 4), "vwap_dev": round(vwap_dev, 6),
-            "jump_score": jump_score, "direction": direction}
+            "jump_score": jump_score, "direction": direction,
+            "bid_ask_imbalance": round(bid_ask_imbalance, 4)}
 
 
 def write_micro(r, pair: str, feats: dict) -> None:
@@ -142,6 +149,10 @@ def write_micro(r, pair: str, feats: dict) -> None:
         pipe.setex(f"{pair}:micro:vwap_dev", _TTL, feats["vwap_dev"])
         pipe.setex(f"{pair}:micro:jump_score", _TTL, feats["jump_score"])
         pipe.setex(f"{pair}:micro:direction", _TTL, feats["direction"])
+        # Canonical bid_ask_imbalance consumer key (prediction/features.py:169,
+        # redis_keys.BID_ASK_IMBALANCE). .get keeps old callers that built feats
+        # without this key safe (defaults 0.0). Revived from dead/0-fill (cont. 73).
+        pipe.setex(f"{pair}:bid_ask_imbalance", _TTL, feats.get("bid_ask_imbalance", 0.0))
         pipe.setex(f"{pair}:micro:ts", _TTL, now)
         pipe.set(f"{pair}:micro:ofi_prev", feats["ofi"])    # state (no TTL)
         pipe.execute()

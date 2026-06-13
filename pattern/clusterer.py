@@ -102,12 +102,28 @@ def save(clusterer, centroids, model_version: str) -> None:
              model_version=model_version)
 
 
+_LOAD_CACHE: dict | None = None
+_LOAD_MTIME: float = 0.0
+
+
 def load() -> dict | None:
+    """Load the fitted clusterer blob, cached in-process with mtime invalidation.
+
+    The pickle is ~50 MB; predict_cluster runs per-pair-per-minute (≈300×/min),
+    so re-reading it every call would be heavy disk I/O. Cache it and reload only
+    when the file's mtime changes (i.e. after a retrain writes a new model)."""
+    global _LOAD_CACHE, _LOAD_MTIME
     if not _MODEL_PATH.exists():
+        _LOAD_CACHE, _LOAD_MTIME = None, 0.0
         return None
     try:
+        mtime = _MODEL_PATH.stat().st_mtime
+        if _LOAD_CACHE is not None and mtime == _LOAD_MTIME:
+            return _LOAD_CACHE
         with open(_MODEL_PATH, "rb") as f:
-            return pickle.load(f)
+            _LOAD_CACHE = pickle.load(f)
+        _LOAD_MTIME = mtime
+        return _LOAD_CACHE
     except Exception as exc:
         log.warning("pattern_clusters_load_failed", error=str(exc)[:200])
         return None

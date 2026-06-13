@@ -1,6 +1,6 @@
 // AI-03: Panel 1 — Control Panel (cont. 31: + Start New Session)
 import React, { useEffect, useRef, useState } from 'react';
-import { getBotStatus, setBotMode, getToken, startSession, getCurrentSession, clearSession, switchBotMode, getModeChangeStatus, getFapiRecovery } from '../api';
+import { getBotStatus, getToken, startSession, getCurrentSession, clearSession, switchBotMode, getModeChangeStatus, getFapiRecovery } from '../api';
 import axios from 'axios';
 import { card, title, badge } from './shared';
 
@@ -392,6 +392,9 @@ const ControlPanel: React.FC = () => {
       <div style={{ display:'flex', gap:8, marginBottom:12, flexWrap:'wrap' }}>
         <span style={badge(status.running ? '#00ff88' : '#ff4444')}>{status.running ? 'RUNNING' : 'STOPPED'}</span>
         <span style={badge('#0088ff')}>{(status.mode || 'paper').toUpperCase()}</span>
+        <span style={badge(status.actual_trading_mode === 'live' ? '#ff4444' : '#666')}>
+          ENGINE {(status.actual_trading_mode || 'unknown').toUpperCase()}
+        </span>
         <span style={badge('#aa88ff')}>Stage {status.stage || 1} — {stageLabel}</span>
       </div>
 
@@ -504,7 +507,7 @@ const ControlPanel: React.FC = () => {
           Calls /bot/mode_switch which stops bot, closes open trades, rewrites
           .env, restarts brain + celery + data_feed via watchdog. */}
       <ModeSwitchButton
-        currentMode={(status.mode || 'paper') as 'live' | 'paper'}
+        currentMode={(status.actual_trading_mode || status.mode || 'paper') as 'live' | 'paper'}
         liveUnlocked={liveUnlocked}
         maxPos={status.max_position_usdt}
         startingCapital={status.starting_capital_usdt}

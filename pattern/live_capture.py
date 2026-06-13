@@ -99,11 +99,35 @@ def capture_for_pair(pair: str,
                     pair=pair, error=str(exc)[:200])
         return None
 
+    # Phase B (cont. 73) — assign the live cluster from the SAME embedding that
+    # landed in the training stream (keeps train/inference distributions identical,
+    # per the module docstring). Writes the canonical consumer key
+    # `pattern:cluster_id:{pair}` (prediction/features.py:162, was always -1 because
+    # nothing wrote it). predict_cluster returns -1 until a model is fitted; load()
+    # is in-process cached so this adds ~no cost. TTL > capture cadence (60s) so the
+    # key stays warm; a `_strength` companion key aids debugging/gating.
+    cluster_id = -1
+    try:
+        from pattern.clusterer import predict_cluster
+        cluster_id, strength = predict_cluster(vec)
+        pipe = r.pipeline(transaction=False)
+        pipe.setex(f"pattern:cluster_id:{pair}", 180, int(cluster_id))
+        pipe.setex(f"pattern:cluster_strength:{pair}", 180, round(float(strength), 4))
+        pipe.execute()
+        # Rule 12 — emit counters so a silent assignment failure is visible.
+        r.incr("pattern:assign:total")
+        if cluster_id < 0:
+            r.incr("pattern:assign:noise")
+    except Exception as exc:
+        log.debug("pattern_cluster_assign_failed", pair=pair, error=str(exc)[:120])
+        r.incr("pattern:assign:error")
+
     return {
         "pair":           pair,
         "ts_ms":          now_ms,
         "market_regime":  market_regime,
         "embedding":      vec,
+        "cluster_id":     cluster_id,
     }
 
 

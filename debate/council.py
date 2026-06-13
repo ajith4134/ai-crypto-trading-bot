@@ -21,7 +21,6 @@ existing 'debate_no_llm_full_allocation' path — preserving the previous
 behaviour exactly. Worst case = 9 LLM calls per signal (3 agents × 3 rounds);
 typical case = 3 (round 1) or 6 (rounds 1+2 when there's disagreement).
 """
-import asyncio
 import json
 import structlog
 from llm.guard import assert_no_reflection
@@ -362,12 +361,21 @@ async def run_debate(signal: dict, market: dict, capital_pct: float, balance: fl
     from llm.decision import decide
 
     # ── Round 1 ──────────────────────────────────────────────────────────────
-    bull_r1_raw, bear_r1_raw, risk_r1_raw = await asyncio.gather(
-        decide(_bull_prompt(signal, market), timeout=60),
-        decide(_bear_prompt(signal, market), timeout=60),
-        decide(_risk_prompt(signal, capital_pct, balance), timeout=60),
-        return_exceptions=True,
-    )
+    # Sequential: Ollama has one CPU-bound slot per inference; concurrent dispatch
+    # means all 3 share cores and each takes 3× longer, reliably hitting the 60s
+    # timeout. Sequential gives each call the full CPU and its own 60s window.
+    try:
+        bull_r1_raw = await decide(_bull_prompt(signal, market), timeout=60)
+    except Exception as exc:
+        bull_r1_raw = exc
+    try:
+        bear_r1_raw = await decide(_bear_prompt(signal, market), timeout=60)
+    except Exception as exc:
+        bear_r1_raw = exc
+    try:
+        risk_r1_raw = await decide(_risk_prompt(signal, capital_pct, balance), timeout=60)
+    except Exception as exc:
+        risk_r1_raw = exc
     bull_failed = isinstance(bull_r1_raw, Exception) or not isinstance(bull_r1_raw, dict)
     bear_failed = isinstance(bear_r1_raw, Exception) or not isinstance(bear_r1_raw, dict)
     risk_failed = isinstance(risk_r1_raw, Exception) or not isinstance(risk_r1_raw, dict)
@@ -436,12 +444,18 @@ async def run_debate(signal: dict, market: dict, capital_pct: float, balance: fl
                  threshold=_R2_STRENGTH_GATE)
     if fire_r2:
         try:
-            bull_r2_raw, bear_r2_raw, risk_r2_raw = await asyncio.gather(
-                decide(_bull_prompt_r2(signal, market, bear_r1, risk_r1), timeout=60),
-                decide(_bear_prompt_r2(signal, market, bull_r1, risk_r1), timeout=60),
-                decide(_risk_prompt_r2(signal, capital_pct, balance, bull_r1, bear_r1), timeout=60),
-                return_exceptions=True,
-            )
+            try:
+                bull_r2_raw = await decide(_bull_prompt_r2(signal, market, bear_r1, risk_r1), timeout=60)
+            except Exception as exc:
+                bull_r2_raw = exc
+            try:
+                bear_r2_raw = await decide(_bear_prompt_r2(signal, market, bull_r1, risk_r1), timeout=60)
+            except Exception as exc:
+                bear_r2_raw = exc
+            try:
+                risk_r2_raw = await decide(_risk_prompt_r2(signal, capital_pct, balance, bull_r1, bear_r1), timeout=60)
+            except Exception as exc:
+                risk_r2_raw = exc
             if isinstance(bull_r2_raw, dict):
                 bull_r2 = bull_r2_raw
             if isinstance(bear_r2_raw, dict):
@@ -462,11 +476,14 @@ async def run_debate(signal: dict, market: dict, capital_pct: float, balance: fl
     if fire_r3:
         try:
             mod_q = _moderator_question(bull_r2, bear_r2)
-            bull_r3_raw, bear_r3_raw = await asyncio.gather(
-                decide(_bull_prompt_r3(signal, mod_q), timeout=45),
-                decide(_bear_prompt_r3(signal, mod_q), timeout=45),
-                return_exceptions=True,
-            )
+            try:
+                bull_r3_raw = await decide(_bull_prompt_r3(signal, mod_q), timeout=45)
+            except Exception as exc:
+                bull_r3_raw = exc
+            try:
+                bear_r3_raw = await decide(_bear_prompt_r3(signal, mod_q), timeout=45)
+            except Exception as exc:
+                bear_r3_raw = exc
             if isinstance(bull_r3_raw, dict):
                 bull_r3 = bull_r3_raw
             if isinstance(bear_r3_raw, dict):

@@ -14,6 +14,39 @@ log = structlog.get_logger()
 _VIRTUAL_BALANCE_KEY = redis_keys.VIRTUAL_BALANCE
 
 
+# cont. 75 — ATOMIC virtual-balance accounting. VIRTUAL_BALANCE is mutated by
+# multiple concurrent actors: the brain's run_open (deduct on open), the
+# trailing-SL monitor's close_trade (restore on close), and the DCA loop
+# (add_dca / close_partial). The previous pattern everywhere was a NON-atomic
+# read-modify-write — GET balance → compute → SET balance. When an open's
+# deduct interleaved with a close's restore, one side read a stale value and
+# its write clobbered the other's (a lost update), drifting the stored balance
+# away from the true ledger (start + realised_pnl − deployed). The same window
+# made the sizing check and the actual deduct see different balances, surfacing
+# as "insufficient virtual balance" rejects that the sizing math forbids.
+#
+# All GUARDED deductions (open, DCA) now go through _reserve_balance, which does
+# the check AND the deduct inside one server-side Lua call (Redis runs it
+# atomically). All ADDITIVE restores use INCRBYFLOAT (a single atomic op). No
+# balance mutation reads-then-writes in two steps anymore.
+_RESERVE_LUA = """
+local bal = tonumber(redis.call('GET', KEYS[1]) or '0')
+local amt = tonumber(ARGV[1])
+if bal < amt then return '-1' end
+return redis.call('INCRBYFLOAT', KEYS[1], '-' .. ARGV[1])
+"""
+
+
+def _reserve_balance(r, amount: float) -> float | None:
+    """Atomically deduct `amount` from the virtual balance, but only if the
+    balance covers it. Returns the new balance, or None when there are
+    insufficient funds (in which case nothing is deducted)."""
+    new_bal = r.eval(_RESERVE_LUA, 1, _VIRTUAL_BALANCE_KEY, f"{float(amount):.8f}")
+    if str(new_bal) == "-1":
+        return None
+    return float(new_bal)
+
+
 class PaperExecutionEngine(ExecutionEngine):
 
     def open_trade(self, params: dict) -> str:
@@ -39,12 +72,18 @@ class PaperExecutionEngine(ExecutionEngine):
         params["average_entry"] = fill_price
 
         capital = float(params["capital_usdt"])
-        balance = float(r.get(_VIRTUAL_BALANCE_KEY) or 0)
-        if balance < capital:
+        # cont. 75 — atomic reserve: check-and-deduct in ONE Redis op so a
+        # concurrent close/DCA can't race between the check and the deduct.
+        # Reserve FIRST, then persist; refund the reservation if the trade row
+        # fails to write so a failed open can never leak capital.
+        if _reserve_balance(r, capital) is None:
+            balance = float(r.get(_VIRTUAL_BALANCE_KEY) or 0)
             raise ValueError(f"Insufficient virtual balance: {balance:.2f} < {capital:.2f}")
-        r.set(_VIRTUAL_BALANCE_KEY, balance - capital)
-
-        trade_id = write_trade_open(params)
+        try:
+            trade_id = write_trade_open(params)
+        except Exception:
+            r.incrbyfloat(_VIRTUAL_BALANCE_KEY, capital)   # refund the reservation
+            raise
         r.publish(redis_keys.CH_TRADE_OPENED, json.dumps({
             "trade_id": trade_id, "pair": params["pair"],
             "direction": params["direction"], "entry_price": fill_price,
@@ -161,8 +200,9 @@ class PaperExecutionEngine(ExecutionEngine):
         ])
         dca_return = float(trade["capital_usdt"]) * 0.5 * dca_rounds
         total_return = float(trade["capital_usdt"]) + dca_return + net_pnl
-        balance = float(r.get(_VIRTUAL_BALANCE_KEY) or 0)
-        r.set(_VIRTUAL_BALANCE_KEY, balance + total_return)
+        # cont. 75 — atomic additive restore (was a non-atomic GET+SET that
+        # raced concurrent open/DCA deducts and lost updates).
+        r.incrbyfloat(_VIRTUAL_BALANCE_KEY, total_return)
         if dca_rounds:
             log.info("dca_capital_returned", trade_id=trade_id, rounds=dca_rounds, dca_return=round(dca_return, 4))
 
@@ -335,10 +375,9 @@ class PaperExecutionEngine(ExecutionEngine):
         mark_price = float(r.get(redis_keys.MARK_PRICE.replace("{pair}", trade["pair"])) or 0)
 
         dca_capital = float(trade["capital_usdt"]) * 0.5
-        balance = float(r.get(_VIRTUAL_BALANCE_KEY) or 0)
-        if balance < dca_capital:
+        # cont. 75 — atomic check-and-deduct (see _reserve_balance).
+        if _reserve_balance(r, dca_capital) is None:
             raise ValueError("Insufficient virtual balance for DCA")
-        r.set(_VIRTUAL_BALANCE_KEY, balance - dca_capital)
 
         orig_entry = float(trade["average_entry"] or trade["entry_price"])
         orig_qty = float(trade["quantity"])
@@ -415,8 +454,8 @@ class PaperExecutionEngine(ExecutionEngine):
         new_qty = full_qty - qty_close
         write_trade_update(trade_id, {"quantity": round(new_qty, 8)})
 
-        balance = float(r.get(_VIRTUAL_BALANCE_KEY) or 0)
-        r.set(_VIRTUAL_BALANCE_KEY, balance + partial_net)
+        # cont. 75 — atomic additive restore (see close_trade).
+        r.incrbyfloat(_VIRTUAL_BALANCE_KEY, partial_net)
 
         # Accumulate partial state (TP2 close will add this to final PnL)
         try:

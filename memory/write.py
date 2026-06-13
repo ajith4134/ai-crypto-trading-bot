@@ -91,7 +91,8 @@ def write_trade_open(params: dict) -> str:
                     position_size_usdt, capital_pct,
                     predicted_direction, predicted_entry,
                     predicted_sl, predicted_tp,
-                    predicted_hold_seconds, predicted_rr
+                    predicted_hold_seconds, predicted_rr,
+                    signals_at_entry
                 ) VALUES (
                     %s, %s, %s, %s, %s, %s,
                     %s, %s, %s, %s, %s,
@@ -101,7 +102,8 @@ def write_trade_open(params: dict) -> str:
                     %s, %s,
                     %s, %s,
                     %s, %s,
-                    %s, %s
+                    %s, %s,
+                    %s
                 )
             """, (
                 trade_id,
@@ -131,6 +133,7 @@ def write_trade_open(params: dict) -> str:
                 _pred_tp,
                 _pred_hold,
                 _pred_rr,
+                params.get("signals_at_entry"),
             ))
             if _pred_id is not None:
                 try:
@@ -625,6 +628,31 @@ def write_trade_close(trade_id: str, exit_data: dict) -> None:
             update_beliefs_on_close(trade_id, _v_won, _v_pnl, _v_cap)
     except Exception as exc:
         log.warning("debate_beliefs_update_skipped", error=str(exc))
+
+    # cont. 72 — Debate REALIZED-outcome learning loop. Writes the
+    # `debate:prior:regime:{regime}:{dir}` EWMA that debate.fallback reads as its
+    # PRIMARY term (the cont.69 design left this loop unimplemented → the prior was
+    # always empty). No LLM. Own flag (default on), independent of F37 governance so
+    # the core fix runs even when the LLM council is deactivated. Best-effort.
+    try:
+        import redis_client as _rcprior
+        if (_rcprior.get().get("debate:prior_learning_enabled") or "1") == "1":
+            from debate.learning import update_outcome_prior
+            with db_conn() as _pconn:
+                with _pconn.cursor() as _pcur:
+                    _pcur.execute(
+                        "SELECT direction, market_regime, capital_usdt "
+                        "FROM trades WHERE id = %s",
+                        (trade_id,),
+                    )
+                    _prow = _pcur.fetchone()
+            if _prow:
+                _p_dir, _p_regime, _p_cap = _prow[0], _prow[1], _prow[2]
+                _p_pnl = float(exit_data.get("net_pnl_usdt", 0))
+                _p_capf = float(_p_cap) if _p_cap is not None else 100.0
+                update_outcome_prior(_p_regime, _p_dir, _p_pnl, _p_capf)
+    except Exception as exc:
+        log.warning("debate_prior_learning_skipped", error=str(exc))
 
     # Blueprint F35 MemRL Phase 2 — constant-α MC Q-update from the closed trade.
     # The Q-table is consumed by memrl._phase2_quality_rerank to re-rank candidate

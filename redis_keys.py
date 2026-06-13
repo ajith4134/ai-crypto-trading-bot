@@ -56,6 +56,23 @@ NETFLOW_DEADLOCK_DISABLED = "netflow:disabled"                 # str ("1" = kill
 NETFLOW_REJECT_COUNT      = "netflow:reject_count"             # str (int) — total parse/transport/http failures
 NETFLOW_CALL_COUNT        = "netflow:call_count"               # str (int) — total provider calls
 
+# Priority 2 (cont. 74) — OI velocity + Long/Short + Taker ratio — owner: data/oi_ls_taker.py
+# Free production /futures/data Binance endpoints. The audit's Gate 3 (OI×price
+# divergence) + Gate 4 (LS crowding) + taker aggressor momentum. TTL 600s.
+OI_NOW            = "{pair}:oi_now"           # str (float) — current open interest (base units)
+OI_CHANGE_5M      = "{pair}:oi_change_5m"     # str (float) — last 5m pct change in OI
+OI_CHANGE_Z       = "{pair}:oi_change_z"      # str (float) — z-score of OI pct-change over 30 samples
+OI_PRICE_DIV      = "{pair}:oi_price_div"     # str (float) — sign(Δoi)·sign(Δprice) ∈ {-1,0,+1} (Gate 3)
+LS_GLOBAL_RATIO   = "{pair}:ls_global_ratio"  # str (float) — global account long/short ratio (retail crowd)
+LS_TOP_RATIO      = "{pair}:ls_top_ratio"     # str (float) — top-trader position long/short ratio (smart money)
+LS_CROWD_Z        = "{pair}:ls_crowd_z"       # str (float) — z-score of top-trader ratio over 30 samples (Gate 4)
+TAKER_RATIO       = "{pair}:taker_ratio"      # str (float) — taker buy/sell volume ratio (>1 = buyers aggress)
+TAKER_RATIO_Z     = "{pair}:taker_ratio_z"    # str (float) — z-score of taker ratio over 30 samples
+OILS_UPDATED_AT   = "oils:updated_at"         # str (epoch)
+OILS_DISABLED     = "oils:disabled"           # str ("1" = kill switch / deadlock)
+OILS_CALL_COUNT   = "oils:call_count"         # str (int)
+OILS_REJECT_COUNT = "oils:reject_count"       # str (int)
+
 # F53 — Qlib Alpha-158 Formulaic Alpha Pool (cont. 55) — owner: ml/qlib_alphas.py
 QLIB_ALPHA_VALUE          = "{pair}:qlib_alpha:{factor_id}"    # str (float) per-pair per-factor instantaneous value
 QLIB_IC_HISTORY           = "qlib:ic_history:{factor_id}"      # JSON list — rolling 7d hourly IC samples

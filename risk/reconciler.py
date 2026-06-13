@@ -37,14 +37,25 @@ from memory.write import write_trade_close
 log = structlog.get_logger()
 
 
-def _income_by_type(client, pair: str, start_ms: int):
-    """Sum REALIZED_PNL / COMMISSION / FUNDING_FEE (USDT) for a symbol since
-    start_ms. COMMISSION income is returned NEGATIVE by Binance."""
+def _income_by_type(client, pair: str, start_ms: int, end_ms: int | None = None):
+    """Sum REALIZED_PNL / COMMISSION / FUNDING_FEE (USDT) for a symbol in the
+    window [start_ms, end_ms). COMMISSION income is returned NEGATIVE by Binance.
+
+    cont. 77 — the upper bound is the fix for the ghost double-count: without it
+    this summed ALL of a symbol's income since the ghost's entry, so a re-traded
+    symbol (e.g. CARV×3) attributed later trades' realized PnL to this one. The
+    bot holds one position per symbol, so the NEXT open on this symbol is exactly
+    where this position's income window must end.
+    """
     realized = commission = funding = 0.0
     try:
-        inc = client._client.futures_income_history(
-            symbol=pair, startTime=int(start_ms), limit=500)
+        _kw = dict(symbol=pair, startTime=int(start_ms), limit=500)
+        if end_ms is not None:
+            _kw["endTime"] = int(end_ms)        # Binance endTime is inclusive…
+        inc = client._client.futures_income_history(**_kw)
         for i in inc:
+            if end_ms is not None and float(i.get("time") or 0) >= end_ms:
+                continue                         # …so drop the boundary tick (exclusive)
             t = i.get("incomeType")
             a = float(i.get("income") or 0)
             if t == "REALIZED_PNL":
@@ -58,13 +69,43 @@ def _income_by_type(client, pair: str, start_ms: int):
     return realized, commission, funding
 
 
+def _next_open_ms(pair: str, after_ms: int, exclude_id=None):
+    """Epoch-ms of the next live trade opened on `pair` strictly AFTER after_ms,
+    or None. Bounds a ghost's income window so a re-traded symbol can't pull a
+    later position's PnL into this one (one position per symbol → next open marks
+    where this position was already flat).
+
+    `exclude_id` MUST be the ghost's own trade id: `after_ms` is the ghost's entry
+    truncated to int-ms, so the ghost's own fractional entry (e.g. …412.221 > 412)
+    would otherwise match ITSELF and collapse the window to empty → every ghost
+    booked at $0. Excluding the id is what makes the bound correct."""
+    try:
+        with db_conn() as cx:
+            cur = cx.cursor()
+            cur.execute(
+                "SELECT EXTRACT(EPOCH FROM entry_time)*1000 FROM trades "
+                "WHERE pair=%s AND is_paper=false "
+                "AND EXTRACT(EPOCH FROM entry_time)*1000 > %s "
+                "AND (%s::text IS NULL OR id::text <> %s::text) "
+                "ORDER BY entry_time ASC LIMIT 1",
+                (pair, float(after_ms), exclude_id, exclude_id))
+            row = cur.fetchone()
+            return float(row[0]) if row and row[0] else None
+    except Exception as exc:
+        log.debug("reconciler_next_open_failed", pair=pair, error=str(exc)[:120])
+        return None
+
+
 def _close_ghost(client, r, row) -> None:
     tid, pair, direction, avg_entry, entry_price, qty, t0_ms = row
     entry = float(avg_entry or entry_price or 0)
     qty = float(qty or 0)
     start_ms = int(t0_ms) if t0_ms else int((time.time() - 24 * 3600) * 1000)
 
-    realized, commission, funding = _income_by_type(client, pair, start_ms)
+    # cont. 77 — bound the income window at the next open on this symbol so a
+    # re-traded symbol doesn't double-count a later position's realized PnL.
+    end_ms = _next_open_ms(pair, start_ms, exclude_id=tid)
+    realized, commission, funding = _income_by_type(client, pair, start_ms, end_ms)
     fees = abs(commission)
     net = realized + commission + funding   # commission already negative
 

@@ -11,6 +11,7 @@
     "@types/node": "^16.18.126",
     "@types/react": "^19.2.14",
     "@types/react-dom": "^19.2.3",
+    "@xyflow/react": "^12.11.0",
     "axios": "^1.16.1",
     "lightweight-charts": "^5.2.0",
     "react": "^19.2.6",

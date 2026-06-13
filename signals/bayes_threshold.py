@@ -239,11 +239,31 @@ def refresh() -> dict:
     now_ts = int(time.time())
     try:
         r = redis_client.get()
-        r.set(redis_keys.BAYES_THRESHOLD_T_HIGH, round(final_t_high, 2))
-        r.set(redis_keys.BAYES_THRESHOLD_T_LOW,  round(final_t_low, 2))
+        # Phase-7c §11 no-bypass: route the live T_high/T_low write THROUGH the unified producer-bus
+        # kernel. producers.apply_controller performs the bounded clamp + versioned audit record and does
+        # the actual r.set — so this controller no longer self-applies a live parameter directly. The
+        # written value is byte-identical to the old direct write (the clamp already held upstream); the
+        # kernel re-asserts the hard bounds and keeps an audit trail. Never raises; falls back if absent.
+        from signals.scibrain import producers
+        producers.apply_controller(r, "bayes_threshold",
+                                   redis_key=redis_keys.BAYES_THRESHOLD_T_HIGH,
+                                   value=final_t_high, bounds=(_T_HIGH_MIN, _T_HIGH_MAX),
+                                   reason="bayes posterior lower-bound + util-calib blend")
+        producers.apply_controller(r, "bayes_threshold",
+                                   redis_key=redis_keys.BAYES_THRESHOLD_T_LOW,
+                                   value=final_t_low, bounds=(_T_LOW_FLOOR, final_t_high - _T_LOW_MIN_GAP),
+                                   reason="T_high minus configured gap")
         r.set(redis_keys.BAYES_THRESHOLD_REFRESH_TS, now_ts)
     except Exception as exc:
         log.warning("bayes_threshold_write_failed", error=str(exc)[:120])
+        # last-resort fallback so the controller never freezes if the bus is unavailable
+        try:
+            r = redis_client.get()
+            r.set(redis_keys.BAYES_THRESHOLD_T_HIGH, round(final_t_high, 2))
+            r.set(redis_keys.BAYES_THRESHOLD_T_LOW,  round(final_t_low, 2))
+            r.set(redis_keys.BAYES_THRESHOLD_REFRESH_TS, now_ts)
+        except Exception:
+            pass
 
     report = {
         "enabled": True,
@@ -278,7 +298,24 @@ def get_adaptive_min_strength() -> Optional[float]:
             return None
         if int(time.time()) - int(ts) > _REFRESH_STALE_S:
             return None
-        return max(_T_HIGH_MIN, min(_T_HIGH_MAX, float(t)))
+        # cont. 74 — DEADLOCK BREAKER. The Bayesian refresh can ratchet t_high
+        # (+util-calib blend) ABOVE what the current regime can produce, e.g.
+        # t_high=50 while turbulent-regime signals max ~42 post-MPP → zero trades
+        # → no new win/loss data → threshold stays pinned → self-starving freeze
+        # (observed 2026-06-07, ~4.5h drought). A Redis-tunable consumer-side CAP
+        # (bayes:t_high_cap, fallback _T_HIGH_MAX) clamps the EFFECTIVE accept
+        # threshold without fighting the 5-min refresh: the refresh may still
+        # compute 50, but the engine never sees a gate above the cap, so the
+        # strongest current signals trade and feed the buckets back to health.
+        # Reversible + tunable live: redis-cli set bayes:t_high_cap 60 (or DEL).
+        cap = _T_HIGH_MAX
+        try:
+            _cap_raw = r.get("bayes:t_high_cap")
+            if _cap_raw is not None:
+                cap = max(_T_HIGH_MIN, min(_T_HIGH_MAX, float(_cap_raw)))
+        except (TypeError, ValueError):
+            pass
+        return max(_T_HIGH_MIN, min(cap, float(t)))
     except Exception:
         return None
 

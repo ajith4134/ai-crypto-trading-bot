@@ -106,6 +106,13 @@ def train_hmm(symbols: list[str]) -> None:
                 continue
             closes = [float(row["close"]) for row in csv.DictReader(open(csv_file))]
             returns = [(closes[i] - closes[i-1]) / closes[i-1] for i in range(1, len(closes))]
+            # cont. 75 — drop glitch returns (|r| > 50%/day) BEFORE fitting. An unfiltered
+            # bad daily close produced a degenerate HMM component (mean ~3.93 = +393%/day)
+            # that ml/hmm.py._calibrate then rejected (|mean|>0.5), disabling the HMM
+            # entirely. Filtering at the same 0.5 threshold the serving path uses keeps the
+            # model healthy. Real crypto daily moves (±30%) are preserved.
+            returns = [x for x in returns
+                       if x == x and abs(x) <= 0.5 and x != float("inf") and x != float("-inf")]
             all_returns.extend(returns)
 
         if len(all_returns) < 100:

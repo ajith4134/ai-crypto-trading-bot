@@ -2062,6 +2062,28 @@ async def monitor_trailing_sl(engine) -> None:
                 _t_elapsed_ms = (_time_mod_loop.monotonic() - _t_start) * 1000
                 _per_trade_times.append((str(trade.get("id"))[:8], pair, _t_elapsed_ms))
             _loop_elapsed_s = _time_mod_loop.monotonic() - _loop_start
+            # cont. 79 — LIVE PRICE PUSH to the dashboard. CH_PRICE_UPDATE was
+            # wired end-to-end (dashboard WS bridge subscribes + OpenTradesTable
+            # refreshes on it) but NOTHING published it, so the open-trades table
+            # only ever refreshed on its 5s fallback poll → displayed price/PnL
+            # lagged Binance by up to 5s. This loop already holds fresh ~1s mark
+            # prices for every open trade, so publish them here every tick (~1.5s).
+            try:
+                if trades:
+                    _pub_pipe = r.pipeline()
+                    for _t in trades:
+                        _pub_pipe.get(redis_keys.MARK_PRICE.replace("{pair}", _t["pair"]))
+                    _pub_marks = _pub_pipe.execute()
+                    _marks_map = {
+                        _t["pair"]: float(_m)
+                        for _t, _m in zip(trades, _pub_marks) if _m
+                    }
+                    if _marks_map:
+                        r.publish(redis_keys.CH_PRICE_UPDATE,
+                                  json.dumps({"marks": _marks_map}))
+            except Exception as _pub_exc:
+                log.warning("price_update_publish_failed",
+                            error=str(_pub_exc)[:120])
             try:
                 _slow_top = sorted(_per_trade_times, key=lambda x: -x[2])[:5]
                 log.info("sl_monitor_loop_timing",

@@ -86,6 +86,19 @@ FEATURE_COLUMNS: tuple[str, ...] = (
     "cvd_z",
     "ofi_l1",
     "ofi_accel",
+    # Priority 2 (cont. 74) — OI velocity + Long/Short crowding + Taker aggressor.
+    # data/oi_ls_taker.py writes these live from the free production /futures/data
+    # Binance endpoints (audit Gate 3 = oi_price_div, Gate 4 = ls_crowd_z). Like
+    # cvd_z/ofi_l1 above, these have NO historical reconstruction (not in the kline
+    # corpus) → 0-filled in the offline training vector; the ONLINE river learner
+    # gets them live via the live_features snapshot (train==serve preserved).
+    # Appending here widens FEATURE_COLUMNS: the XGB predict path stays dormant
+    # until its next retrain (xgb_predictor.predict feature_count guard), and the
+    # online predictor self-resets to the new width (_ensure_bundle) — both safe.
+    "oi_change_z",
+    "oi_price_div",
+    "ls_crowd_z",
+    "taker_ratio_z",
 )
 
 
@@ -172,6 +185,13 @@ def live_features(pair: str,
     f["ofi_l1"]                  = _f(f"{pair}:micro:ofi_l1")
     f["ofi_accel"]               = _f(f"{pair}:micro:ofi_accel")
     f["cvd_z"]                   = _cvd_z(pair)
+    # Priority 2 (cont. 74) — OI velocity / LS crowding / taker aggressor (live-only).
+    # Inline key literals (matching data/oi_ls_taker.py) — same pattern as the
+    # micro keys above — so features.py needs no redis_keys mount in every consumer.
+    f["oi_change_z"]             = _f(f"{pair}:oi_change_z")
+    f["oi_price_div"]            = _f(f"{pair}:oi_price_div")
+    f["ls_crowd_z"]              = _f(f"{pair}:ls_crowd_z")
+    f["taker_ratio_z"]           = _f(f"{pair}:taker_ratio_z")
     f["vol_unit"]                = atr_norm if atr_norm > 0 else 0.01
     f["atr_norm"]                = atr_norm
     f["sentiment"]               = _f(redis_keys.SENTIMENT_PAIR.replace(

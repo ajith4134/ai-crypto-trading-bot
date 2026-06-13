@@ -946,7 +946,10 @@ async def run_scan(exchange_client) -> list[str]:
     if r.get("scanner:stage_halving") == "1" and brain_stage > 2:
         max_pairs = max(60, config.trading.max_active_pairs // 2)
     else:
-        max_pairs = config.trading.max_active_pairs
+        # Redis override: `scanner:max_active_pairs` lets operator raise beyond
+        # the image-baked config.yaml ceiling without a rebuild.
+        _r_max = r.get("scanner:max_active_pairs")
+        max_pairs = int(_r_max) if _r_max else config.trading.max_active_pairs
 
     # F51c (cont. 51) — two-pass scoring with ADX trend filter.
     # Pass 1: compute composite WITHOUT ADX → identifies the top liquidity/

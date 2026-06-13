@@ -7,7 +7,7 @@ import OpenTradesTable from './panels/OpenTradesTable';
 import ClosedTradesTable from './panels/ClosedTradesTable';
 import SignalMonitor from './panels/SignalMonitor';
 import PairScanner from './panels/PairScanner';
-import LaunchPad from './panels/LaunchPad';
+import ScientistBrain from './panels/ScientistBrain';
 import StrategyPanel from './panels/StrategyPanel';
 import DirectionPanel from './panels/DirectionPanel';
 import DirectionWinRate from './panels/DirectionWinRate';
@@ -97,7 +97,7 @@ const App: React.FC = () => {
           <div style={{gridColumn:'1 / -1'}}><OpenTradesTable /></div>
           <SignalMonitor />
           <PairScanner />
-          <LaunchPad />
+          <div style={{gridColumn:'1 / -1'}}><ScientistBrain /></div>
           <StrategyPanel />
           <AIIntelligencePanel />
           <DirectionPanel />

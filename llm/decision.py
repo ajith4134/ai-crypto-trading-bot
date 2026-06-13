@@ -33,6 +33,7 @@ Cost / rate guard:
 """
 import asyncio
 import json
+import time
 import aiohttp
 import structlog
 
@@ -68,7 +69,7 @@ async def _call_ollama(prompt: str, timeout: int) -> dict:
             return json.loads(data["response"])
 
 
-def _mark_evidence(provider: str) -> None:
+def _mark_evidence(provider: str, elapsed_s: float | None = None) -> None:
     """Durable evidence keys so feature_health and dashboards can see which
     provider is currently serving real-time decision LLM calls."""
     try:
@@ -79,6 +80,16 @@ def _mark_evidence(provider: str) -> None:
         r.incr(f"llm:decision_calls_by_provider:{provider}")
         r.set("llm:decision_last_provider", provider)
         r.set("llm:decision_last_ts", str(int(_t.time())))
+        if provider == "ollama":
+            # dashboard/api.py checks llm:ollama:last_success_ts (written by
+            # ollama_client.py for research calls) to determine degraded status.
+            # Decision calls use a separate aiohttp path that never wrote this
+            # key, causing the dashboard to always show ollama as degraded even
+            # when 60+ successful decide() calls had been made.
+            r.incr("llm:ollama:success_count")
+            r.set("llm:ollama:last_success_ts", str(int(_t.time())))
+            if elapsed_s is not None:
+                r.set("llm:ollama:last_elapsed_s", str(elapsed_s))
     except Exception:
         pass
 
@@ -94,10 +105,11 @@ async def decide(prompt: str, timeout: int = 120) -> dict:
     # ── 1) Ollama, only if its circuit is healthy ────────────────────────────
     if not ollama_in_cooldown(_TASK_NAME):
         try:
+            _t0 = time.time()
             result = await _call_ollama(prompt, timeout)
             if isinstance(result, dict):
                 reset_ollama_health(_TASK_NAME)
-                _mark_evidence("ollama")
+                _mark_evidence("ollama", elapsed_s=round(time.time() - _t0, 1))
                 return result
             # Mistral returned non-dict (e.g., a list) — treat as a parse
             # failure and fall through to cloud.

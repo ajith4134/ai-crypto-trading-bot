@@ -53,7 +53,7 @@ def compute_and_store(window_seconds: int = 3600) -> dict:
                       (SELECT COUNT(*) FROM trades
                          WHERE exit_reason = 'trailing_sl'
                            AND net_pnl_usdt > 0
-                           AND closed_at > NOW() - (%s || ' seconds')::interval) AS hits,
+                           AND exit_time > NOW() - (%s || ' seconds')::interval) AS hits,
                       (SELECT COUNT(*) FROM counterfactuals
                          WHERE miss_decoded = TRUE
                            AND created_at > NOW() - (%s || ' seconds')::interval) AS misses,

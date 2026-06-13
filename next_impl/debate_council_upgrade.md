@@ -107,3 +107,57 @@ Live incident RESOLVED (predict-all gate disarmed, 9 trades open). Ollama config
 APPLIED + verified (but phi3 still ~3.4 tok/s → cloud-first is mandatory for the debate).
 Next: implement items above. Gate must stay `prediction:gate_auto_arm=0` until predictor
 retrained (see memory feedback_predict_gate_disabled).
+
+---
+
+## CONT. 72 — "NEVER CONTRIBUTED" ROOT CAUSE + REDESIGN (2026-06-07)
+
+User: "debate council never contributed — improve or replace." Investigated with
+GROUND TRUTH (Rule 13). Findings (all confirmed at source/DB/Redis):
+
+### The verdict is INVERTED (the real bug — measured, not theorised)
+`SELECT s.debate_verdict, avg(t.net_pnl_usdt), winrate JOIN trades` over closed trades:
+  - full_allocation (FULL size):   3469 trades, **-$0.500 avg, 46.9% WR**  ← LOSES
+  - reduced_allocation (70% size): 1174 trades, **+$0.093 avg, 54.6% WR**  ← WINS
+  - exploratory (5% size):          530 trades, +$0.024 avg, 39.2% WR
+Win-rate gap (46.9 vs 54.6) is size-INDEPENDENT (Rule 9 disconfirm passed) → the scorer
+genuinely allocates the MOST size to the WORST trades. ~$1,734 of harm across the
+full-size cohort. Cause: `deterministic_verdict` anchored `base = signal_strength` then
+ADDED regime/candlenet/ofi bonuses — but Cont.71 ALREADY baked those exact features into
+signal_strength. So `full` just meant "high signal_strength", and high-confluence trades
+are the crowded losers (matches audit_findings bull+long / bear+short crowding).
+
+### Both learning loops were DEAD
+  - `run_debate()` (LLM council, 746 lines) — NEVER called anywhere (orphaned since the
+    cont.69 redesign). phi3 ~4 tok/s + cloud quota → user already retired it. Leave as
+    documented-orphan; do not revive.
+  - `debate:prior:*` (the cache `_learned_prior_delta` reads) — EMPTY. The async debate
+    that was meant to populate it (engine.py:2612 TODO) was never implemented → the
+    fallback's learned-prior term was always 0.
+  - `debate:agent_weight:*` — EMPTY. `update_beliefs_on_close` IS wired (write.py:625) but
+    `debate_arguments` has had NO new rows since 2026-06-02 (deterministic path sets
+    llm_available=False → save_debate_arguments returns 0). Starved.
+
+### Data constraints (Rule 2, measured)
+  - `pattern_cluster_id` NULL on ALL 11,323 trades AND 0/2000 recent signals → cluster-keyed
+    prior is impossible. Key the prior on **regime:direction** (always present).
+  - Live feature population (latest 2000 signals): funding_rate 99%, vol_unit ~0.03 avg,
+    xsmom_rank 19% non-trivial, liq_cascade_prob/exchange_netflow_z = 0-fill (DEAD).
+  - Realized edge by regime:dir (the base rate the loop will learn): turbulent:short +1.08,
+    bull:long +0.59, bear:long +0.13, turbulent:long -0.13, **bear:short -0.84** (54% WR but
+    huge avg loss → prior must track avg-PnL MAGNITUDE, not win/loss sign), unknown:long -3.11.
+
+### THE FIX (replace the scorer's logic; close the loop with REALIZED outcomes, no LLM)
+1. **debate/fallback.py** — base=50 (neutral), NOT signal_strength. Score becomes a pure
+   ORTHOGONAL risk/crowding/outcome overlay using ONLY factors NOT already in
+   signal_strength: realized regime:dir prior (±15, PRIMARY), funding crowding (±8),
+   volatility regime (vol_unit), xsmom tailwind, global loss-streak, guarded cascade/vpin.
+   Default (all-neutral) → reduced_allocation (the MEASURED winner). full_allocation now
+   REQUIRES a positive realized prior; skip_risk requires strong negative confluence.
+2. **debate/learning.py (NEW)** — `update_outcome_prior(regime, dir, net_pnl, capital)`:
+   EWMA(α=0.05) of clip(net_pnl/capital,-1,1) → `debate:prior:regime:{regime}:{dir}`;
+   pushes win/loss to `debate:recent_outcomes` (LTRIM 20) for the loss-streak factor.
+   Counters `debate:prior_updates_count` + `debate:prior_last_ts` (Rule 12).
+3. **memory/write.py** — call update_outcome_prior at trade close (own flag, default on).
+Deploy: `./debate` + `./memory` bind-mounted → `docker-compose restart brain` (no rebuild).
+Measurable: re-run the verdict×PnL JOIN after 50+ closes — the inversion must flatten.

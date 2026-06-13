@@ -126,7 +126,17 @@ def run_ga(
         # Persist best params + fitness for transparency
         try:
             r = redis_client.get()
-            r.set(_GA_PARAMS_KEY, json.dumps(best_params))
+            # Phase-7c §11 no-bypass: route the live ga:best_params write THROUGH the unified producer-bus
+            # kernel. producers.apply_params re-asserts the per-param bounds + records a per-param old→new
+            # diff to the audit ledger, instead of a direct self-apply. best_params is already clamped to
+            # `bounds` above, so the written value is byte-identical. Falls back to a direct set if absent.
+            try:
+                from signals.scibrain import producers as _producers
+                _producers.apply_params(r, "ga_params", redis_key=_GA_PARAMS_KEY,
+                                        params=best_params, bounds=bounds,
+                                        reason="DEAP GA evolved best (Sharpe / Pareto front)")
+            except Exception:
+                r.set(_GA_PARAMS_KEY, json.dumps(best_params))
             entry = {
                 "params": best_params,
                 "fitness": list(best.fitness.values),

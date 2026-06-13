@@ -10,8 +10,8 @@ trading:
 capital:
   per_trade_min_pct: 5           # minimum capital per trade as % of account
   per_trade_max_pct: 30          # maximum capital per trade as % of account
-  leverage_min: 20               # cont. 62e (2026-05-29, owner mandate): default leverage = 20x.
-  leverage_max: 20               # hard cap — never exceeded under any condition
+  leverage_min: 3                # Phase 0 locked via Redis (was 20x, reduced after risk audit)
+  leverage_max: 5                # hard cap — Redis key risk:leverage overrides at runtime
   dca_trigger_1_pct: -20         # first DCA at -20% from original entry (long) / +20% (short)
   dca_trigger_2_pct: -40         # second DCA at -40% from original entry (long) / +40% (short)
   dca_rounds_max: 0              # DISABLED 2026-05-24: 123 DCA trades = 1.6% win, -$2364; 2135 no-DCA = 49.8% win, +$4317
@@ -42,7 +42,7 @@ risk:
   dead_trade_force_close_max_s: 21600  # 6 h hard ceiling if loss never reverts
 
 brain:
-  evolution_stage: 1
+  evolution_stage: 4             # updated 2026-06-06: bot reached Stage 4 at 10,641 trades
   stage_1_to_2_trades: 100       # Stage 1→2: 100 closed paper trades (no performance requirement)
   stage_2_to_3_trades: 500       # Stage 2→3: 500 closed paper trades + win rate ≥ 45%
   stage_2_to_3_winrate: 45

@@ -190,6 +190,8 @@ async def bot_status():
     return {
         "stage": int(r.get(redis_keys.BRAIN_STAGE) or 1),
         "mode": r.get("bot:mode") or "paper",
+        "actual_trading_mode": r.get("bot:actual_trading_mode"),
+        "actual_engine": r.get("bot:actual_engine"),
         "running": r.get("bot:running") == "1",
         "paper_closed": int(r.get("brain:paper_closed") or 0),
         "settings_configured": configured,
@@ -451,6 +453,8 @@ async def mode_switch(req: ModeSwitchRequest):
     import redis_client
     import json as _j
     r = redis_client.get()
+    previous_mode = r.get("bot:mode") or "paper"
+    previous_running = r.get("bot:running") or "0"
     target = req.target.lower()
     if target not in ("live", "paper"):
         raise HTTPException(status_code=400,
@@ -485,18 +489,38 @@ async def mode_switch(req: ModeSwitchRequest):
             raise HTTPException(
                 status_code=400,
                 detail="max_position_usdt cannot exceed starting_capital_usdt")
+        # Read-only mainnet readiness check. A live switch is not complete if
+        # this VPS cannot reach/authenticate Binance Futures.
+        try:
+            from exchange.client import BinanceClient
+            BinanceClient().get_account_balance()
+        except Exception as exc:
+            r.set("bot:running", "0")
+            raise HTTPException(
+                status_code=503,
+                detail=(
+                    "Live switch blocked: Binance Futures mainnet readiness "
+                    f"check failed: {str(exc)[:240]}"))
 
     # Step 1 — stop bot
     r.set("bot:running", "0")
 
-    # Step 2 — close open trades via current engine
+    # Step 2 — close open trades via the ACTUAL current engine. The dashboard
+    # container is not recreated on every mode change, so its process env can be
+    # stale and execution.factory.get_engine() is not authoritative here.
     from memory.query import get_open_trades
-    from execution.factory import get_engine
     closed_ids: list[str] = []
     errors: list[dict] = []
     if req.close_open_trades:
         try:
-            engine = get_engine()
+            actual_mode = r.get("bot:actual_trading_mode") or "paper"
+            if actual_mode == "live":
+                from exchange.client import BinanceClient
+                from execution.live import LiveExecutionEngine
+                engine = LiveExecutionEngine(BinanceClient())
+            else:
+                from execution.paper import PaperExecutionEngine
+                engine = PaperExecutionEngine()
             for trade in get_open_trades():
                 tid = trade.get("id")
                 try:
@@ -507,6 +531,14 @@ async def mode_switch(req: ModeSwitchRequest):
                                    "error": str(exc)[:200]})
         except Exception as exc:
             errors.append({"error": f"engine_unavailable: {str(exc)[:200]}"})
+        if errors:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "message": "Mode switch aborted because open trades did not all close",
+                    "closed_trades": len(closed_ids),
+                    "failed_closes": errors,
+                })
 
     # Step 3 — write the desired settings (correct Redis keys)
     import redis_keys as _rk
@@ -525,10 +557,12 @@ async def mode_switch(req: ModeSwitchRequest):
     payload = {
         "target":            target,
         "trading_mode":      "live" if target == "live" else "paper",
-        "binance_testnet":   "false" if target == "live" else "true",
+        "binance_testnet":   "false",   # always false — mainnet keys used for price feeds in both modes
         "requested_at":      int(time.time()) if False else None,  # set below
         "starting_capital":  req.starting_capital_usdt,
         "max_position":      req.max_position_usdt,
+        "previous_mode":     previous_mode,
+        "previous_running":  previous_running,
     }
     import time as _t
     payload["requested_at"] = int(_t.time())
@@ -712,9 +746,79 @@ async def get_open_trades():
                     strategy_name_map = {str(sid): name for sid, name in _cur.fetchall()}
         except Exception:
             strategy_name_map = {}
+
+    def _historical_manifest(prov: dict, trade: dict) -> dict | None:
+        """Best-effort visibility for pre-schema opens, without inventing missing effects."""
+        attribution = prov.get("attribution")
+        if isinstance(attribution, list) and attribution:
+            influences = [{
+                "source": a.get("module", "unknown"),
+                "authority": "live", "status": "applied", "role": "direction",
+                "raw_vote": a.get("vote"), "actual_effect": a.get("share"),
+                "effect_kind": "signed_fusion_share",
+                "aligned": bool(a.get("aligned", False)),
+            } for a in attribution if isinstance(a, dict)]
+            return {
+                "schema_version": 1, "origin": prov.get("origin", "scibrain"),
+                "provenance_quality": "partial_historical_snapshot",
+                "limitations": ["suppressed, abstained, gate, and raw module details were not captured"],
+                "decision": {
+                    "direction": trade.get("direction"), "conviction": prov.get("conviction"),
+                    "regime": prov.get("regime"), "primary_driver": prov.get("primary_driver"),
+                },
+                "summary": {"applied": len(influences), "gate_applied": 0, "suppressed": 0,
+                            "abstained": 0, "advised": 0, "counterfactual_only": 0},
+                "influences": influences,
+            }
+        score_names = ("ofi", "regime", "tft", "candlenet", "patchtst", "vpin", "sent")
+        present = [(name, prov.get(f"{name}_score")) for name in score_names
+                   if prov.get(f"{name}_score") is not None]
+        if present:
+            influences = [{
+                "source": name, "authority": "live", "status": "applied",
+                "role": "component_score", "score": score,
+                "actual_effect": None, "effect_kind": "exact_weight_not_captured",
+            } for name, score in present]
+            return {
+                "schema_version": 1, "origin": "legacy_engine",
+                "provenance_quality": "partial_historical_snapshot",
+                "limitations": ["component scores were captured; exact applied weights were not"],
+                "decision": {"direction": trade.get("direction"),
+                             "conviction": prov.get("direction_conf"),
+                             "composite": prov.get("composite"),
+                             "regime": trade.get("market_regime")},
+                "summary": {"applied": len(influences), "gate_applied": 0, "suppressed": 0,
+                            "abstained": 0, "advised": 0, "counterfactual_only": 0},
+                "influences": influences,
+            }
+        return None
+
     enriched = []
     for t in trades:
+        # Normalize the immutable-at-open provenance once. Keep the original nested
+        # record and expose its high-value fields directly for dashboard consumers.
+        _prov_raw = t.get("signals_at_entry")
+        try:
+            _prov = (_prov_raw if isinstance(_prov_raw, dict)
+                     else json.loads(_prov_raw)) if _prov_raw else {}
+        except Exception:
+            _prov = {}
+        t["signals_at_entry"] = _prov
+        t["influence_manifest"] = (_prov.get("influence_manifest")
+                                   or _historical_manifest(_prov, t))
+        t["trade_audit"] = _prov.get("audit")
+        t["trade_recommendation"] = _prov.get("recommendation")
+        t["post_open_influences"] = _prov.get("post_open_influences", [])
+        # Phase-7f task-8: bounded cerebellar calibration adjustment frozen at open
+        # (base→adjusted conviction, delta, applied?). Lets the open-trades table show the
+        # canary's per-trade effect (Rule 21). Absent for trades opened before this shipped.
+        t["cerebellum"] = _prov.get("cerebellum")
         t["strategy_name"] = strategy_name_map.get(str(t.get("strategy_id") or ""), "—")
+        # SciBrain trades aren't picked by a legacy strategy — label them with their OWN
+        # identity (the responsible module driver) from the provenance stamped at open.
+        if t.get("timeframe") == "scibrain":
+            _driver = _prov.get("primary_driver")
+            t["strategy_name"] = f"🧠 scibrain·{_driver}" if _driver else "🧠 scibrain"
         pair = t.get("pair", "")
         mark = float(r.get(redis_keys.MARK_PRICE.replace("{pair}", pair)) or t.get("entry_price") or 0)
         entry = float(t.get("average_entry") or t.get("entry_price") or 0)
@@ -884,15 +988,32 @@ async def get_closed_trades(pair: Optional[str] = None, limit: int = 100,
     return {"trades": trades, "summary": summary}
 
 
+def _scan_exists(r, pattern: str, cap: int = 5000) -> bool:
+    """Non-blocking existence check via cursor SCAN instead of KEYS.
+
+    `KEYS <pat>` is O(N) over the ENTIRE keyspace and BLOCKS single-threaded Redis for the
+    whole scan; on this db0 (~135k keys) each call cost ~40ms and stalled every other client —
+    including the dashboard's own polls (the observed "dashboard stuck/slow"). SCAN returns in
+    bounded chunks (never blocks); we stop at the first match, or give up after ~`cap` keys."""
+    cursor, scanned = 0, 0
+    while True:
+        cursor, batch = r.scan(cursor=cursor, match=pattern, count=500)
+        if batch:
+            return True
+        scanned += 500
+        if cursor == 0 or scanned >= cap:
+            return False
+
+
 @app.get("/brain/status", dependencies=[Depends(_verify_token)])
 async def brain_status():
     import redis_client, redis_keys, json
     r = redis_client.get()
-    # Compute overall directional accuracy across all pairs
-    acc_keys = r.keys("brain:directional_accuracy:*")
+    # Compute overall directional accuracy across all pairs.
+    # SCAN (non-blocking) + a single MGET — never KEYS (which blocked Redis ~40ms per call).
+    acc_keys = list(r.scan_iter(match="brain:directional_accuracy:*", count=5000))
     total_dir, correct_dir = 0, 0
-    for k in acc_keys:
-        raw = r.get(k)
+    for raw in (r.mget(acc_keys) if acc_keys else []):
         if raw:
             d = json.loads(raw)
             total_dir += d.get("total", 0)
@@ -1165,7 +1286,7 @@ async def launchpad():
                        table_entry_price, last_mark, shadow_pnl_pct,
                        peak_profit_pct, peak_loss_pct, mv_candlenet,
                        mv_predicted, mv_realized, flips_count, regime,
-                       ttl_expires_at
+                       ttl_expires_at, source, replay_reason, replay_strength
                 FROM launch_pad ORDER BY slot
             """)
             cols = [d[0] for d in cur.description]
@@ -1176,6 +1297,9 @@ async def launchpad():
         sym = s.get("symbol")
         if sym:
             s.update(_trailing_move(r, sym))
+            s["deciding"] = bool(r.exists(f"launchpad:deciding:{sym}"))
+        else:
+            s["deciding"] = False
     return {
         "enabled": r.get(redis_keys.LAUNCHPAD_ENABLED) == "1",
         "depth": int(r.get(redis_keys.LAUNCHPAD_DEPTH) or 10),
@@ -1183,6 +1307,705 @@ async def launchpad():
         "regime": r.get(redis_keys.CURRENT_REGIME) or "unknown",
         "slots": slots,
     }
+
+
+@app.get("/scibrain", dependencies=[Depends(_verify_token)])
+async def scibrain():
+    """Scientist-Brain Launchpad — the live view of the modular PhD math/physics/quantum
+    circuit (signals/scibrain). Reads the scibrain:* hot-mirror written by the runner:
+    a heartbeat, the most-recent per-symbol decisions (each with its module evidence +
+    COMPUTED responsibility attribution), and the dual-brain Ollama interrogator transcript
+    (why this direction + wrong-direction risk). Read-only; trade-origination authority is
+    controlled by scibrain:enabled."""
+    import json
+    import redis_client
+    r = redis_client.get()
+
+    def _jget(key, default=None):
+        try:
+            raw = r.get(key)
+            return json.loads(raw) if raw else default
+        except Exception:
+            return default
+
+    def _int(key):
+        try:
+            return int(r.get(key) or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    def _prefilter_agg():
+        try:
+            h = r.hgetall("scibrain:prefilter:agg") or {}
+            if not h:
+                return {}
+            pt = int(h.get("picks_total", 0) or 0)
+            pc = int(h.get("picks_captured", 0) or 0)
+            out = {
+                "pick_cycles": int(h.get("pick_cycles", 0) or 0),
+                "picks_total": pt,
+                "picks_captured": pc,
+                "starve_cycles": int(h.get("starve_cycles", 0) or 0),
+                "pick_coverage": round(pc / pt, 4) if pt else None,
+            }
+            if h.get("last_missed"):
+                try:
+                    out["last_missed"] = json.loads(h["last_missed"])
+                    out["last_missed_ts"] = float(h.get("last_missed_ts", 0) or 0)
+                except Exception:
+                    pass
+            return out
+        except Exception:
+            return {}
+
+    try:
+        syms = list(r.zrevrange("scibrain:last_decisions", 0, 29) or [])
+    except Exception:
+        syms = []
+    decisions = []
+    for sym in syms:
+        dec = _jget(f"scibrain:{sym}:decision")
+        if not dec:
+            continue
+        reasoning = _jget(f"scibrain:{sym}:reasoning")
+        if reasoning:
+            dec["reasoning"] = reasoning
+        decisions.append(dec)
+
+    # crash radar — StatPhysSOC self-organized-criticality early-warning (top elevated pairs)
+    crash_radar = _scibrain_crash_radar(r, _jget, limit=12)
+
+    # Phase 4 — Ex-ante Decision-Risk Audit: every OPENED trade the Scientist interrogated at
+    # open (BEFORE any outcome), its direction-risk forecast, the wrong-direction flag, and (when
+    # flagged) the agent's proposed remediation/improvement. Not a post-OUTCOME verdict.
+    audits = _scibrain_audits(r, _jget, limit=30)
+
+    def _zlen(key):
+        try:
+            return int(r.zcard(key) or 0)
+        except Exception:
+            return 0
+
+    return {
+        "enabled": r.get("scibrain:enabled") == "1",
+        "interrogate": r.get("scibrain:interrogate") == "1",
+        "autoact": r.get("scibrain:audit_autoact") == "1",
+        "status": _jget("scibrain:status", {}),
+        "prewarm": _jget("scibrain:prewarm_status", {}),
+        "counters": {
+            "cycles": _int("scibrain:cycles"),
+            "scored": _int("scibrain:scored_total"),
+            "interrogated": _int("scibrain:interrogated_total"),
+            "wrong_dir_flags": _int("scibrain:wrong_dir_flag_total"),
+            "audited": _int("scibrain:audited_total"),
+            "flagged_trades": _zlen("scibrain:wrong_direction_trades"),
+            "audit_queue": (lambda: (r.llen("scibrain:audit_queue") or 0))(),
+            "dir_capped": _int("scibrain:dir_capped_total"),
+            "cluster_capped": _int("scibrain:cluster_capped_total"),
+        },
+        "crash_radar": crash_radar,
+        "decisions": decisions,
+        "audits": audits,
+        "audits_meta": {
+            "audit_kind": "ex_ante_decision_risk",
+            "evaluated_at": "post_open_pre_outcome",
+            "label": "Ex-ante Decision-Risk Audit",
+            "note": ("Judged at OPEN, before any realized outcome — a forecast of how likely the "
+                     "direction is wrong, not a post-result verdict. Outcome calibration is graded "
+                     "separately at close."),
+        },
+        # Phase 7a — how well-calibrated that ex-ante forecaster actually is, graded at close
+        # (Brier, base rate, Brier-skill vs base-rate guess, reliability bins). y_wrong is the
+        # path-aware twin fault_class where the replay is confident, else the failure_type proxy
+        # (see calibration.label_sources for the per-row basis breakdown).
+        "calibration": _jget("scibrain:calibration", {}),
+        # Phase 7a — the outcome-truth ledger aggregate: realized multi-objective utility, ROC,
+        # MFE/MAE, and the decision's forward direction-correctness at standardized horizons
+        # (15/60/240m after entry, independent of our actual exit). Built per closed trade onto the
+        # immutable row; this is the recomputed aggregate. win_rate here is descriptive only.
+        "outcomes": _jget("scibrain:outcomes", {}),
+        # Phase 7a — module-state embeddings + matched-cohort retrieval aggregate: the module roster,
+        # how many decisions are embedded, and a leave-one-out retrieval-quality metric (does a
+        # decision's same-regime cohort, found by module-vote cosine + context — NOT prose — predict
+        # its realized-utility sign?). Recomputed from the immutable per-row embeddings.
+        "cohort": _jget("scibrain:cohort", {}),
+        # Phase 7b — the single experiment registry: bounded typed ChangeSpec hypotheses (deduped by
+        # content fingerprint), counts per validated lifecycle status, and the most-recent few. Tier-0:
+        # records/tracks proposals; it has NO authority to apply any change (that's the Phase-7c gate).
+        "experiments": _jget("scibrain:experiments", {}),
+        # Phase 7b — generalized hypothesis memory: knob+direction changes that were rejected/demoted/
+        # rolled-back (negative, the council refuses to repeat them) vs retained (positive laws).
+        "memory": _jget("scibrain:memory", {}),
+        # Phase 2b — Universe Core: the read-only cross-market UniverseFrame digest, built once per
+        # funnel cycle (breadth, crowding/mean_abs_corr, PC1 market-factor share, lead-lag). The full
+        # matrices stay in-RAM for the in-process cross-market modules; this is the live-visible mirror.
+        "universe": _jget("scibrain:universe:state", {}),
+        # Phase 2b — Universe-Core MODULES that score the frame once/cycle (SparseFactorResidual…).
+        # They ship shadow_only (recorded + IC-evaluable, NEVER applied to a live pick) until they
+        # prove incremental IC. This block shows which ran + over how many symbols.
+        "universe_modules": _jget("scibrain:universe:modules", {}),
+        # Phase 2b Tier-B — InformationGeometryHealth: bank-level recalibration monitor. Per-module
+        # model-manifold DRIFT (Fisher-Rao on the Gaussian manifold), IC-transferability (exp(-drift)),
+        # and nonlinear REDUNDANCY (normalized HSIC/CKA) between modules' output distributions. Tier-0:
+        # report only (feeds the upcoming evidence-family penalty + prune/demote); no trading authority.
+        "infogeo": _jget("scibrain:infogeo:health", {}),
+        # Module ablation/prune/demote — ADVISORY per-module verdict (KEEP/WATCH/DEMOTE/PRUNE/
+        # INSUFFICIENT) from incremental IC + redundancy + drift. Never auto-acts (§6g, Rule 14).
+        "ablation": _jget("scibrain:ablation:report", {}),
+        # Top-K prefilter (Phase 5, compute-bound scan): mode + coverage of qualifying candidates.
+        "prefilter": _jget("scibrain:prefilter:status", {}),
+        # PICK-level rolling evidence (the capital-relevant on-flip gate, Rule 14): fraction of TRUE
+        # full-universe picks the top-K∪rotation would have kept, + cycles that starved a real pick.
+        "prefilter_agg": _prefilter_agg(),
+    }
+
+
+@app.get("/scibrain/autopsy", dependencies=[Depends(_verify_token)])
+async def scibrain_autopsy(limit: int = 12):
+    """VS-V3 Trade Autopsy Theatre data — per CLOSED scibrain trade, the full per-trade truth read from
+    the immutable `signals_at_entry` JSONB (no re-derivation):
+      • decision_snapshot — the entry-time brain decision (SAME shape as a live decision, so the frontend
+        replays the entry circuit with the existing atlas adapter): WHY the trade was opened.
+      • lifetrace — the bounded recorded events (entry/DCA/TP/SL/brain-interventions/MFE-MAE/exit).
+      • outcome_packet — realized multi-objective utility, ROC, drawdown, forward direction-horizons.
+      • counterfactual (twin) — actual vs OPPOSITE vs ABSTAIN policy replayed on the real forward path,
+        with a confidence-labelled FAULT CLASS (none/direction/selection).
+      • audit — the at-open Ollama verdict (agrees? wrong-direction risk? narrative).
+      • remediation — the agent's proposed circuit change after the trade (the per-trade ChangeSpec analog).
+    On-demand (NOT in the 3s poll); bounded to the most-recent `limit` trades."""
+    import json as _json
+    from db import db_conn
+    from signals.scibrain.viz_contracts import (build_brain_graph_snapshot, wrap_trade_replay,
+                                                 SCHEMA_VERSIONS)
+    lim = max(1, min(30, int(limit)))
+
+    def _ff(v):
+        try:
+            return None if v is None else float(v)
+        except (TypeError, ValueError):
+            return None
+
+    def _iso(v):
+        return v.isoformat() if hasattr(v, "isoformat") else v
+
+    def _jb(v):
+        if isinstance(v, dict):
+            return v
+        if isinstance(v, str):
+            try:
+                return _json.loads(v)
+            except Exception:
+                return {}
+        return {}
+
+    cols = ["id", "pair", "direction", "entry_price", "exit_price", "entry_time", "exit_time",
+            "exit_reason", "hold_time_seconds", "capital_usdt", "net_pnl_usdt",
+            "intervention_count", "brain_influenced", "signals_at_entry"]
+    try:
+        with db_conn() as conn, conn.cursor() as cur:
+            cur.execute(f"""SELECT {', '.join(cols)}
+                              FROM trades
+                             WHERE timeframe='scibrain' AND status='closed'
+                               AND signals_at_entry::jsonb ? 'outcome_packet'
+                             ORDER BY exit_time DESC NULLS LAST
+                             LIMIT %s""", (lim,))
+            rows = [dict(zip(cols, rec)) for rec in cur.fetchall()]
+    except Exception as exc:
+        return {"available": False, "error": str(exc)[:200], "trades": []}
+
+    trades = []
+    for row in rows:
+        prov = _jb(row.get("signals_at_entry"))
+        op = prov.get("outcome_packet") or {}
+        cf = op.get("counterfactual") or {}
+        audit = prov.get("audit") or {}
+        rem = prov.get("remediation") or {}
+        decision = prov.get("decision_snapshot") or {}
+        trades.append(wrap_trade_replay({
+            "trade_id": str(row.get("id")),
+            # entry-snapshot id → the wrap resolves it to an immutable evidence pointer
+            "snapshot_id": (prov.get("entry_snapshot") or {}).get("snapshot_id"),
+            "pair": row.get("pair"),
+            "direction": row.get("direction"),
+            "entry_price": _ff(row.get("entry_price")),
+            "exit_price": _ff(row.get("exit_price")),
+            "entry_time": _iso(row.get("entry_time")),
+            "exit_time": _iso(row.get("exit_time")),
+            "exit_reason": row.get("exit_reason"),
+            "hold_time_s": row.get("hold_time_seconds"),
+            "capital_usdt": _ff(row.get("capital_usdt")),
+            "net_pnl_usdt": _ff(row.get("net_pnl_usdt")),
+            "intervention_count": row.get("intervention_count"),
+            "brain_influenced": row.get("brain_influenced"),
+            # realized outcome truth
+            "outcome": {
+                "utility": op.get("utility"),
+                "return_on_capital": op.get("return_on_capital"),
+                "net_pnl_usdt": op.get("net_pnl_usdt"),
+                "mfe_usdt": op.get("mfe_usdt"), "mae_usdt": op.get("mae_usdt"),
+                "drawdown_frac": op.get("drawdown_frac"),
+                "won": op.get("won"), "exit_reason": op.get("exit_reason"),
+                "failure_label": op.get("failure_label"),
+                "horizons": op.get("horizons"), "horizons_complete": op.get("horizons_complete"),
+            },
+            # path-aware counterfactual twin + fault class
+            "counterfactual": {
+                "status": cf.get("status"), "method": cf.get("method"),
+                "fault_class": cf.get("fault_class"), "fault_margin": cf.get("fault_margin"),
+                "confidence": cf.get("confidence"), "confidence_score": cf.get("confidence_score"),
+                "path_bars": cf.get("path_bars"), "tf": cf.get("tf"),
+                "actual": cf.get("actual"), "opposite": cf.get("opposite"), "abstain": cf.get("abstain"),
+            },
+            # at-open audit + the proposed circuit change (per-trade ChangeSpec analog)
+            "audit": {
+                "verdict_direction": audit.get("verdict_direction"),
+                "agrees_with_fusion": audit.get("agrees_with_fusion"),
+                "wrong_direction_risk": audit.get("wrong_direction_risk"),
+                "responsible_factor": audit.get("responsible_factor"),
+                "narrative": audit.get("narrative"),
+                "model": audit.get("model"), "provider": audit.get("provider"),
+            },
+            "remediation": {
+                "module_to_adjust": rem.get("module_to_adjust"),
+                "circuit_improvement": rem.get("circuit_improvement"),
+                "reason": rem.get("reason"), "model": rem.get("model"),
+            } if rem else None,
+            # the bounded recorded life trace + the entry-time decision (same shape as a live decision)
+            "lifetrace": prov.get("lifetrace") or {},
+            "decision": decision,
+            # BACKEND-built entry-circuit BrainGraphSnapshot (typed nodes/edges + evidence_ids) so the
+            # autopsy replays the entry circuit WITHOUT the frontend re-inferring it from prose (§8).
+            "entry_graph": build_brain_graph_snapshot(decision) if decision else None,
+        }))
+    return {"available": True, "n": len(trades), "contract": "TradeReplayFrame",
+            "schema_version": SCHEMA_VERSIONS["TradeReplayFrame"], "trades": trades}
+
+
+@app.get("/scibrain/learning", dependencies=[Depends(_verify_token)])
+async def scibrain_learning(limit: int = 50):
+    """VS-V4 Learning Laboratory data — the living-intelligence experiment system assembled from the
+    REAL registry + memory + competence + authority artifacts (no re-derivation):
+      • hypotheses — every bounded typed ChangeSpec, its validated-lifecycle status, its append-only
+        transition HISTORY (genealogy/version lineage), and the latest matched-cohort EVALUATION
+        (champion[current base] vs challenger[candidate] scorecard with its bootstrap lower bound).
+      • lifecycle — the canonical promotion pipeline + the legal-transition DAG + by-status counts.
+      • memory — generalized hypothesis memory: NEGATIVE (knob+direction changes the council must not
+        repeat) vs POSITIVE (retained laws).
+      • competence — the advisory per-module ablation verdict joined with each module's rolling IC.
+      • authority — the live switches + the Tier-0 invariant (registry records; it never applies).
+    On-demand (NOT in the 3s poll); bounded to the most-recent `limit` hypotheses. Pure read."""
+    import redis_client
+    from signals.scibrain.learning_view import build_learning_snapshot
+    from signals.scibrain.viz_contracts import wrap_learning_graph
+    try:
+        return wrap_learning_graph(build_learning_snapshot(redis_client.get(), limit=limit))
+    except Exception as exc:
+        return {"available": False, "error": str(exc)[:200]}
+
+
+@app.get("/scibrain/authority", dependencies=[Depends(_verify_token)])
+async def scibrain_authority():
+    """Phase-7c AUTHORITY RECONCILIATION — the canonical, honest map of the current real-LIVE state to the
+    explicit observe→advise→bounded_canary→live (+veto) ladder (Rule 14). Enumerates every component class
+    with its declared authority CAP, EFFECTIVE authority now (read from the live kill-switches), risk tier,
+    status, kill switch, and evidence — then the INVARIANT checks that catch authority drift (no component
+    exceeds its cap; only the known real-money path holds live capital authority; Tier-0 holds none; the
+    promotion gate is inactive). On-demand (NOT in the 3s poll); pure read; no trading authority."""
+    import redis_client
+    from signals.scibrain.authority import reconcile_authority
+    try:
+        return reconcile_authority(redis_client.get())
+    except Exception as exc:
+        return {"available": False, "error": str(exc)[:200]}
+
+
+@app.get("/scibrain/canary", dependencies=[Depends(_verify_token)])
+async def scibrain_canary():
+    """Phase-7c bounded-canary status — the master switch, the ONE active canary (its override + lineage +
+    rollback artifact), pending owner-approval requests, recent history, and config. On-demand; pure read.
+    The canary is the only capital-affecting promotion path: owner-approved, one (module,regime) at a time,
+    auto-rollback; DEFAULT OFF. The agent cannot approve — approval is the owner's explicit Redis flag."""
+    import redis_client
+    from signals.scibrain import canary
+    try:
+        return canary.status(redis_client.get())
+    except Exception as exc:
+        return {"available": False, "error": str(exc)[:200]}
+
+
+@app.get("/scibrain/workspace", dependencies=[Depends(_verify_token)])
+async def scibrain_workspace(symbol: str | None = None):
+    """Phase-7d read-only global latent WORKSPACE (design §3.4) — the latest scored Decision's module
+    bank re-expressed as typed CognitiveMessages + one shared BeliefState (calibrated regime posterior,
+    cross-module disagreement = epistemic uncertainty, per-module support distance, the salient broadcast
+    subset). On-demand; pure read; no trading authority. `symbol` optional (defaults to most-recent)."""
+    import redis_client
+    from signals.scibrain import workspace
+    try:
+        return workspace.build_workspace(redis_client.get(), symbol=symbol)
+    except Exception as exc:
+        return {"available": False, "error": str(exc)[:200]}
+
+
+@app.get("/scibrain/thalamus", dependencies=[Depends(_verify_token)])
+async def scibrain_thalamus(symbol: str | None = None):
+    """Phase-7d THALAMUS / salience router (design §3.3) — scores the workspace messages (info-gain +
+    relevance + anomaly + risk-urgency − compute-cost − family-redundancy), selects a sparse load-balanced
+    evidence subset (abstaining the rest), and allocates bounded memory/planning/audit/compute budgets
+    scaled by stakes AND real system load. On-demand; pure read; no trading authority."""
+    import redis_client
+    from signals.scibrain import thalamus, workspace
+    try:
+        ws = workspace.build_workspace(redis_client.get(), symbol=symbol, publish=False)
+        return thalamus.route_salience(redis_client.get(), ws)
+    except Exception as exc:
+        return {"available": False, "error": str(exc)[:200]}
+
+
+@app.get("/scibrain/metacognition", dependencies=[Depends(_verify_token)])
+async def scibrain_metacognition(symbol: str | None = None):
+    """Phase-7d METACORTEX competence maps (design §3.11) — per-component calibration (|IC|·support) with
+    epistemic (reducible) vs aleatoric (irreducible) uncertainty, support distance / OOD, and abstention
+    utility, plus the key output P(action_supported|belief,evidence,versions) for the live decision.
+    On-demand; pure read; no trading authority."""
+    import redis_client
+    from signals.scibrain import metacog
+    try:
+        return metacog.build_competence_map(redis_client.get(), symbol=symbol)
+    except Exception as exc:
+        return {"available": False, "error": str(exc)[:200]}
+
+
+@app.get("/scibrain/brainstem", dependencies=[Depends(_verify_token)])
+async def scibrain_brainstem():
+    """Phase-7d BRAINSTEM safety status (design §3.1) — the live hard-constraint SafeSet (kill switch,
+    size/leverage hard caps, max-open exposure), the active reflexes (crash-tail veto, exposure
+    saturation), and the falsifiable non-bypass invariants. The brainstem PROJECTS any learned action to
+    the closest admissible one (or baseline-abstains on a fault); it holds no authority of its own.
+    On-demand; pure read."""
+    import redis_client
+    from signals.scibrain import brainstem
+    try:
+        return brainstem.safety_status(redis_client.get())
+    except Exception as exc:
+        return {"available": False, "error": str(exc)[:200]}
+
+
+@app.get("/scibrain/episodic", dependencies=[Depends(_verify_token)])
+async def scibrain_episodic():
+    """Phase-7e HIPPOCAMPUS episodic memory (design §3.5) — rich Episodes (EntrySnapshot/LifeTrace/
+    OutcomePacket) re-assembled from the ledger, each with a pattern-separated k-WTA embedding + a replay
+    priority (|rpe|+surprise+tail+disagreement+rarity−redundancy), plus a memory-health diagnosis: outcome
+    imbalance, whether rare FAILURES are actually preserved at the top of the replay queue, and the
+    pattern-separation quality. On-demand; pure read; no trading authority."""
+    import redis_client
+    from signals.scibrain import episodic
+    try:
+        return episodic.build_episodic_memory(redis_client.get())
+    except Exception as exc:
+        return {"available": False, "error": str(exc)[:200]}
+
+
+@app.get("/scibrain/abstention", dependencies=[Depends(_verify_token)])
+async def scibrain_abstention():
+    """Phase-7e ABSTENTION memory (design §3.5/§3.11) — the rejected-action / correct-abstention / near-
+    miss / false-alarm events current memory drops, now preserved + classified, with a net ABSTENTION
+    REWARD (avoided losses − forgone gains) and a SKILL read (does the bot reject discriminatingly?
+    rejected would-win rate vs accepted win rate). On-demand; pure read; no trading authority."""
+    import redis_client
+    from signals.scibrain import abstention
+    try:
+        return abstention.build_abstention_memory(redis_client.get())
+    except Exception as exc:
+        return {"available": False, "error": str(exc)[:200]}
+
+
+@app.get("/scibrain/sleep", dependencies=[Depends(_verify_token)])
+async def scibrain_sleep(run: bool = False):
+    """Phase-7e isolated SLEEP cycle status (design §3.6/§9) — the last replay/consolidation/calibration/
+    adversarial/homeostasis/pruning maintenance cycle (run off the hot path by the worker). `run=true`
+    triggers an on-demand cycle (single-flight). On-demand; pure read + ephemeral bookkeeping."""
+    import redis_client
+    from signals.scibrain import sleep
+    try:
+        r = redis_client.get()
+        return sleep.run_sleep_cycle(r, force=True) if run else sleep.sleep_status(r)
+    except Exception as exc:
+        return {"available": False, "error": str(exc)[:200]}
+
+
+@app.get("/scibrain/consolidation", dependencies=[Depends(_verify_token)])
+async def scibrain_consolidation():
+    """Phase-7e NEOCORTEX slow-consolidation health (design §3.6) — the EWC consolidation report diagnosed:
+    did EWC reduce catastrophic forgetting vs the no-EWC ablation, and did the protected old-competence
+    regression test ACCEPT or REJECT the update (keeping θ_old). On-demand; pure read; no trading authority."""
+    import redis_client
+    from signals.scibrain import consolidation_health
+    try:
+        return consolidation_health.build_consolidation_health(redis_client.get())
+    except Exception as exc:
+        return {"available": False, "error": str(exc)[:200]}
+
+
+@app.get("/scibrain/world_model", dependencies=[Depends(_verify_token)])
+async def scibrain_world_model():
+    """Phase-7f WORLD-MODEL health (design §3.6/§3.9) — the RSSM trained on RICH cross-trade sequences from
+    the immutable ledger (not sparse trade-only state), judged by an honest open-loop multi-step CALIBRATION
+    metric (normalized model error = imagined-reward MSE / constant-baseline MSE = 1−R²), with planning
+    authority gated by that error (planning_weight = clip(1 − model_error − epistemic, 0, 1)). When the model
+    can't beat a constant, authority is correctly WITHHELD — a safe, honest default. Pure read of the report
+    written by the scibrain-world-model beat task; no trading authority."""
+    import redis_client
+    from signals.scibrain import world_model_health
+    try:
+        return world_model_health.build_world_model_health(redis_client.get())
+    except Exception as exc:
+        return {"available": False, "error": str(exc)[:200]}
+
+
+@app.get("/scibrain/controllers", dependencies=[Depends(_verify_token)])
+async def scibrain_controllers():
+    """Phase-7f HIERARCHICAL CONTROLLERS health (design §3.7/§8-417) — the day/minute PPO bandits reframed as a
+    DAY→HOUR→MINUTE hierarchy with one shared belief, real multi-timescale trajectories, the revived hour role,
+    and a measured COORDINATION GAIN + ablation vs the flat baseline (decorative-level flags included). SHADOW:
+    the LIVE PPO agents are untouched (Rule 21). Pure read of the report written by the beat task."""
+    import redis_client
+    from signals.scibrain import controllers_health
+    try:
+        return controllers_health.build_controllers_health(redis_client.get())
+    except Exception as exc:
+        return {"available": False, "error": str(exc)[:200]}
+
+
+@app.get("/scibrain/offline_rl", dependencies=[Depends(_verify_token)])
+async def scibrain_offline_rl():
+    """Phase-7f OFFLINE RL CHALLENGERS health (design §3.7/§8-416) — tabular CQL + IQL over abstain/enter/
+    manage/exit options with a SUPPORT-AWARE baseline fallback, scored off-policy on the deterministic digital
+    twin (CQL/IQL vs baseline/realized/oracle, fallback rate, option support; manage/exit unsupported by the
+    current logging). SHADOW — no live authority (Rule 21). Pure read of the beat-task report."""
+    import redis_client
+    from signals.scibrain import offline_rl_health
+    try:
+        return offline_rl_health.build_offline_rl_health(redis_client.get())
+    except Exception as exc:
+        return {"available": False, "error": str(exc)[:200]}
+
+
+@app.get("/scibrain/risk_policy", dependencies=[Depends(_verify_token)])
+async def scibrain_risk_policy():
+    """Phase-7f RISK-SENSITIVE POLICY health (design §3.7/§3.10/§8-416) — distributional CVaR objective +
+    explicit turnover cost + CBF (reduce-only) safety projection + support-aware fallback, twin-evaluated on
+    the mean-vs-tail tradeoff (CVaR / worst / max-drawdown / turnover for mean vs CVaR vs CVaR+safety vs
+    baseline vs realized). SHADOW — no live authority (Rule 21). Pure read of the beat-task report."""
+    import redis_client
+    from signals.scibrain import risk_policy_health
+    try:
+        return risk_policy_health.build_risk_policy_health(redis_client.get())
+    except Exception as exc:
+        return {"available": False, "error": str(exc)[:200]}
+
+
+@app.get("/scibrain/meta_learning", dependencies=[Depends(_verify_token)])
+async def scibrain_meta_learning():
+    """Phase-7f META-LEARNING health (design §3.7/§5.4-7/§5.5 stage-6/§8-419) — real regime×VPIN cohort tasks
+    with real belief states + twin-utility targets (no synthetic-zero-state, no leak), few-shot Reptile
+    adaptation (vs no-adapt / from-scratch / pooled) + a protected-competence test vs sequential fine-tune.
+    Upgrades ml/maml.py. SHADOW — no live authority; ml/maml.py untouched (Rule 21). Pure read of the report."""
+    import redis_client
+    from signals.scibrain import meta_learning_health
+    try:
+        return meta_learning_health.build_meta_learning_health(redis_client.get())
+    except Exception as exc:
+        return {"available": False, "error": str(exc)[:200]}
+
+
+@app.get("/scibrain/replay", dependencies=[Depends(_verify_token)])
+async def scibrain_replay():
+    """Phase-7e PRIORITIZED REPLAY health (design §3.5 / Schaul 2015) — samples episodes ∝ priority^α,
+    applies importance-sampling weights w=(N·P)^(−β), and reports whether rare FAILURES are over-sampled
+    (the point) AND whether the IS correction recovers the true outcome distribution (unbiasedness),
+    plus the effective coverage so over-concentration on a few episodes is caught. On-demand; pure read."""
+    import redis_client
+    from signals.scibrain import episodic
+    try:
+        return episodic.replay_health(redis_client.get())
+    except Exception as exc:
+        return {"available": False, "error": str(exc)[:200]}
+
+
+@app.get("/scibrain/training", dependencies=[Depends(_verify_token)])
+async def scibrain_training():
+    """Phase-7e TRAINING HEALTH (design §8) — the shared-latent SSL train+eval report turned into an
+    auto-diagnosed health view: the AUC contextualised by class balance, the number of minority test
+    examples, and its Hanley–McNeil 95% CI, plus typed issues (imbalance / underpowered / no-signal /
+    leakage / small-corpus) so an operator can tell an underpowered or data-limited result apart from a
+    genuinely bad model or a leak. On-demand; pure read."""
+    import redis_client
+    from signals.scibrain import training_health
+    try:
+        return training_health.build_training_health(redis_client.get())
+    except Exception as exc:
+        return {"available": False, "error": str(exc)[:200]}
+
+
+@app.get("/scibrain/brain", dependencies=[Depends(_verify_token)])
+async def scibrain_brain(symbol: str | None = None):
+    """Phase-7d WHOLE-BRAIN dashboard / BrainPulse (design §Phase-E step 17) — every cognitive-OS region
+    (brainstem/thalamus/workspace/metacortex/action/tail/learning) folded into one read-only snapshot:
+    region activity + authority + health, plus the workspace broadcast, uncertainty (epistemic vs
+    aleatoric, P(action_supported)), competence/OOD, the live-capital authority + producer-bus no-bypass,
+    and the compute/attention budgets. On-demand; pure read; no trading authority."""
+    import redis_client
+    from signals.scibrain import brain_view
+    try:
+        return brain_view.build_brain_pulse(redis_client.get(), symbol=symbol)
+    except Exception as exc:
+        return {"available": False, "error": str(exc)[:200]}
+
+
+@app.get("/scibrain/universe", dependencies=[Depends(_verify_token)])
+async def scibrain_universe():
+    """VS-V5 Universe Neural Field data — the bounded REAL relational-field topology mirrored from the
+    in-RAM UniverseFrame the Universe-Core scored (scibrain:universe:field): correlation-territory
+    CLUSTERS, classical-MDS NODE positions (co-movement geometry, not force-layout), directed lead-lag
+    EDGES (predictive-flow / contagion), and the market-state digest. The fast-moving OPEN-POSITION
+    overlay is joined here (per-pair held side) so it stays current independent of the 60s frame.
+    On-demand (NOT in the 3s poll); pure read."""
+    import json as _json
+    import redis_client
+    r = redis_client.get()
+    try:
+        raw = r.get("scibrain:universe:field")
+        snap = _json.loads(raw) if raw else None
+    except Exception as exc:
+        return {"available": False, "error": str(exc)[:200]}
+    if not snap:
+        return {"available": False, "error": "no field snapshot yet (built once per universe-frame rebuild)"}
+    # overlay current open positions onto the nodes (fast-moving; not part of the frame snapshot)
+    held: dict = {}
+    try:
+        from memory.query import get_open_trades
+        for t in (get_open_trades() or []):
+            pair = t.get("pair")
+            if pair:
+                held[pair] = (t.get("direction") or "").lower()
+    except Exception:
+        held = {}
+    for n in (snap.get("nodes") or []):
+        side = held.get(n.get("symbol"))
+        if side:
+            n["held"] = True
+            n["held_side"] = side
+    snap["n_open_positions"] = len(held)
+    from signals.scibrain.viz_contracts import wrap_universe_graph
+    return wrap_universe_graph(snap)
+
+
+@app.get("/scibrain/graph", dependencies=[Depends(_verify_token)])
+async def scibrain_graph(symbol: str):
+    """Versioned BrainGraphSnapshot (design §8) for ONE symbol — the live cognitive circuit
+    (modules → router → fusion → safety → audit → action) as typed nodes[]/edges[]/regions[] + the
+    belief field + real BrainPulses, each pointing back to IMMUTABLE evidence IDs. Built BACKEND-side
+    from the same immutable evidence the runner mirrors (scibrain:{sym}:decision/:reasoning) so the
+    frontend no longer infers the graph from prose. On-demand (NOT in the 3s poll); pure read."""
+    import json as _json
+    import redis_client
+    from signals.scibrain.viz_contracts import build_brain_graph_snapshot
+    r = redis_client.get()
+    sym = (symbol or "").strip().upper()
+    if not sym:
+        return {"contract": "BrainGraphSnapshot", "available": False, "error": "symbol required"}
+    try:
+        raw = r.get(f"scibrain:{sym}:decision")
+        dec = _json.loads(raw) if raw else None
+        if dec:
+            rsn = r.get(f"scibrain:{sym}:reasoning")
+            if rsn:
+                dec["reasoning"] = _json.loads(rsn)
+    except Exception as exc:
+        return {"contract": "BrainGraphSnapshot", "available": False, "error": str(exc)[:200]}
+    if not dec:
+        return {"contract": "BrainGraphSnapshot", "available": False,
+                "error": f"no live decision for {sym}"}
+    return build_brain_graph_snapshot(dec)
+
+
+def _scibrain_audits(r, jget, limit: int = 30) -> list[dict]:
+    """The most-recent ex-ante decision-risk audits (newest first). Each = the at-open
+    interrogation forecast for an OPENED trade + its wrong-direction flag + the agent's
+    remediation when it was flagged. These are made before any outcome exists, not post-result.
+    Sourced from the recommendation/flag ledgers so EVERY audited decision is visible."""
+    try:
+        # union of recently-recommended (flagged) and recently-audited trade ids, newest first
+        rec_ids = list(r.zrevrange("scibrain:recommended_actions", 0, limit - 1) or [])
+        flag_ids = list(r.zrevrange("scibrain:wrong_direction_trades", 0, limit - 1) or [])
+    except Exception:
+        rec_ids, flag_ids = [], []
+    seen, out = set(), []
+    for tid in rec_ids + flag_ids:
+        if tid in seen:
+            continue
+        seen.add(tid)
+        a = jget(f"scibrain:audit:{tid}")
+        if not a:
+            continue
+        try:
+            a["wrong_dir_risk_score"] = float(r.zscore("scibrain:wrong_direction_trades", tid) or 0.0)
+        except Exception:
+            a["wrong_dir_risk_score"] = 0.0
+        a["trade_id"] = tid
+        out.append(a)
+        if len(out) >= limit:
+            break
+    return out
+
+
+def _scibrain_crash_radar(r, jget, limit: int = 12) -> list[dict]:
+    """Top pairs by StatPhysSOC crash_warning, enriched with the SOC module's own
+    criticality detail + the fused direction so the dashboard can show WHY each is hot."""
+    try:
+        rows = r.zrevrange("scibrain:crash_radar", 0, limit - 1, withscores=True) or []
+    except Exception:
+        return []
+    out = []
+    for sym, score in rows:
+        item = {"symbol": sym, "crash_warning": round(float(score), 4)}
+        mods = jget(f"scibrain:{sym}:modules") or []
+        soc = next((m for m in mods if m.get("module") == "statphys_soc"), None)
+        if soc:
+            f = soc.get("features", {})
+            item.update({
+                "criticality": f.get("criticality"),
+                "regime": soc.get("regime_tag"),
+                "hill_alpha": f.get("hill_alpha"),
+                "csd": f.get("csd"),
+                "skew": f.get("skew"),
+                "soc_direction": soc.get("direction"),
+            })
+        dec = jget(f"scibrain:{sym}:decision")
+        if dec:
+            item["fused_direction"] = dec.get("direction")
+            item["fused_conviction"] = dec.get("conviction")
+        out.append(item)
+    return out
+
+
+@app.get("/scibrain/crash_radar", dependencies=[Depends(_verify_token)])
+async def scibrain_crash_radar(limit: int = 20):
+    """StatPhysSOC crash early-warning radar — the pairs closest to a critical
+    (self-organized-criticality) state right now, most-elevated first."""
+    import json
+    import redis_client
+    r = redis_client.get()
+
+    def _jget(key, default=None):
+        try:
+            raw = r.get(key)
+            return json.loads(raw) if raw else default
+        except Exception:
+            return default
+
+    return {"radar": _scibrain_crash_radar(r, _jget, limit=max(1, min(int(limit), 100)))}
 
 
 @app.get("/signals/shadow_win_rate", dependencies=[Depends(_verify_token)])
@@ -1309,6 +2132,218 @@ async def signal_util_calib_state():
     calibration last-run report."""
     from signals.utility_calibration import state
     return state()
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# cont. 74 — Kuramoto ensemble-coherence counterfactual A/B (replaced hist_acc)
+# ─────────────────────────────────────────────────────────────────────────
+def _dec(v):
+    """Redis client returns bytes (decode_responses=False). Normalize to str."""
+    return v.decode() if isinstance(v, (bytes, bytearray)) else v
+
+
+@app.get("/signals/coherence/shadow", dependencies=[Depends(_verify_token)])
+async def signal_coherence_shadow(limit: int = 60):
+    """cont. 74 — Kuramoto ensemble-coherence counterfactual A/B vs the legacy past-trades
+    win-rate. `coherence` is the forward-looking per-signal score that REPLACED
+    hist_acc; the legacy Beta-Binomial win-rate is still computed each cycle purely
+    for this A/B. Returns the live source, running divergence count, aggregate stats
+    and the most-divergent recent pairs (signals:strength_shadow:{pair}, 300s TTL)."""
+    import redis_client
+    r = redis_client.get()
+    raw = _dec(r.get("signals:coherence_enabled"))
+    coherence_live = (raw is None) or (str(raw) != "0")
+    try:
+        total = int(_dec(r.get("signals:strength_shadow:count")) or 0)
+    except Exception:
+        total = 0
+    rows = []
+    try:
+        for k in r.scan_iter(match="signals:strength_shadow:*", count=500):
+            key = _dec(k)
+            if key.endswith(":count"):
+                continue
+            val = _dec(r.get(key))
+            if not val:
+                continue
+            d = {"pair": key.rsplit(":", 1)[-1]}
+            for tok in val.split():
+                if "=" in tok:
+                    kk, vv = tok.split("=", 1)
+                    d[kk] = vv
+            try:
+                d["coherence"] = float(d.get("coherence"))
+                d["legacy_winrate"] = float(d.get("legacy_winrate"))
+            except (TypeError, ValueError):
+                continue
+            d["delta"] = round(d["coherence"] - d["legacy_winrate"], 2)
+            try:
+                d["r"] = float(d.get("r"))
+            except (TypeError, ValueError):
+                d["r"] = None
+            rows.append(d)
+    except Exception:
+        pass
+    rows.sort(key=lambda x: abs(x["delta"]), reverse=True)
+    n = len(rows)
+    r_vals = [x["r"] for x in rows if x.get("r") is not None]
+    agg = {
+        "live_pairs": n,
+        "avg_coherence": round(sum(x["coherence"] for x in rows) / n, 2) if n else None,
+        "avg_legacy": round(sum(x["legacy_winrate"] for x in rows) / n, 2) if n else None,
+        "avg_abs_delta": round(sum(abs(x["delta"]) for x in rows) / n, 2) if n else None,
+        "coherence_higher": sum(1 for x in rows if x["delta"] > 0),
+        "legacy_higher": sum(1 for x in rows if x["delta"] < 0),
+        "avg_r": round(sum(r_vals) / len(r_vals), 3) if r_vals else None,
+    }
+    return {
+        "coherence_live": coherence_live,
+        "live_source": "coherence" if coherence_live else "legacy_winrate",
+        "divergence_count_total": total,
+        "aggregate": agg,
+        "rows": rows[:max(1, min(int(limit), 200))],
+    }
+
+
+@app.get("/signals/coherence/scoreboard", dependencies=[Depends(_verify_token)])
+async def signal_coherence_scoreboard(limit: int = 4000):
+    """cont. 74 — the REAL test: of the closed trades that snapshotted both scores,
+    which one (coherence vs legacy win-rate) actually predicts winners? Win-rate by
+    score bucket + Spearman IC vs realized net PnL + a verdict. Populates as trades
+    opened after the cont.74 persistence deploy close."""
+    from signals.coherence_eval import state
+    return state(limit=limit)
+
+
+class CoherenceToggle(BaseModel):
+    enabled: bool       # True = Kuramoto coherence (default); False = legacy win-rate
+
+
+@app.post("/signals/coherence/toggle", dependencies=[Depends(_verify_token)])
+async def signal_coherence_toggle(req: CoherenceToggle):
+    """cont. 74 — flip the live per-signal strength source. enabled=true → Kuramoto
+    coherence (default); enabled=false → legacy past-trades win-rate. Reversible LIVE;
+    the A/B keeps logging either way. Brain reads signals:coherence_enabled per cycle."""
+    import redis_client
+    redis_client.get().set("signals:coherence_enabled", "1" if req.enabled else "0")
+    return {"ok": True, "coherence_live": req.enabled}
+
+
+@app.get("/signals/coherence/panel", response_class=HTMLResponse)
+async def coherence_panel():
+    """Self-contained Kuramoto coherence shadow A/B viewer. Open it at the dashboard
+    host /signals/coherence/panel, log in once, watch coherence vs legacy win-rate."""
+    return HTMLResponse(_COHERENCE_PANEL_HTML)
+
+
+_COHERENCE_PANEL_HTML = """<!doctype html><html><head><meta charset=utf-8>
+<meta name=viewport content="width=device-width,initial-scale=1">
+<title>Kuramoto Coherence Shadow</title><style>
+body{font-family:system-ui,Segoe UI,Roboto,sans-serif;background:#0f1117;color:#e6e6e6;margin:0;padding:24px}
+.card{max-width:920px;margin:0 auto;background:#171a21;border:1px solid #262b36;border-radius:12px;padding:24px}
+h1{font-size:20px;margin:0 0 4px}.sub{color:#8a93a3;font-size:13px;margin-bottom:18px}
+input{background:#0f1117;border:1px solid #2a3140;color:#e6e6e6;border-radius:8px;padding:10px;width:100%;box-sizing:border-box;margin:6px 0 14px}
+button{border:0;border-radius:10px;padding:10px 16px;font-size:14px;font-weight:600;cursor:pointer;margin-right:8px}
+.go{background:#2d8a4e;color:#fff}.coh{background:#2d6a8a;color:#fff}.leg{background:#7a5a2a;color:#fff}
+.badge{display:inline-block;padding:4px 10px;border-radius:999px;font-size:12px;font-weight:700}
+.b-coh{background:#1f4a5a;color:#7fd4ff}.b-leg{background:#5a431c;color:#f0c674}
+.row{display:flex;gap:14px;flex-wrap:wrap;margin:14px 0}
+.stat{background:#0f1117;border:1px solid #232936;border-radius:8px;padding:10px 14px;min-width:108px}
+.stat .k{color:#8a93a3;font-size:11px}.stat .v{font-size:18px;font-weight:700}
+table{width:100%;border-collapse:collapse;margin-top:12px;font-size:13px}
+th,td{text-align:right;padding:6px 8px;border-bottom:1px solid #232936}
+th:first-child,td:first-child{text-align:left}
+th{color:#8a93a3;font-weight:600;font-size:11px;text-transform:uppercase}
+.pos{color:#5fd08a}.neg{color:#ff8b8b}.muted{color:#6b7383}
+.empty{background:#1a2330;border:1px solid #233047;color:#9fb6d4;padding:12px;border-radius:8px;font-size:13px;margin-top:14px}
+small{color:#6b7383}</style></head><body><div class=card>
+<h1>Kuramoto Coherence — Shadow A/B</h1>
+<div class=sub>cont. 74 · forward-looking ensemble agreement replaced the past-trades win-rate (hist_acc). Live source vs legacy, logged every cycle.</div>
+<div id=login>
+  <input id=pw type=password placeholder="dashboard password" />
+  <button class=go onclick=login()>Log in</button>
+</div>
+<div id=ctl style=display:none>
+  <div>Live per-signal source: <span id=mode class="badge b-coh">COHERENCE</span></div>
+  <div class=row>
+    <div class=stat><div class=k>divergences (all-time)</div><div class=v id=s_total>–</div></div>
+    <div class=stat><div class=k>live pairs</div><div class=v id=s_pairs>–</div></div>
+    <div class=stat><div class=k>avg coherence</div><div class=v id=s_coh>–</div></div>
+    <div class=stat><div class=k>avg legacy</div><div class=v id=s_leg>–</div></div>
+    <div class=stat><div class=k>avg |Δ|</div><div class=v id=s_d>–</div></div>
+    <div class=stat><div class=k>avg r</div><div class=v id=s_r>–</div></div>
+    <div class=stat><div class=k>coh&gt;leg / leg&gt;coh</div><div class=v id=s_split>–</div></div>
+  </div>
+  <button class=coh onclick=setSrc(true)>Use COHERENCE (default)</button>
+  <button class=leg onclick=setSrc(false)>Use LEGACY win-rate</button>
+  <h2 style="font-size:15px;margin:22px 0 2px">Live divergence (recent pairs)</h2>
+  <div id=tblwrap></div>
+  <h2 style="font-size:15px;margin:26px 0 2px">Predictiveness scoreboard — closed trades</h2>
+  <div class=sub style=margin-bottom:8px>Does the score actually predict winners? Win-rate by score bucket + Spearman IC vs realized PnL. Builds up as post-deploy trades close.</div>
+  <div id=scorewrap></div>
+  <p><small>Live rows have a 300s TTL (only recently-scored pairs appear). Scoreboard needs trades opened AFTER the cont.74 deploy to close first. Refreshes every 5s. Token stored in this browser only.</small></p>
+</div>
+<script>
+let T=localStorage.getItem('dash_tok')||'';
+function hdr(){return {'Authorization':'Bearer '+T,'Content-Type':'application/json'}}
+async function login(){
+  const pw=document.getElementById('pw').value;
+  const res=await fetch('/auth/login',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({username:'admin',password:pw})});
+  if(!res.ok){alert('login failed');return}
+  const j=await res.json();T=j.access_token;localStorage.setItem('dash_tok',T);show()}
+function show(){document.getElementById('login').style.display='none';
+  document.getElementById('ctl').style.display='block';refresh();refreshScore()}
+function f(x){return (x===null||x===undefined)?'–':x}
+async function refresh(){
+  const res=await fetch('/signals/coherence/shadow',{headers:hdr()});
+  if(res.status===401){localStorage.removeItem('dash_tok');location.reload();return}
+  const s=await res.json();const a=s.aggregate||{};
+  document.getElementById('s_total').textContent=f(s.divergence_count_total);
+  document.getElementById('s_pairs').textContent=f(a.live_pairs);
+  document.getElementById('s_coh').textContent=f(a.avg_coherence);
+  document.getElementById('s_leg').textContent=f(a.avg_legacy);
+  document.getElementById('s_d').textContent=f(a.avg_abs_delta);
+  document.getElementById('s_r').textContent=f(a.avg_r);
+  document.getElementById('s_split').textContent=f(a.coherence_higher)+' / '+f(a.legacy_higher);
+  const m=document.getElementById('mode');
+  if(s.coherence_live){m.textContent='COHERENCE';m.className='badge b-coh'}
+  else{m.textContent='LEGACY win-rate';m.className='badge b-leg'}
+  const rows=s.rows||[];const w=document.getElementById('tblwrap');
+  if(!rows.length){w.innerHTML='<div class=empty>No recent shadow records — per-pair keys expired (300s TTL). The all-time divergence counter above keeps climbing; rows repopulate as the brain scores live signals.</div>';return}
+  let h='<table><tr><th>pair</th><th>dir</th><th>coherence</th><th>legacy</th><th>Δ</th><th>r</th></tr>';
+  for(const x of rows){const d=x.delta;const c=d>0?'pos':(d<0?'neg':'muted');
+    h+='<tr><td>'+x.pair+'</td><td class=muted>'+f(x.dir)+'</td><td>'+f(x.coherence)+'</td><td class=muted>'+f(x.legacy_winrate)+'</td><td class='+c+'>'+(d>0?'+':'')+f(d)+'</td><td class=muted>'+f(x.r)+'</td></tr>'}
+  h+='</table>';w.innerHTML=h}
+function buckRows(b){let s='';for(const x of (b||[])){s+='<tr><td>'+x.bucket+'</td><td class=muted>'+f(x.n)+'</td><td>'+(x.win_rate===null?'–':x.win_rate+'%')+'</td><td class='+(x.avg_pnl>0?'pos':(x.avg_pnl<0?'neg':'muted'))+'>'+f(x.avg_pnl)+'</td></tr>'}return s}
+async function refreshScore(){
+  const res=await fetch('/signals/coherence/scoreboard',{headers:hdr()});
+  if(!res.ok)return;const s=await res.json();const w=document.getElementById('scorewrap');
+  if(s.status==='collecting'||s.n_trades===0){w.innerHTML='<div class=empty>'+f(s.note||'Collecting — no closed trades carry the dual-score snapshot yet.')+'</div>';return}
+  if(s.status==='error'){w.innerHTML='<div class=empty>scoreboard error: '+f(s.error)+'</div>';return}
+  const ci=s.coherence||{},li=s.legacy||{};
+  const vmap={coherence:'b-coh',legacy:'b-leg',tie:'b-leg',insufficient:'b-leg'};
+  let h='<div class=row>';
+  h+='<div class=stat><div class=k>closed trades</div><div class=v>'+f(s.n_trades)+'</div></div>';
+  h+='<div class=stat><div class=k>overall win</div><div class=v>'+f(s.overall_win_rate)+'%</div></div>';
+  h+='<div class=stat><div class=k>net PnL</div><div class=v class='+(s.overall_net_pnl>0?'pos':'neg')+'>'+f(s.overall_net_pnl)+'</div></div>';
+  h+='<div class=stat><div class=k>coherence IC</div><div class=v>'+f(ci.spearman_ic)+'</div></div>';
+  h+='<div class=stat><div class=k>legacy IC</div><div class=v>'+f(li.spearman_ic)+'</div></div>';
+  h+='<div class=stat><div class=k>verdict</div><div class=v><span class="badge '+(vmap[s.verdict]||'b-leg')+'">'+f(s.verdict).toUpperCase()+'</span></div></div>';
+  h+='</div>';
+  if(s.status==='low_confidence')h+='<div class=empty>Low confidence: '+f(s.n_trades)+' trades (&lt; '+f(s.min_meaningful)+'). Directional only.</div>';
+  h+='<div style="display:flex;gap:18px;flex-wrap:wrap;margin-top:10px">';
+  h+='<div style=flex:1;min-width:280px><div class=sub>COHERENCE — win-rate by bucket (tercile spread '+f(ci.tercile_win_spread_pp)+'pp)</div><table><tr><th>bucket</th><th>n</th><th>win</th><th>avg pnl</th></tr>'+buckRows(ci.buckets)+'</table></div>';
+  h+='<div style=flex:1;min-width:280px><div class=sub>LEGACY — win-rate by bucket (tercile spread '+f(li.tercile_win_spread_pp)+'pp)</div><table><tr><th>bucket</th><th>n</th><th>win</th><th>avg pnl</th></tr>'+buckRows(li.buckets)+'</table></div>';
+  h+='</div>';
+  h+='<div class=empty style=margin-top:12px>'+f(s.verdict_note)+'<br><small>'+f(s.caveat)+'</small></div>';
+  w.innerHTML=h}
+async function setSrc(v){
+  if(!v&&!confirm('Switch the LIVE per-signal source back to the legacy past-trades win-rate? Coherence is the recommended default.'))return;
+  await fetch('/signals/coherence/toggle',{method:'POST',headers:hdr(),body:JSON.stringify({enabled:v})});
+  refresh()}
+if(T)show();setInterval(()=>{if(T){refresh();refreshScore()}},5000);
+</script></div></body></html>"""
 
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -1693,9 +2728,14 @@ async def llm_providers():
     ollama_last_ts = r.get("llm:ollama:last_success_ts")
     ollama_last_elapsed = r.get("llm:ollama:last_elapsed_s")
     ollama_age = (now - int(ollama_last_ts)) if ollama_last_ts else None
-    # "in cooldown" doesn't apply to local; report a degraded flag if no
-    # success in the last 10 min instead.
-    ollama_degraded = ollama_age is None or ollama_age > 600
+    # cont. 74 — the local 14b is the RARE fallback (research is cloud-primary), so it
+    # is idle for long stretches BY DESIGN. The old "degraded if no success in 10 min"
+    # was a permanently-recurring FALSE alarm: warming the model reset the timestamp,
+    # but nothing routinely calls it so it re-degraded every 10 min. Idle != broken.
+    # Degraded now means GENUINELY broken: it was attempted but has never succeeded.
+    # A model that has succeeded at least once and is merely idle reports healthy.
+    ollama_degraded = (ollama_last_ts is None) and (ollama_fail > 0)
+    ollama_idle = (ollama_age is None) or (ollama_age > 600)
     ollama_row = {
         "name": "ollama_local",
         "model": _os.environ.get("OLLAMA_RESEARCH_MODEL", "mistral:7b"),
@@ -1704,6 +2744,7 @@ async def llm_providers():
         "configured": True,         # always — built into the stack
         "in_cooldown": False,       # cooldown is cloud-rate-limit semantics
         "degraded": ollama_degraded,
+        "idle": ollama_idle,        # cont. 74 — healthy but not called recently (fallback)
         "cooldown_ttl_seconds": 0,
         "successful_calls": ollama_succ,
         "rate_limit_hits": ollama_fail,   # repurposed: transport/timeout fails
@@ -1720,11 +2761,12 @@ async def llm_providers():
     for row in rows:
         if row["name"] in _LOCAL_PROVIDERS:
             row["kind"] = "local"
-            # Local servers don't have cloud-style rate-limit semantics;
-            # surface a degraded flag when configured but no success in the
-            # last 10 min (parallels the Ollama row's logic).
+            # cont. 74 — idle != degraded (parallels the Ollama row). A local fallback
+            # that is merely uncalled is healthy/idle, not broken.
             _age = row.get("last_success_age_seconds")
-            row["degraded"] = row["configured"] and (_age is None or _age > 600)
+            row["idle"] = (_age is None) or (_age > 600)
+            row["degraded"] = bool(row["configured"]) and (_age is None) and \
+                              (row.get("rate_limit_hits") or 0) > 0
         else:
             row["kind"] = "cloud"
     rows.insert(0, ollama_row)   # primary first
@@ -2149,6 +3191,112 @@ async def models_status():
         "progress_pct": None,
     })
 
+    # CandleNet 30m + 1h (F48 — were trained on disk but not surfaced; cont. 73)
+    for _cn_tf, _cn_file in (("30m", "candlenet_30m.pth"), ("1h", "candlenet_1h.pth")):
+        _cf       = _file_info(_cn_file)
+        _auc      = _redis_float(f"brain:candlenet_{_cn_tf}_val_auc")
+        _lift     = _redis_float(f"brain:candlenet_{_cn_tf}_top_decile_lift")
+        _calib    = _redis_float(f"brain:candlenet_{_cn_tf}_dir_calib_err")
+        _samples  = _redis_int(f"brain:candlenet_{_cn_tf}_samples")
+        _accepted = (r.get(f"brain:candlenet_{_cn_tf}_accepted") == "1")
+        _reject   = r.get(f"brain:candlenet_{_cn_tf}_rejection_reason")
+        if _auc is not None and _samples:
+            _m = (f"auc {_auc:.3f}  lift {(_lift or 0):.2f}x  calib {(_calib or 0):.3f}"
+                  f"  ({_samples:,}n)") if _accepted else (
+                  f"REJECTED ({_reject})" if _reject else f"REJECTED ({_samples}n)")
+        else:
+            _m = None
+        rows.append({
+            "name": f"CandleNet {_cn_tf}", "purpose": "Next-Candle Direction / Magnitude (F48)",
+            "file": _cn_file, **_cf,
+            "status": _status(_cf, max_age_hours=168, pending_text=None),
+            "metric_label": "val_auc / lift / calib / samples",
+            "metric_value": _m, "progress_pct": None,
+        })
+
+    # Pattern Clusters (HDBSCAN, F46/Phase-A) — REVIVED cont. 73. Fit from the live
+    # CandleNet embedding stream; assigns pattern:cluster_id:{pair} every 1m.
+    pc_f = _file_info("pattern_clusters.pkl")
+    pc_total = _redis_int("pattern:assign:total") or 0
+    pc_noise = _redis_int("pattern:assign:noise") or 0
+    pc_captured = _redis_int("pattern:embeddings:captured_count") or 0
+    pc_train_raw = r.get("pattern:cluster_train:last")
+    pc_nclusters = None
+    if pc_train_raw:
+        try:
+            import json as _pjson
+            pc_nclusters = _pjson.loads(pc_train_raw).get("n_clusters")
+        except Exception:
+            pc_nclusters = None
+    if pc_f["exists"]:
+        _assigned = pc_total - pc_noise
+        pc_metric = (f"{pc_nclusters or '?'} clusters  "
+                     f"assigned {_assigned}/{pc_total}  "
+                     f"captured {pc_captured:,}")
+    else:
+        pc_metric = "no model fit yet"
+    rows.append({
+        "name": "Pattern Clusters", "purpose": "HDBSCAN regime-pattern id (pattern_cluster_id)",
+        "file": "pattern_clusters.pkl", **pc_f,
+        "status": _status(pc_f, max_age_hours=24, pending_text=None),  # retrained 6h
+        "metric_label": "clusters / assigned / captured",
+        "metric_value": pc_metric, "progress_pct": None,
+    })
+
+    # Online Predictor (SGD incremental, partial_fit per closed trade)
+    op_f = _file_info("online_predictor.pkl")
+    op_updates = _redis_int("prediction:online:update_count")
+    op_fitted = (r.get("prediction:online:fitted") == "1")
+    rows.append({
+        "name": "Online Predictor", "purpose": "Incremental SGD P(win) (per-trade partial_fit)",
+        "file": "online_predictor.pkl", **op_f,
+        "status": ("active" if (op_f["exists"] and op_fitted) else
+                   ("stale" if op_f["exists"] else "pending")),
+        "metric_label": "updates / fitted",
+        "metric_value": (f"{op_updates or 0} updates  fitted={op_fitted}"
+                         if op_f["exists"] else "not fitted"),
+        "progress_pct": None,
+    })
+
+    # Predict-All ensemble (XGB + per-kline) — pre-open profit predictor
+    for _pa_name, _pa_file, _pa_purpose in (
+        ("Predict-All XGB", "predict_all_xgb.pkl", "Pre-open profit ensemble (XGBoost)"),
+        ("Predict-All Kline", "predict_all_kline.pkl", "Pre-open per-kline predictor"),
+    ):
+        _paf = _file_info(_pa_file)
+        rows.append({
+            "name": _pa_name, "purpose": _pa_purpose,
+            "file": _pa_file, **_paf,
+            "status": _status(_paf, max_age_hours=168, pending_text=None),
+            "metric_label": "size",
+            "metric_value": (f"{_paf['size_kb']:.0f} KB" if _paf["exists"] else None),
+            "progress_pct": None,
+        })
+
+    # Shadow Ablation — per-feature ablation tracker
+    sa_f = _file_info("shadow_ablation.pkl")
+    rows.append({
+        "name": "Shadow Ablation", "purpose": "Per-feature ablation / contribution tracker",
+        "file": "shadow_ablation.pkl", **sa_f,
+        "status": _status(sa_f, max_age_hours=168, pending_text=None),
+        "metric_label": "size",
+        "metric_value": (f"{sa_f['size_kb']:.0f} KB" if sa_f["exists"] else None),
+        "progress_pct": None,
+    })
+
+    # Chronos-Bolt — Amazon foundation forecaster, externally pretrained (HF)
+    chronos_dir = (models_dir / "chronos_bolt_base")
+    chronos_count = _redis_int("ml:chronos:inference_count") or 0
+    rows.append({
+        "name": "Chronos-Bolt", "purpose": "Foundation time-series forecaster (zero-shot)",
+        "file": "chronos_bolt_base/", "exists": chronos_dir.exists(),
+        "mtime": None, "age_hours": None, "size_kb": None,
+        "status": "pretrained" if chronos_dir.exists() else "missing",
+        "metric_label": "Inferences",
+        "metric_value": chronos_count if chronos_count else "loaded",
+        "progress_pct": None,
+    })
+
     return {"models": rows, "generated_at": now}
 
 
@@ -2470,10 +3618,13 @@ async def system_health():
         "providers_configured": sum(1 for k in _keys if k),
     }
 
-    # Celery worker — check Redis for active celery keys
+    # Celery worker — check Redis for active celery keys (non-blocking SCAN, never KEYS:
+    # KEYS celery*/_kombu* over the 135k-key db0 blocked Redis ~40ms/call → dashboard stalls).
     try:
-        celery_keys = r.keys("celery*") or r.keys("_kombu*")
-        svc["celery_worker"] = {"status": "ok" if celery_keys else "degraded"}
+        # _kombu* first: it's where the broker's binding keys actually live, so it matches on
+        # the first SCAN batch (~2ms); celery* is the rare fallback (the prefix held 0 keys here).
+        celery_alive = _scan_exists(r, "_kombu*") or _scan_exists(r, "celery*")
+        svc["celery_worker"] = {"status": "ok" if celery_alive else "degraded"}
     except Exception:
         svc["celery_worker"] = {"status": "degraded"}
 
@@ -2637,15 +3788,30 @@ async def ws_dashboard(websocket: WebSocket):
         pubsub.subscribe(*channels)
 
         while True:
-            message = pubsub.get_message(ignore_subscribe_messages=True, timeout=1.0)
-            if message and message.get("data"):
-                try:
-                    await websocket.send_text(json.dumps({
-                        "channel": message["channel"],
-                        "data": message["data"],
-                    }))
-                except Exception:
+            # cont.78 — NON-BLOCKING drain. The old get_message(timeout=1.0) was a
+            # SYNCHRONOUS blocking call running on the single uvicorn event loop: with
+            # any dashboard tab open it froze the whole worker up to 1s per tick,
+            # starving ALL HTTP requests — dashboard panels lagged AND POST /bot/stop
+            # queued behind it (the "Stop button doesn't stop the bot" symptom).
+            # timeout=0.0 polls without blocking; we drain everything pending each
+            # tick, then yield to the loop with asyncio.sleep so HTTP requests run.
+            _disconnected = False
+            while True:
+                message = pubsub.get_message(
+                    ignore_subscribe_messages=True, timeout=0.0)
+                if not message:
                     break
+                if message.get("data"):
+                    try:
+                        await websocket.send_text(json.dumps({
+                            "channel": message["channel"],
+                            "data": message["data"],
+                        }))
+                    except Exception:
+                        _disconnected = True
+                        break
+            if _disconnected:
+                break
             await asyncio.sleep(0.05)
 
     except WebSocketDisconnect:

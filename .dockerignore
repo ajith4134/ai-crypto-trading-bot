@@ -1,0 +1,19 @@
+# Build-context excludes — keep the 3.6 GB repo from being shipped to the daemon +
+# chown -R'd on every build. ONLY paths that are never needed inside the image are
+# listed here (caches, vcs, logs, build artifacts). The big win — data/historical
+# (2.3 GB) — is NOT excluded yet: it is bind-mounted on only 5 of 14 services, so
+# removing it from the image could break a service that reads /app/data/historical
+# without mounting it. Verify that before adding `data/historical/` here.
+.git
+.gitignore
+**/__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.log
+node_modules/
+frontend/node_modules/
+.env.bak*
+.codegraph/

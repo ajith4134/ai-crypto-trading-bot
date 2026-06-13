@@ -4,9 +4,80 @@ import { getOpenTradesFull } from '../api';
 import { WsContext } from '../context';
 import { card, title, Table } from './shared';
 
+const statusColor: Record<string, string> = {
+  applied: '#00ff88',
+  gate_applied: '#00d4ff',
+  suppressed: '#ff9966',
+  abstained: '#777',
+  advised: '#d6a6ff',
+  counterfactual_only: '#ffaa00',
+  unavailable: '#555',
+};
+
+const InfluenceCell: React.FC<{trade:any}> = ({trade}) => {
+  const manifest = trade.influence_manifest || trade.signals_at_entry?.influence_manifest;
+  const postOpen = Array.isArray(trade.post_open_influences) ? trade.post_open_influences : [];
+  const influences = [...(manifest?.influences || []), ...postOpen];
+  const summary = manifest?.summary || {};
+  const audit = trade.trade_audit || trade.signals_at_entry?.audit;
+  const rec = trade.trade_recommendation || trade.signals_at_entry?.recommendation;
+  if (!manifest && !audit && !rec && postOpen.length === 0) {
+    return <span style={{color:'#555'}}>not captured</span>;
+  }
+  const applied = +(summary.applied || 0) + +(summary.gate_applied || 0);
+  const nonCausal = +(summary.suppressed || 0) + +(summary.abstained || 0)
+    + +(summary.advised || 0) + +(summary.counterfactual_only || 0) + postOpen.length;
+  return (
+    <details style={{minWidth:180,maxWidth:360,fontFamily:'monospace',fontSize:9}}>
+      <summary style={{cursor:'pointer',color:'#ccc'}}>
+        <span style={{color:'#00ff88'}}>{applied} applied</span>
+        {' · '}
+        <span style={{color:'#ffaa00'}}>{nonCausal} visible/non-causal</span>
+        {manifest?.provenance_quality === 'partial_historical_snapshot'
+          && <span style={{color:'#ff9966'}}> · partial history</span>}
+      </summary>
+      <div style={{marginTop:5,maxHeight:230,overflowY:'auto'}}>
+        {Array.isArray(manifest?.limitations) && manifest.limitations.map((item:string, idx:number) =>
+          <div key={`limitation-${idx}`} style={{color:'#ff9966',paddingBottom:3}}>limit: {item}</div>
+        )}
+        {influences.map((inf:any, idx:number) => {
+          const status = inf.status || 'unavailable';
+          const raw = inf.raw_vote ?? inf.score;
+          const effect = inf.actual_effect;
+          return (
+            <div key={`${inf.source || 'influence'}-${idx}`}
+              style={{borderTop:'1px solid #222',padding:'4px 0',lineHeight:1.35}}>
+              <b style={{color:statusColor[status] || '#aaa'}}>{inf.source || 'unknown'}</b>
+              {' '}
+              <span style={{color:statusColor[status] || '#888'}}>{status}</span>
+              {' · '}
+              <span style={{color:'#888'}}>{inf.authority || 'observe'}</span>
+              {raw != null && <span style={{color:'#bbb'}}> · raw {typeof raw === 'number' ? raw.toFixed(3) : raw}</span>}
+              {inf.router_gain != null && <span style={{color:'#bbb'}}> · gain {(+inf.router_gain).toFixed(3)}</span>}
+              {effect != null && effect !== 0 && <div style={{color:'#aaa'}}>effect: {String(effect)}</div>}
+              {(inf.explanation || inf.reason) && <div style={{color:'#777'}}>{inf.explanation || inf.reason}</div>}
+            </div>
+          );
+        })}
+        {audit && (
+          <div style={{borderTop:'1px solid #333',paddingTop:4,color:'#bbb'}}>
+            audit: {audit.agrees_with_fusion ? 'agrees' : 'disagrees'}
+            {' · '}wrong-dir {audit.wrong_direction_risk ?? 'n/a'}
+          </div>
+        )}
+        {rec && (
+          <div style={{color:'#d6a6ff'}}>
+            advise: {rec.recommended_action || 'HOLD'}{rec.applied ? ' (applied)' : ' (not applied)'}
+          </div>
+        )}
+      </div>
+    </details>
+  );
+};
+
 const OpenTradesTable: React.FC = () => {
   const [trades, setTrades] = useState<any[]>([]);
-  const [sort, setSort] = useState<string>('entry_time');
+  const [sort] = useState<string>('entry_time');
   const evt = useContext(WsContext);
 
   const [totalPnl, setTotalPnl] = useState(0);
@@ -32,6 +103,7 @@ const OpenTradesTable: React.FC = () => {
       : t.pair),
     t.direction?.toUpperCase(),
     <span style={{color:stratName === '—' ? '#555' : '#aa88ff', fontSize:10, fontFamily:'monospace'}}>{stratName}</span>,
+    <InfluenceCell trade={t}/>,
     `$${(+t.entry_price||0).toLocaleString(undefined,{maximumFractionDigits:6})}`,
     `$${(+(t.average_entry||t.entry_price)||0).toLocaleString(undefined,{maximumFractionDigits:6})}`,
     <span style={{color:'#00d4ff'}}>${mark.toLocaleString(undefined,{maximumFractionDigits:6})}</span>,
@@ -133,6 +205,25 @@ const OpenTradesTable: React.FC = () => {
     t.pattern_cluster_id != null ? <span style={{color:'#aaaaff',fontFamily:'monospace',fontSize:10}}>#{t.pattern_cluster_id}</span> : <span style={{color:'#555'}}>—</span>,
     t.trade_potential_score||'—',
     t.direction_confidence||'—',
+    // Cerebellum bounded calibration adjustment (Phase-7f task-8 — first limited canary authority):
+    // base→adjusted conviction (±0.05 cap) and whether it was APPLIED to size/leverage. "off" = owner
+    // kill switch disarmed, "unearned" = head did not beat baseline OOS (both still show the would-be Δ).
+    (() => {
+      const c = t.cerebellum;
+      if (!c) return <span style={{color:'#555'}}>—</span>;
+      const d = +c.delta || 0;
+      const dcol = d > 0 ? '#00ff88' : d < 0 ? '#ff6666' : '#888';
+      const state = c.applied
+        ? <span style={{color:'#00ff88'}}>✓ applied</span>
+        : <span style={{color:'#888'}}>{c.armed===false ? 'off' : (c.earned===false ? 'unearned' : 'no')}</span>;
+      return (
+        <span style={{fontSize:10,fontFamily:'monospace'}}>
+          {(+c.base).toFixed(2)}→<span style={{color:'#00d4ff'}}>{(+c.adjusted).toFixed(2)}</span>
+          {' '}<span style={{color:dcol}}>({d>=0?'+':''}{d.toFixed(2)})</span>
+          {' '}{state}
+        </span>
+      );
+    })(),
     t.hold_hours !== undefined ? `${t.hold_hours.toFixed(1)}h` : (t.entry_time ? `${((Date.now()-new Date(t.entry_time).getTime())/3600000).toFixed(1)}h` : '—'),
     <span style={{background:'#00443a',color:'#00ff88',padding:'1px 6px',borderRadius:3,fontSize:11}}>OPEN</span>,
   ]});
@@ -145,7 +236,7 @@ const OpenTradesTable: React.FC = () => {
           Total: {totalPnl>=0?'+':''}{totalPnl.toFixed(2)} USDT
         </span>
       </div>
-      <Table cols={['Pair','Dir','Strategy','Entry','Avg Entry','Mark','PnL','Peak PnL','SL','TP1','TP2','Capital','Lev','Notional','Cap%','Regime','TF','CN-5m','CN-15m','CN-30m','CN-1h','Cluster','Potential','Conf','Hold','Status']} rows={rows} maxH={250}/>
+      <Table cols={['Pair','Dir','Strategy','Influence','Entry','Avg Entry','Mark','PnL','Peak PnL','SL','TP1','TP2','Capital','Lev','Notional','Cap%','Regime','TF','CN-5m','CN-15m','CN-30m','CN-1h','Cluster','Potential','Conf','Cerebellum','Hold','Status']} rows={rows} maxH={250}/>
     </div>
   );
 };

@@ -1,10 +1,10 @@
-# Next-Impl: Launch-Pad of 10 (pre-qualified "always open green" pool)
+# Next-Impl: Launch-Pad (50-slot on-deck buffer — expanded from 10, 2026-06-06)
 
 Status: **DISCUSSION / DATA-GATHERING ONLY — do NOT implement yet** (owner mandate, cont. 70).
 Owner restated requirement (verbatim intent):
 - After picking a trade + entry price, if it opens in loss / red candle → HOLD until green/profit;
   if it won't, REPLACE that symbol with one that opens green. Goal: every open starts favorable. Long or short.
-- Keep a SEPARATE table (distinct from active pairs) that always holds exactly **10** symbols (long/short/both).
+- Keep a SEPARATE table (distinct from active pairs) that always holds exactly **50** symbols (expanded from 10 on 2026-06-06; long/short/both).
 - When one of the 10 gets opened as a trade, its slot is refilled by the next outside symbol that opens green.
 - If all 10 are opened, refill all 10 (immediately or over time).
 - Concentrate all compute/intelligence on finding + maintaining these 10.

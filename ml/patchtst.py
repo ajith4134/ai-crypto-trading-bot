@@ -125,3 +125,74 @@ def get_longsequence_forecast(pair: str) -> dict:
     except Exception as exc:
         log.error("patchtst_forecast_failed", pair=pair, error=str(exc)[:200])
         return {}
+
+
+def get_longsequence_forecast_batch(pairs: list[str], chunk: int = 128) -> dict[str, dict]:
+    """cont. 74 — BATCHED forecast. Stacks every pair with full 256-step context into
+    one tensor and runs a SINGLE forward pass per chunk, instead of one pass per pair.
+    PatchTST (a transformer) batches the sequence dim natively, so this is ~N× faster
+    than looping get_longsequence_forecast (measured: per-pair loop = ~6s/pair → the
+    batch does hundreds of pairs in a few seconds). Writes all LONGSEQ_FORECAST keys via
+    a single Redis pipeline. Returns {pair: forecast}. Chunked to bound peak memory.
+    """
+    out: dict[str, dict] = {}
+    if not pairs or not _MODEL_PATH.exists():
+        return out
+    try:
+        from feature_governance.registry import is_active
+        if not is_active("F20"):
+            return out
+    except Exception:
+        pass
+    model = _load()
+    if model is None:
+        return out
+    import torch
+    r = redis_client.get()
+    # Gather inputs (skip pairs without full context — same contract as the single path)
+    rows = []  # (pair, anchor, current_price, normalized_closes)
+    for pair in pairs:
+        try:
+            candles_raw = r.lrange(
+                redis_keys.CANDLES.replace("{pair}", pair).replace("{interval}", "1h"),
+                0, CONTEXT_LENGTH - 1)
+            if len(candles_raw) < CONTEXT_LENGTH:
+                continue
+            closes = [float(json.loads(c)["c"]) for c in reversed(candles_raw)]
+            anchor = closes[0] if closes[0] > 0 else 1.0
+            rows.append((pair, anchor, closes[-1], [c / anchor for c in closes]))
+        except Exception:
+            continue
+    if not rows:
+        return out
+    for i in range(0, len(rows), max(1, chunk)):
+        block = rows[i:i + chunk]
+        try:
+            X = torch.tensor([b[3] for b in block], dtype=torch.float32).unsqueeze(-1)  # [B,256,1]
+            with torch.no_grad():
+                preds = model(X)  # [B, 16]
+            preds = preds.tolist()
+        except Exception as exc:
+            log.error("patchtst_batch_forward_failed", n=len(block), error=str(exc)[:200])
+            continue
+        pipe = r.pipeline()
+        for (pair, anchor, current, _), prow in zip(block, preds):
+            try:
+                final_relative = float(prow[-1])
+                predicted_final_price = final_relative * anchor
+                chg = (predicted_final_price - current) / current * 100 if current > 0 else 0.0
+                fc = {
+                    "predicted_final_price": round(predicted_final_price, 8),
+                    "predicted_change_pct": round(chg, 4),
+                    "horizon_hours": PREDICTION_LENGTH,
+                }
+                out[pair] = fc
+                pipe.set(redis_keys.LONGSEQ_FORECAST.replace("{pair}", pair),
+                         json.dumps(fc), ex=1800)
+            except Exception:
+                continue
+        try:
+            pipe.execute()
+        except Exception as exc:
+            log.warning("patchtst_batch_pipe_failed", error=str(exc)[:150])
+    return out

@@ -17,6 +17,19 @@ class LiveExecutionEngine(ExecutionEngine):
     def __init__(self, binance_client) -> None:
         self._client = binance_client
 
+    def _assert_live_trade(self, trade: dict, action: str) -> None:
+        """Never let the live engine act on a simulated trade row."""
+        if trade.get("is_paper") is True:
+            try:
+                redis_client.get().incr("safety:live_engine_paper_trade_blocked")
+            except Exception:
+                pass
+            log.error("live_engine_blocked_paper_trade",
+                      trade_id=trade.get("id"), pair=trade.get("pair"),
+                      action=action)
+            raise RuntimeError(
+                f"refusing {action}: trade {trade.get('id')} is_paper=true")
+
     def _resolve_fill_price(self, order: dict, pair: str) -> float:
         """Binance's futures_create_order response for MARKET orders often
         returns avgPrice=0 because the order is still ACK'd, not yet filled,
@@ -89,6 +102,44 @@ class LiveExecutionEngine(ExecutionEngine):
                 pass
             time.sleep(0.3)
         return 0.0
+
+    def _income_since(self, pair: str, start_ms: int):
+        """cont. 77 — sum the ACTUAL realized PnL / commission / funding (USDT) for `pair`
+        from Binance income since start_ms (the exchange is the source of truth). Used at
+        CLOSE time, when the position has just gone flat: because the position was
+        continuously open since entry, income-since-entry is EXACTLY this position's
+        realized — no double-count (unlike the delayed reconciler over a re-traded symbol).
+        Short retry: income events can lag the close fill by a moment. COMMISSION/FUNDING
+        income are returned with Binance's sign (commission is negative). Returns
+        (realized, commission, funding, available)."""
+        for _ in range(4):
+            realized = commission = funding = 0.0
+            try:
+                inc = self._client._client.futures_income_history(
+                    symbol=pair, startTime=int(start_ms), limit=500)
+                for i in inc:
+                    t = i.get("incomeType")
+                    a = float(i.get("income") or 0)
+                    if t == "REALIZED_PNL":
+                        realized += a
+                    elif t == "COMMISSION":
+                        commission += a
+                    elif t == "FUNDING_FEE":
+                        funding += a
+                if inc:
+                    return realized, commission, funding, True
+            except Exception as exc:
+                log.debug("live_income_fetch_failed", pair=pair, error=str(exc)[:120])
+            time.sleep(0.4)
+        return 0.0, 0.0, 0.0, False
+
+    def _entry_ms(self, trade: dict) -> int:
+        """Entry time of `trade` in epoch-ms (fallback: 24h ago) for income bounding."""
+        et = trade.get("entry_time")
+        try:
+            return int(et.timestamp() * 1000)
+        except Exception:
+            return int((time.time() - 24 * 3600) * 1000)
 
     def open_trade(self, params: dict) -> str:
         """N-05: Set leverage, place market order, wait for fill, write real
@@ -268,6 +319,7 @@ class LiveExecutionEngine(ExecutionEngine):
         safely on Binance instead of opening a reverse-direction position.
         """
         trade = self._get_trade(trade_id)
+        self._assert_live_trade(trade, "close_trade")
         # cont. 69/70b: cancel the resting CONDITIONAL/algo stop first so it
         # can't fire a second reduce-only order against an already-flat position.
         # The stop is an algo order (algoId), so cancel via the algo endpoint and
@@ -314,62 +366,103 @@ class LiveExecutionEngine(ExecutionEngine):
                 _already_flat = True
             else:
                 raise
-        exit_price = 0.0 if _already_flat else self._resolve_fill_price(
-            order, trade["pair"])
-        if exit_price <= 0:
-            # Position is closed on Binance but we couldn't resolve the exit
-            # price. cont. 70d — if the stop already flattened us, the fill was
-            # at ~the stop trigger (trailing_sl_level); prefer that, else fall
-            # back to current mark so PnL math doesn't break.
-            import redis_client as _rc
-            r = _rc.get()
-            _sl_lvl = float(trade.get("trailing_sl_level") or 0)
-            if _already_flat and _sl_lvl > 0:
-                exit_price = _sl_lvl
-            else:
-                exit_price = float(r.get(redis_keys.MARK_PRICE.replace("{pair}", trade["pair"])) or 0)
-            log.warning("live_close_fill_price_fallback",
-                        trade_id=trade_id, exit_price=exit_price,
-                        already_flat=_already_flat,
-                        order_id=order.get("orderId"))
-        # cont. 70c — real fees = ENTRY commission (stashed at open) + EXIT
-        # commission (fetched from the close order's fills). The ACK response
-        # carries commission=0, which is why live trades recorded fees_usdt=0.
-        _exit_fee = self._resolve_order_commission(order, trade["pair"])
-        try:
-            _entry_fee = float(
-                redis_client.get().get(f"trade:{trade_id}:entry_fee_usdt") or 0)
-        except (TypeError, ValueError):
-            _entry_fee = 0.0
-        fees = _exit_fee + _entry_fee
-
         entry = float(trade["average_entry"] or trade["entry_price"])
         qty = float(trade["quantity"])
         direction_sign = 1.0 if trade["direction"] == "long" else -1.0
-        final_pnl = (exit_price - entry) * qty * direction_sign
-        net_pnl = final_pnl - fees
+        exit_price = 0.0 if _already_flat else self._resolve_fill_price(
+            order, trade["pair"])
 
-        # F48 §Idea B — aggregate any prior partial-close PnL into the
-        # recorded final/net (same pattern as execution/paper.py).
-        try:
-            _r_tmp = redis_client.get()
-            partial_pnl_acc = float(_r_tmp.get(f"trade:{trade_id}:partial_pnl_usdt") or 0)
-            partial_fees_acc = float(_r_tmp.get(f"trade:{trade_id}:partial_fees_usdt") or 0)
-            if abs(partial_pnl_acc) > 0 or abs(partial_fees_acc) > 0:
-                final_pnl = final_pnl + (partial_pnl_acc + partial_fees_acc)
-                fees     = fees + partial_fees_acc
-                net_pnl  = net_pnl + partial_pnl_acc
-                log.info("live_trade_close_with_partials",
-                         trade_id=trade_id,
-                         partial_net=round(partial_pnl_acc, 4),
-                         partial_fees=round(partial_fees_acc, 4))
-                _r_tmp.delete(f"trade:{trade_id}:partial_pnl_usdt",
-                              f"trade:{trade_id}:partial_fees_usdt",
-                              f"trade:{trade_id}:partial_count",
-                              f"trade:{trade_id}:tp1_fired",
-                              f"trade:{trade_id}:tp_fired")
-        except Exception:
-            pass
+        # cont. 77 — DRIFT FIX. When the exchange-native stop already flattened us (or the
+        # fill price can't be resolved), the OLD path booked exit_price = the stop TRIGGER
+        # (optimistic vs the worse real fill) and fees = entry-side only (the empty close
+        # order carries no commission) → the DB systematically OVER-stated PnL vs Binance.
+        # Book the ACTUAL realized + commission + funding from Binance income instead (the
+        # exchange is the source of truth; the position just went flat after being open
+        # since entry, so income-since-entry is exactly this trade's — no double-count,
+        # unlike the delayed reconciler over a re-traded symbol). Income already includes
+        # any partial-close realized, so we skip the redis partial accumulators below.
+        _income_used = False
+        if _already_flat or exit_price <= 0:
+            realized, commission, funding, _avail = self._income_since(
+                trade["pair"], self._entry_ms(trade))
+            if _avail and (realized != 0.0 or commission != 0.0):
+                final_pnl = realized
+                fees = abs(commission)
+                net_pnl = realized + commission + funding
+                exit_price = (entry + direction_sign * realized / qty) if qty > 0 else entry
+                _income_used = True
+                try:
+                    redis_client.get().delete(
+                        f"trade:{trade_id}:partial_pnl_usdt",
+                        f"trade:{trade_id}:partial_fees_usdt",
+                        f"trade:{trade_id}:partial_count",
+                        f"trade:{trade_id}:tp1_fired",
+                        f"trade:{trade_id}:tp_fired")
+                except Exception:
+                    pass
+                log.info("live_close_booked_from_income", trade_id=trade_id,
+                         pair=trade["pair"], realized=round(realized, 4),
+                         commission=round(commission, 4), funding=round(funding, 4))
+            else:
+                # income not posted yet → last-resort estimate (the old behavior)
+                import redis_client as _rc
+                r = _rc.get()
+                _sl_lvl = float(trade.get("trailing_sl_level") or 0)
+                if _already_flat and _sl_lvl > 0:
+                    exit_price = _sl_lvl
+                else:
+                    exit_price = float(r.get(redis_keys.MARK_PRICE.replace("{pair}", trade["pair"])) or 0)
+                log.warning("live_close_fill_price_fallback",
+                            trade_id=trade_id, exit_price=exit_price,
+                            already_flat=_already_flat,
+                            order_id=order.get("orderId"))
+
+        if not _income_used:
+            # cont. 70c — real fees = ENTRY commission (stashed at open) + EXIT commission
+            # (from the close order's fills). cont. 77 — if the entry-fee stash is missing,
+            # the fee would be exit-only (~half the round-trip), so fall back to the ACTUAL
+            # total commission from Binance income.
+            _exit_fee = self._resolve_order_commission(order, trade["pair"])
+            try:
+                _entry_fee = float(
+                    redis_client.get().get(f"trade:{trade_id}:entry_fee_usdt") or 0)
+            except (TypeError, ValueError):
+                _entry_fee = 0.0
+            if _entry_fee <= 0.0:
+                _, _comm_inc, _, _avail = self._income_since(
+                    trade["pair"], self._entry_ms(trade))
+                fees = abs(_comm_inc) if (_avail and abs(_comm_inc) > _exit_fee) else _exit_fee
+            else:
+                fees = _exit_fee + _entry_fee
+            final_pnl = (exit_price - entry) * qty * direction_sign
+            net_pnl = final_pnl - fees
+
+        # F48 §Idea B — aggregate any prior partial-close PnL into the recorded final/net
+        # (same pattern as execution/paper.py). SKIP when income was used: Binance income
+        # already includes every partial-close realized, so re-adding would double-count.
+        # cont. 77 — explicit guard (was: `raise _SkipPartials()` into a bare
+        # except, which only worked because the undefined name threw NameError —
+        # accidental control flow that breaks the moment the except is narrowed).
+        if not _income_used:
+            try:
+                _r_tmp = redis_client.get()
+                partial_pnl_acc = float(_r_tmp.get(f"trade:{trade_id}:partial_pnl_usdt") or 0)
+                partial_fees_acc = float(_r_tmp.get(f"trade:{trade_id}:partial_fees_usdt") or 0)
+                if abs(partial_pnl_acc) > 0 or abs(partial_fees_acc) > 0:
+                    final_pnl = final_pnl + (partial_pnl_acc + partial_fees_acc)
+                    fees     = fees + partial_fees_acc
+                    net_pnl  = net_pnl + partial_pnl_acc
+                    log.info("live_trade_close_with_partials",
+                             trade_id=trade_id,
+                             partial_net=round(partial_pnl_acc, 4),
+                             partial_fees=round(partial_fees_acc, 4))
+                    _r_tmp.delete(f"trade:{trade_id}:partial_pnl_usdt",
+                                  f"trade:{trade_id}:partial_fees_usdt",
+                                  f"trade:{trade_id}:partial_count",
+                                  f"trade:{trade_id}:tp1_fired",
+                                  f"trade:{trade_id}:tp_fired")
+            except Exception:
+                pass
 
         now = datetime.now(timezone.utc)
         entry_time = trade.get("entry_time") or now
@@ -517,6 +610,7 @@ class LiveExecutionEngine(ExecutionEngine):
         pass force=False (default).
         """
         trade = self._get_trade(trade_id)
+        self._assert_live_trade(trade, "modify_sl")
         current_sl = float(trade.get("trailing_sl_level") or 0)
         direction = trade["direction"]
 
@@ -564,6 +658,7 @@ class LiveExecutionEngine(ExecutionEngine):
     def add_dca(self, trade_id: str, round_number: int) -> None:
         """N-08: Place additional market order; update average_entry."""
         trade = self._get_trade(trade_id)
+        self._assert_live_trade(trade, "add_dca")
         dca_qty = float(trade["quantity"]) * 0.5
 
         order = self._client.place_market_order(
@@ -612,6 +707,7 @@ class LiveExecutionEngine(ExecutionEngine):
         aggregate.
         """
         trade = self._get_trade(trade_id)
+        self._assert_live_trade(trade, "close_partial")
         full_qty = float(trade["quantity"])
         qty_close = min(float(qty_to_close), full_qty)
         if qty_close <= 0:

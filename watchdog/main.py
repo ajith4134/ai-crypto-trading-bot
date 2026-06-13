@@ -119,6 +119,7 @@ def _apply_mode_change(payload: dict) -> dict:
     import redis_keys as _rk
     r = _rc.get()
     result: dict = {"steps": []}
+    previous_running = str(payload.get("previous_running") or "0")
 
     # Sanity — bot stopped
     if r.get("bot:running") == "1":
@@ -190,36 +191,94 @@ def _apply_mode_change(payload: dict) -> dict:
         # current) compose. Naming only the 3 services + current compose also stops
         # the accidental redis/ollama recreation seen before.
         cmd = ["docker", "compose",
+               "--env-file", "/app/.env",
                "--project-directory", "/opt/trading-bot",
                "-f", "/app/docker-compose.yml",
                "-p", "trading-bot",
                "up", "-d", "--force-recreate",
                "brain", "celery_worker", "data_feed"]
-        proc = subprocess.run(cmd, cwd="/app",
+        # cont. 77 FIX — docker compose interpolates ${TRADING_MODE} in the brain/celery/data_feed
+        # `environment:` blocks from the PROCESS env FIRST, and only then from --env-file. The watchdog
+        # loaded TRADING_MODE at ITS OWN startup, so a stale value (e.g. paper) SHADOWS the freshly
+        # rewritten /app/.env (live) → the recreated brain came up on the OLD mode and the switch failed
+        # verification (container_env_verified=False). Inject the TARGET values into the subprocess env
+        # so interpolation resolves to the mode we're switching TO, regardless of the watchdog's own
+        # stale env or the file. (Belt-and-suspenders with --env-file.)
+        sub_env = dict(os.environ)
+        sub_env["TRADING_MODE"] = str(target_trading)
+        sub_env["BINANCE_TESTNET"] = str(target_testnet)
+        proc = subprocess.run(cmd, cwd="/app", env=sub_env,
                               capture_output=True, text=True, timeout=120)
         if proc.returncode == 0:
             result["steps"].append("recreated_brain_celery_data_feed")
         else:
-            # Fallback: do soft restart of each via docker-py — won't pick up
-            # env changes, but better than nothing.
             log.error("compose_recreate_failed",
                       stderr=proc.stderr[:300],
                       stdout=proc.stdout[:300])
-            import docker as docker_sdk
-            client = docker_sdk.from_env()
-            for svc in ("brain", "celery_worker", "data_feed"):
-                try:
-                    conts = client.containers.list(
-                        all=True, filters={"name": f"trading-bot-{svc}-1"})
-                    if conts:
-                        conts[0].restart()
-                        result["steps"].append(f"fallback_restart_{svc}")
-                except Exception as exc:
-                    result["steps"].append(
-                        f"fallback_restart_{svc}_failed: {str(exc)[:120]}")
+            # cont. 78 FIX — the old fallback used container.restart(), which KEEPS the old env
+            # (env_file vars load at CREATE time, not restart), so the brain came up in the WRONG mode
+            # and the switch was left half-applied (live-but-halted, mislabel-halt loop). The usual
+            # recreate failure is a DANGLING ORPHAN: a prior interrupted recreate leaves a hash-renamed
+            # "<id>_trading-bot-<svc>-1" holding the name → compose errors with "Conflict. The container
+            # name is already in use". So: force-remove those orphans (and the live container) and RETRY
+            # the recreate — never a bare restart — so the fallback ALSO lands the target env.
+            try:
+                import docker as docker_sdk
+                client = docker_sdk.from_env()
+                for svc in ("brain", "celery_worker", "data_feed"):
+                    nm = f"trading-bot-{svc}-1"
+                    for c in client.containers.list(all=True):
+                        if c.name == nm or c.name.endswith(f"_{nm}"):
+                            try:
+                                c.remove(force=True)
+                                result["steps"].append(f"removed_container_{c.name}")
+                            except Exception as exc:
+                                result["steps"].append(f"rm_{svc}_failed: {str(exc)[:100]}")
+                retry = subprocess.run(cmd, cwd="/app", env=sub_env,
+                                       capture_output=True, text=True, timeout=150)
+                if retry.returncode == 0:
+                    result["steps"].append("recreate_retry_succeeded")
+                else:
+                    log.error("compose_recreate_retry_failed", stderr=retry.stderr[:300])
+                    result["steps"].append(f"recreate_retry_failed: {retry.stderr[:160]}")
+            except Exception as exc:
+                result["steps"].append(f"recreate_fallback_failed: {str(exc)[:120]}")
     except Exception as exc:
         result["error"] = f"recreate_failed: {str(exc)[:200]}"
         return result
+
+    # 2b) Verify the recreated money-routing containers really have the target
+    # env. A plain Docker restart keeps the old env; that was the live button
+    # failure mode. Do not report success unless the running containers agree.
+    result["container_env_verified"] = False
+    try:
+        env_verified = True
+        import subprocess
+        for svc in ("brain", "celery_worker", "data_feed"):
+            name = f"trading-bot-{svc}-1"
+            proc = subprocess.run(
+                ["docker", "inspect", name,
+                 "--format", "{{range .Config.Env}}{{println .}}{{end}}"],
+                cwd="/app", capture_output=True, text=True, timeout=30)
+            if proc.returncode != 0:
+                env_verified = False
+                result["steps"].append(f"inspect_failed_{svc}: {proc.stderr[:120]}")
+                continue
+            env_lines = set(proc.stdout.splitlines())
+            expected_mode = f"TRADING_MODE={target_trading}"
+            expected_testnet = f"BINANCE_TESTNET={target_testnet}"
+            if expected_mode not in env_lines or expected_testnet not in env_lines:
+                env_verified = False
+                log.warning("mode_change_env_mismatch",
+                            service=svc, expected_mode=expected_mode,
+                            expected_testnet=expected_testnet)
+                result["steps"].append(f"{svc}_env={proc.stdout[:300]}")
+        result["container_env_verified"] = env_verified
+        if env_verified:
+            result["steps"].append("container_env_verified")
+    except Exception as exc:
+        result["steps"].append(f"env_verify_failed: {str(exc)[:200]}")
+        log.warning("mode_change_env_verify_failed", error=str(exc)[:200])
 
     # 3) Wait for brain health (poll its /health, max 60s)
     waited = 0
@@ -236,6 +295,28 @@ def _apply_mode_change(payload: dict) -> dict:
             continue
     else:
         result["steps"].append("brain_health_timeout")
+        log.warning("mode_change_brain_health_timeout", target=target_trading)
+
+    # The process may be healthy enough to answer HTTP before MasterBrain has
+    # selected its execution engine. Verify the published runtime route too.
+    actual_mode = r.get("bot:actual_trading_mode")
+    actual_engine = r.get("bot:actual_engine")
+    expected_engine = (
+        "LiveExecutionEngine" if target_trading == "live"
+        else "PaperExecutionEngine")
+    if actual_mode != target_trading or actual_engine != expected_engine:
+        result["runtime_engine_verified"] = False
+        result["steps"].append(
+            f"runtime_mode_mismatch: expected {target_trading}/"
+            f"{expected_engine}, got {actual_mode}/{actual_engine}")
+        log.warning("mode_change_runtime_mismatch",
+                    expected_mode=target_trading,
+                    expected_engine=expected_engine,
+                    actual_mode=actual_mode,
+                    actual_engine=actual_engine)
+    else:
+        result["runtime_engine_verified"] = True
+        result["steps"].append("runtime_engine_verified")
 
     # 4) Initialise virtual_balance via the CORRECT redis key
     starting_capital = payload.get("starting_capital")
@@ -247,20 +328,50 @@ def _apply_mode_change(payload: dict) -> dict:
         except Exception as exc:
             result["steps"].append(f"vb_set_failed: {str(exc)[:120]}")
 
-    # 5) Mark complete
+    # cont. 76 — a paper↔live switch is "complete" ONLY when the running
+    # money-routing containers truly hold the target env AND the brain's live
+    # runtime engine matches. Otherwise the .env was rewritten but a stale
+    # process is still routing on the OLD engine (the exact failure that left a
+    # 'live' engine running while the UI said paper). Report it honestly as
+    # FAILED and keep the bot parked — never resume trading on an unverified
+    # (possibly real-money) engine.
+    money_ok = bool(result.get("container_env_verified")
+                    and result.get("runtime_engine_verified"))
+    result["money_routing_ok"] = money_ok
+
+    if previous_running == "1" and money_ok:
+        r.set("bot:running", "1")
+        result["steps"].append("bot_running_restored")
+    else:
+        r.set("bot:running", "0")
+        if previous_running == "1" and not money_ok:
+            result["steps"].append("bot_left_stopped_switch_unverified")
+
+    # 5) Mark complete / failed honestly
     import json as _j
+    status = "complete" if money_ok else "failed"
     result["completed_at"] = int(_t.time())
-    r.set("bot:mode_change_status", "complete")
+    r.set("bot:mode_change_status", status)
     r.set("bot:mode_change_result", _j.dumps(result))
     r.delete("bot:mode_change_pending")
 
-    log.warning("mode_change_complete", **{k: v for k, v in result.items()
+    log.warning(f"mode_change_{status}", **{k: v for k, v in result.items()
                                             if k != "steps"})
     try:
         from notifications.telegram import send_critical
-        send_critical(
-            f"Mode switch complete → {payload.get('target')}.\n"
-            f"Brain restarted, virtual_balance set to {starting_capital}.")
+        if money_ok:
+            send_critical(
+                f"Mode switch complete → {payload.get('target')}.\n"
+                f"Brain recreated on the {target_trading} engine; "
+                f"virtual_balance set to {starting_capital}.")
+        else:
+            send_critical(
+                f"⚠️ Mode switch FAILED → {payload.get('target')}.\n"
+                f"Containers did NOT verify on the target engine "
+                f"(env_ok={result.get('container_env_verified')}, "
+                f"runtime_ok={result.get('runtime_engine_verified')}). "
+                f"Bot left STOPPED. Manual reconciliation required — do not "
+                f"start trading until resolved.")
     except Exception:
         pass
     return result

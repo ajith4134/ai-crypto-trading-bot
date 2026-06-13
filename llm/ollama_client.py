@@ -31,7 +31,8 @@ _DEFAULT_TIMEOUT_S = 300
 def chat_ollama(prompt: str,
                 model: str | None = None,
                 max_tokens: int = 512,
-                timeout_s: int | None = None) -> str:
+                timeout_s: int | None = None,
+                keep_alive: str = "10m") -> str:
     """Synchronous Ollama chat call. Returns the raw model text.
 
     Raises RuntimeError on transport/HTTP failure — caller handles by
@@ -39,7 +40,10 @@ def chat_ollama(prompt: str,
 
     `model` defaults to `OLLAMA_RESEARCH_MODEL` env (mistral:7b by default).
     Pass `model="phi3:mini"` for faster, less capable inference (e.g.
-    decoder classifications)."""
+    decoder classifications).
+    `keep_alive` controls how long Ollama keeps the model resident after the
+    call (default "10m"; pass e.g. "30m" to keep a heavy model warm between
+    infrequent calls, or "0" to unload immediately)."""
     mdl = model or _DEFAULT_MODEL
     # Cap token budget to keep generation under the Ollama request window.
     # Tasks that legitimately need >384 tokens should split the call.
@@ -54,9 +58,9 @@ def chat_ollama(prompt: str,
                 "stream": False,
                 "options": {"num_predict": num_predict,
                             "temperature": 0.7},
-                # keep_alive=10m so the model stays warm across calls and
-                # we don't pay the 18s cold-start penalty repeatedly.
-                "keep_alive": "10m",
+                # keep the model warm across calls so we don't pay the cold-start
+                # penalty repeatedly (caller-tunable for heavy/infrequent models).
+                "keep_alive": keep_alive,
             },
             timeout=timeout_s or _DEFAULT_TIMEOUT_S,
         )

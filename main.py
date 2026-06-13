@@ -129,10 +129,9 @@ async def _main() -> None:
     _startup_checks()
 
     from brain.soar import MasterBrain
-    from execution.factory import get_engine
     from risk.manager import monitor_trailing_sl
     brain = MasterBrain()
-    engine = get_engine()
+    engine = brain.engine
 
     # AJ-03: Graceful shutdown
     loop = asyncio.get_running_loop()

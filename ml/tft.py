@@ -97,3 +97,61 @@ def get_price_forecast(pair: str, timeframe: str) -> dict:
     except Exception as exc:
         log.error("tft_forecast_failed", pair=pair, error=str(exc))
         return {}
+
+
+def get_price_forecast_batch(pairs: list[str], timeframe: str,
+                             context: int = 100, chunk: int = 128) -> dict[str, dict]:
+    """cont. 74 — BATCHED quantile forecast. One forward pass per chunk over all pairs
+    that have `context` candles for this timeframe, instead of one pass per pair. Uses a
+    UNIFORM context length (last `context` closes) so the sequences stack; thinner pairs
+    are skipped here and still served lazily by get_price_forecast. Writes all
+    PRICE_FORECAST keys via one Redis pipeline. Returns {pair: {q10,q50,q90}}."""
+    out: dict[str, dict] = {}
+    if not pairs or not _MODEL_PATH.exists():
+        return out
+    model = _load()
+    if model is None:
+        return out
+    import torch
+    r = redis_client.get()
+    rows = []  # (pair, anchor, normalized_closes)
+    for pair in pairs:
+        try:
+            candles_raw = r.lrange(
+                redis_keys.CANDLES.replace("{pair}", pair).replace("{interval}", timeframe),
+                0, context - 1)
+            if len(candles_raw) < context:
+                continue
+            closes = [float(json.loads(c)["c"]) for c in reversed(candles_raw)]
+            anchor = closes[0] if closes[0] > 0 else 1.0
+            rows.append((pair, anchor, [c / anchor for c in closes]))
+        except Exception:
+            continue
+    if not rows:
+        return out
+    for i in range(0, len(rows), max(1, chunk)):
+        block = rows[i:i + chunk]
+        try:
+            X = torch.tensor([b[2] for b in block], dtype=torch.float32).unsqueeze(-1)  # [B,ctx,1]
+            with torch.no_grad():
+                o = model(X)  # [B, 3] quantiles
+            o = o.tolist()
+        except Exception as exc:
+            log.error("tft_batch_forward_failed", tf=timeframe, n=len(block), error=str(exc)[:200])
+            continue
+        pipe = r.pipeline()
+        for (pair, anchor, _), q in zip(block, o):
+            try:
+                fc = {"q10": float(q[0]) * anchor,
+                      "q50": float(q[1]) * anchor,
+                      "q90": float(q[2]) * anchor}
+                out[pair] = fc
+                pipe.set(redis_keys.PRICE_FORECAST.replace("{pair}", pair).replace("{interval}", timeframe),
+                         json.dumps(fc), ex=1800)
+            except Exception:
+                continue
+        try:
+            pipe.execute()
+        except Exception as exc:
+            log.warning("tft_batch_pipe_failed", tf=timeframe, error=str(exc)[:150])
+    return out

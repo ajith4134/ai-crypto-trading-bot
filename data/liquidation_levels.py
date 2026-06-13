@@ -66,6 +66,14 @@ _DOMINANCE_RATIO = 2.0         # one side ≥2× the other
 _DEADLOCK_MIN_CALLS = 30
 _DEADLOCK_REJECT_FRAC = 0.85
 
+# Majors that get the real Coinalyze liquidation feed (free tier ~ a few req/cycle
+# before 429). All other pairs fall through to the funding/ATR proxy. Tunable via
+# Redis set `liq:coinalyze_pairs` (overrides this default when present).
+_COINALYZE_PAIRS = {
+    "BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT",
+    "DOGEUSDT", "ADAUSDT", "AVAXUSDT", "LINKUSDT", "SUIUSDT",
+}
+
 
 def _r():
     return redis_client.get()
@@ -83,9 +91,13 @@ def is_disabled() -> bool:
     return False
 
 
-def _bump_call(): _r().incr("liq:call_count")
+# NOTE: provider-level failures (Coinalyze 429/404, Coinglass) are NON-FATAL —
+# the proxy backstops every pair. So they record ONLY per-reason telemetry, they
+# do NOT feed the deadlock numerator (`liq:reject_count`). The deadlock now tracks
+# refresh_one OUTCOMES (see refresh_one): it fires only if the PRODUCER genuinely
+# cannot produce for ≥85% of pairs via ANY source — not when an optional provider
+# is rate-limited. This was the self-perpetuating disable bug (cont. 73).
 def _bump_reject(reason: str):
-    _r().incr("liq:reject_count")
     _r().incr(f"liq:reject:{reason}")
 
 
@@ -99,7 +111,6 @@ def _fetch_coinglass(pair: str) -> list[dict] | None:
     url = (f"https://open-api-v3.coinglass.com/public/v2/liquidation_chart"
            f"?symbol={sym}&time_type=h12")
     try:
-        _bump_call()
         resp = requests.get(url, headers={"coinglassSecret": _COINGLASS_KEY},
                             timeout=_PROVIDER_TIMEOUT_S)
         if resp.status_code != 200:
@@ -122,32 +133,90 @@ def _fetch_coinglass(pair: str) -> list[dict] | None:
         return None
 
 
-def _fetch_coinalyze(pair: str) -> list[dict] | None:
-    """Coinalyze liquidation aggregator. Has a free tier; simpler endpoint."""
-    if not _COINALYZE_KEY: return None
-    url = (f"https://api.coinalyze.net/v1/liquidations?symbols={pair}.A"
-           f"&interval=1hour&from={int(time.time()) - 86400}"
-           f"&to={int(time.time())}")
+def _fetch_coinalyze(pair: str, current_price: float) -> list[dict] | None:
+    """Coinalyze liquidation aggregator (free tier).
+
+    Correct endpoint is `/v1/liquidation-history` (the old `/v1/liquidations`
+    path 404s). Symbol format is `{BASE}USDT_PERP.A` (.A = Binance perp). The
+    response is TIME-bucketed long/short liquidation AMOUNTS, not a price
+    heatmap: each bucket has `l` (long liqs) and `s` (short liqs) in USD.
+
+    Long positions liquidate BELOW the current price; shorts liquidate ABOVE.
+    So we synthesise two directional price clusters from the recent (24h)
+    liquidation totals, weighting each side by its realised liquidation volume.
+    This is real exchange data (more accurate than the funding-only proxy)."""
+    if not _COINALYZE_KEY or current_price <= 0:
+        return None
+    # Coinalyze free tier rate-limits hard (HTTP 429 above a few req/cycle). With
+    # 300 active pairs, calling it for every pair both wastes the quota AND drives
+    # reject_frac toward the deadlock threshold. So only call it for a small
+    # whitelist of high-volume majors (matches the coinglass "highest-weight
+    # pairs only" note); everything else uses the proxy directly (no call/reject).
+    _wl = _COINALYZE_PAIRS
     try:
-        _bump_call()
+        _ovrd = _r().smembers("liq:coinalyze_pairs")
+        if _ovrd:
+            _wl = {m.decode() if isinstance(m, bytes) else m for m in _ovrd}
+    except Exception:
+        pass
+    if pair not in _wl:
+        return None
+    base = pair[:-4] if pair.endswith("USDT") else pair
+    symbol = f"{base}USDT_PERP.A"
+    now = int(time.time())
+    url = (f"https://api.coinalyze.net/v1/liquidation-history?symbols={symbol}"
+           f"&interval=1hour&from={now - 86400}&to={now}")
+    try:
         resp = requests.get(url, headers={"api_key": _COINALYZE_KEY},
                             timeout=_PROVIDER_TIMEOUT_S)
         if resp.status_code != 200:
             _bump_reject(f"coinalyze_http_{resp.status_code}")
             return None
         payload = resp.json()
-        entries = payload[0].get("history", []) if isinstance(payload, list) and payload else []
+        history = payload[0].get("history", []) if isinstance(payload, list) and payload else []
+        if not history:
+            _bump_reject("coinalyze_empty")
+            return None
+        long_liq = sum(float(e.get("l", 0) or 0) for e in history)   # liquidated below price
+        short_liq = sum(float(e.get("s", 0) or 0) for e in history)  # liquidated above price
+        if long_liq <= 0 and short_liq <= 0:
+            _bump_reject("coinalyze_zero")
+            return None
+        # Cluster band: typical liquidation distance ~ 1m ATR×3, floored at 1%.
+        band = _atr_band(pair, current_price)
         clusters = []
-        for e in entries:
-            price = float(e.get("h", 0))   # h = high during the bucket
-            notional = float(e.get("l", 0)) + float(e.get("s", 0))
-            if price > 0 and notional > 0:
-                clusters.append({"price": price, "notional": notional})
+        if short_liq > 0:
+            clusters.append({"price": current_price + band, "notional": short_liq})
+        if long_liq > 0:
+            clusters.append({"price": current_price - band, "notional": long_liq})
         return clusters or None
     except Exception as exc:
         _bump_reject("coinalyze_transport")
         log.debug("coinalyze_fetch_fail", pair=pair, err=str(exc)[:120])
         return None
+
+
+def _atr_band(pair: str, current_price: float) -> float:
+    """Price band for synthetic liquidation clusters: 3× mean 1m range over the
+    last 20 candles, floored at 1% of price. Shared by Coinalyze + proxy."""
+    r = _r()
+    candles_raw = r.lrange(
+        redis_keys.CANDLES.replace("{pair}", pair).replace("{interval}", "1m"),
+        0, 19)
+    atr = 0.0
+    if candles_raw:
+        try:
+            ranges = []
+            for c in candles_raw:
+                d = json.loads(c)
+                hi = float(d.get("h", 0)); lo = float(d.get("l", 0))
+                if hi > 0 and lo > 0:
+                    ranges.append(hi - lo)
+            if ranges:
+                atr = sum(ranges) / len(ranges)
+        except Exception:
+            atr = 0.0
+    return max(3.0 * atr, current_price * 0.01)
 
 
 # ---- Proxy (no API key) ----------------------------------------------------
@@ -169,25 +238,10 @@ def _fetch_proxy(pair: str, current_price: float) -> list[dict] | None:
         funding = float(fund_raw)
     except Exception:
         return None
-    # Rough ATR proxy: 1m range over last 20 candles.
-    candles_raw = r.lrange(
-        redis_keys.CANDLES.replace("{pair}", pair).replace("{interval}", "1m"),
-        0, 19)
-    if not candles_raw:
-        return None
-    try:
-        ranges = []
-        for c in candles_raw:
-            d = json.loads(c)
-            hi = float(d.get("h", 0)); lo = float(d.get("l", 0))
-            if hi > 0 and lo > 0: ranges.append(hi - lo)
-        if not ranges: return None
-        atr = sum(ranges) / len(ranges)
-    except Exception:
-        return None
     # Build two synthetic clusters: one above and one below, each at
-    # ±(3 × ATR) from current price. Notional split by funding sign.
-    band = max(3.0 * atr, current_price * 0.01)
+    # ±band from current price (3× 1m ATR, floored 1%). Notional split by
+    # funding sign.
+    band = _atr_band(pair, current_price)
     crowd_long = funding > 0     # positive funding → longs paying → crowded long
     above_notional = 1.0 if crowd_long else 0.5
     below_notional = 0.5 if crowd_long else 1.0
@@ -256,8 +310,8 @@ def refresh_one(pair: str) -> dict:
     clusters = None
     source = "none"
     for fn, name in (
-        (_fetch_coinglass, "coinglass"),
-        (_fetch_coinalyze, "coinalyze"),
+        (lambda p: _fetch_coinglass(p), "coinglass"),
+        (lambda p: _fetch_coinalyze(p, current_price), "coinalyze"),
     ):
         clusters = fn(pair)
         if clusters:
@@ -267,7 +321,12 @@ def refresh_one(pair: str) -> dict:
         clusters = _fetch_proxy(pair, current_price)
         source = "proxy" if clusters else "none"
     if not clusters:
+        # Producer-level failure (NO source incl. proxy produced) — this is what
+        # the deadlock detector tracks. A genuinely dead producer trips here for
+        # most pairs; a merely rate-limited Coinalyze does not (proxy backstops).
+        r.incr("liq:call_count"); r.incr("liq:reject_count")
         return {"ok": False, "reason": "all_sources_failed", "pair": pair}
+    r.incr("liq:call_count")  # success — counts toward deadlock denominator only
 
     summ = _summarise(clusters, current_price)
     pipe = r.pipeline(transaction=False)

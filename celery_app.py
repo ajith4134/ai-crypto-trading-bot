@@ -73,6 +73,13 @@ app.conf.task_routes = {
     "celery_app.auto_arm_prediction_gate_task": {"queue": "predict_all"},
     "celery_app.update_pattern_registry_task":  {"queue": "predict_all"},
     "celery_app.calibration_drift_check_task":  {"queue": "predict_all"},
+    # Priority 2 (cont. 74) — OI/LS/taker producer is a light 5s REST→Redis task
+    # that MUST stay fresh (its keys gate live entries in Step C). default(11k),
+    # predict_all(7k), microstructure(6k) are ALL chronically backlogged, so route
+    # it to the idle dedicated cn_train worker (0 backlog; retrains are infrequent
+    # daily/2x-week, so the 5-min beat runs promptly nearly always). Exact-name
+    # route → wins over the celery_app.* catch-all in Celery's MapRoute.
+    "celery_app.oi_ls_taker_refresh_task":     {"queue": "cn_train"},
     # cont. 65k — explicit routes (the catch-all `celery_app.*` below overrides
     # @app.task(queue=...) decorators, so these MUST be listed before it).
     # All land on the candlenet worker (has data/historical + ml + signals mounts
@@ -135,6 +142,47 @@ app.conf.beat_schedule = {
     # Blueprint F41: Self-Play vs MarS — run every 30 minutes as background task
     "self-play": {
         "task": "celery_app.run_self_play",
+        "schedule": crontab(minute="*/30"),
+    },
+    # Phase-7e: isolated SLEEP cycle (replay/consolidation-check/calibration/adversarial/homeostasis/
+    # pruning) — runs on the WORKER off the brain hot loop, single-flight + load-aware (design §3.6/§9).
+    "scibrain-sleep-cycle": {
+        "task": "celery_app.scibrain_sleep_cycle",
+        "schedule": crontab(minute="*/30"),
+    },
+    # Phase-7f: retrain the RSSM world model on rich ledger sequences + refresh planning-authority health.
+    # Heavy (~45s CPU); single-flight + load-aware. Daily at 04:10 UTC (after the 03:00/03:15 consolidation).
+    "scibrain-world-model": {
+        "task": "celery_app.scibrain_world_model_train",
+        "schedule": crontab(hour=4, minute=10),
+    },
+    # Phase-7f: reframe day/minute MARL as hierarchical controllers + measure coordination gain (shadow).
+    # Fast/deterministic; daily at 04:20 UTC (after the world-model train).
+    "scibrain-hierarchical-controllers": {
+        "task": "celery_app.scibrain_controllers_train",
+        "schedule": crontab(hour=4, minute=20),
+    },
+    # Phase-7f: offline CQL/IQL challengers + support-aware fallback (shadow). Fast; daily 04:25 UTC.
+    "scibrain-offline-rl": {
+        "task": "celery_app.scibrain_offline_rl_train",
+        "schedule": crontab(hour=4, minute=25),
+    },
+    # Phase-7f: distributional/CVaR + costs + CBF safety projection (shadow). Fast; daily 04:30 UTC.
+    "scibrain-risk-policy": {
+        "task": "celery_app.scibrain_risk_policy_train",
+        "schedule": crontab(hour=4, minute=30),
+    },
+    # Phase-7f: meta-learning on real regime/cohort tasks + protected competence (shadow). Fast; daily 04:35 UTC.
+    "scibrain-meta-learning": {
+        "task": "celery_app.scibrain_meta_learning_train",
+        "schedule": crontab(hour=4, minute=35),
+    },
+    # Phase-7f task-8: retrain the CEREBELLUM bounded residual heads (calibration/timing/slippage) on real
+    # matured trade labels + refresh OOS earns-gates and authority health. Fast (~1s, deterministic). Has the
+    # FIRST limited canary authority (owner-gated, bounded) — every 30 min so the earns-gate + applied
+    # counters stay fresh as trades close.
+    "scibrain-cerebellum": {
+        "task": "celery_app.scibrain_cerebellum_train",
         "schedule": crontab(minute="*/30"),
     },
     # Blueprint F30: Feature Governance — full 5-failure-mode check every hour
@@ -328,12 +376,25 @@ app.conf.beat_schedule = {
         "task": "celery_app.capture_pattern_embeddings",
         "schedule": crontab(minute="*"),
     },
+    # cont. 73 (Priority 1 Step 4) — refit the HDBSCAN pattern clusters from the
+    # rolling live embedding stream every 6h so pattern:cluster_id stays current
+    # as market structure drifts. Fast (~1s on 100k×28). Capture (above) feeds it.
+    "train-pattern-clusters": {
+        "task": "celery_app.train_pattern_clusters",
+        "schedule": crontab(minute=17, hour="*/6"),
+    },
     # cont. 70 — Launch-Pad maintainer: keep the 10-deep on-deck buffer full +
     # shadow-track MAE/MFE every 20 s. Shadow-only (launchpad:enabled=0) until
     # reviewed; never opens trades on its own.
+    # cont. 74 — 20s→300s. MEASURED runtime 464-622s (10+ min) per run, yet it was
+    # firing every 20s → ~30× oversubscription that permanently pinned the
+    # candlenet worker's slots and starved latency-critical prediction_refresh /
+    # microstructure_scan on the same queue. A 10-min maintenance pass has no
+    # business running every 20s. (FOLLOW-UP: the 600s runtime itself is worth
+    # profiling — likely slow per-slot LLM/API calls over the 50 launch-pad slots.)
     "launch-pad-maintain": {
         "task": "celery_app.launch_pad_maintain_task",
-        "schedule": 20,
+        "schedule": 300,
     },
     # R4 (cont. 55) — recompute bot self-confidence index. Every 5 min.
     "compute-bot-confidence": {
@@ -512,6 +573,13 @@ app.conf.beat_schedule = {
         "task": "celery_app.netflow_refresh_all_task",
         "schedule": 300,
     },
+    # Priority 2 (cont. 74) — OI velocity + Long/Short + Taker ratio. Every 5 min
+    # poll of free production /futures/data Binance endpoints for top-N active
+    # pairs. See next_impl/priority2_oi_ls_taker.md.
+    "oi-ls-taker-refresh": {
+        "task": "celery_app.oi_ls_taker_refresh_task",
+        "schedule": 300,
+    },
     # F53 (cont. 55) — Qlib Alpha-158 per-minute factor compute. Reads the
     # 1m candle ring buffer; writes {pair}:qlib_alpha:{factor_id}. Reuses
     # 158 closed-form factors implemented in ml/qlib_alphas.py.
@@ -600,9 +668,12 @@ app.conf.beat_schedule = {
         "schedule": 300,
     },
     # Coinglass liquidation heatmap (per-pair clusters for dark-side SL).
+    # cont. 74 — 60s→300s: this fires 146 openInterestHist API calls PER RUN; at
+    # 60s it was a top slot-eater on the default queue (active ×3 during the
+    # backlog probe). The heatmap is slow-moving — 5-min refresh is ample.
     "coinglass-liq-refresh": {
         "task": "celery_app.coinglass_liq_refresh_task",
-        "schedule": 60,
+        "schedule": 300,
     },
     # cont. 61 — Seed gene pool stat-arb anchor producer.
     # Kalman-filtered pair residual z-score for kalman_pair_residual_revert seed.
@@ -617,13 +688,416 @@ app.conf.beat_schedule = {
         "task": "celery_app.evolve_strategy_pool_task",
         "schedule": 21600,  # every 6h
     },
+    # Phase 4 (SciBrain) — auto-interrogate every OPENED scibrain trade out-of-band. The
+    # opener enqueues a Decision snapshot to a Redis list; this drains it (the slow Ollama
+    # work lives here, off the brain hot loop). The job is in Redis so a dropped/expired beat
+    # trigger is harmless — the next tick picks up the same queue.
+    "scibrain-audit-drain": {
+        "task": "celery_app.scibrain_audit_drain",
+        "schedule": 30,
+    },
+    # Keep the 14B lead + 8B critic resident so an audit isn't a cold load between the
+    # (infrequent, cooldown-gated) opened trades.
+    "scibrain-prewarm": {
+        "task": "celery_app.scibrain_prewarm",
+        "schedule": 300,  # every 5 min
+    },
+    # Phase 7a — grade the ex-ante decision-risk forecaster once trades close + get a failure_type
+    # label (Brier + reliability bins). Pure DB/Redis, no LLM; idempotent recompute over graded rows.
+    "scibrain-calibration-grade": {
+        "task": "celery_app.scibrain_calibration_grade",
+        "schedule": 300,  # every 5 min
+    },
+    # Phase 7a — outcome-truth ledger: build the bounded LifeTrace + OutcomePacket for every closed
+    # scibrain trade and backfill standardized forward horizons as they mature. Pure DB/Redis, no
+    # LLM; idempotent recompute over rows, so a dropped/duplicate beat is harmless.
+    "scibrain-outcome-harvest": {
+        "task": "celery_app.scibrain_outcome_harvest",
+        "schedule": 120,  # every 2 min (horizons backfill on later passes)
+    },
+    # Phase 7a — module-state embeddings + matched-cohort retrieval: give every closed scibrain
+    # trade a fixed-length module-state embedding and recompute the cohort retrieval-quality
+    # aggregate. Pure DB/Redis, no LLM; idempotent recompute over rows, so a dropped/duplicate beat
+    # is harmless. Runs after harvest so outcomes exist for the retrieval-quality metric.
+    "scibrain-embed-decisions": {
+        "task": "celery_app.scibrain_embed_decisions",
+        "schedule": 180,  # every 3 min
+    },
+    # Phase 7b — evaluate every COMPILED ChangeSpec hypothesis against its fresh matched cohort
+    # (deterministic fusion-replay + twin-grounded Δutility + bootstrap LCB). Pure DB/Redis, no LLM;
+    # idempotent recompute (pass→unit_tested, fail→rejected). Idle until producers register specs.
+    "scibrain-evaluate-compiled": {
+        "task": "celery_app.scibrain_evaluate_compiled",
+        "schedule": 600,  # every 10 min
+    },
+    "scibrain-canary-monitor": {
+        "task": "celery_app.scibrain_canary_monitor",
+        "schedule": 120,  # every 2 min — tight auto-rollback loop for the live canary (no-op when none)
+    },
+    # Phase 7b — LLM scientific council: turn the richest evidence (recent wrong-direction-flagged
+    # trades) into grounded, bounded ChangeSpec hypotheses (5 constrained roles, cloud-primary LLM),
+    # which the evaluator then grades. Closes the hypothesis→evaluate loop. SLOW + small (LLM-bound,
+    # ~1 call/trade) on the airllm queue; single-flight. Tier-0 — produces+grades proposals, applies none.
+    "scibrain-council": {
+        "task": "celery_app.scibrain_council",
+        "schedule": 1800,  # every 30 min
+    },
 }
+
+# DISABLED 2026-06-11 (CPU/lag remediation, owner-approved) — pop these beat
+# entries so they never fire. Two groups, both verified to have ZERO live effect:
+#   (1) launch-pad-maintain — superseded by the Scientist Brain (scibrain owns
+#       picking/opening). launchpad:enabled=0 so it never opens a trade, yet its
+#       maintainer ran ~1843s/run every 300s, permanently pinning a candlenet
+#       worker slot and starving the microstructure queue (303-deep backlog).
+#   (2) predict-all pipeline — prediction:gate_enabled=0, so signals/engine.py
+#       SKIPS the entire prediction block (predictions never gate a live trade).
+#       These producers (esp. capture-pattern-embeddings, ~95s/run @ 60s cadence)
+#       were the top worker-second consumers on the default queue.
+# REVERT: delete this block — the schedule entries above are otherwise unchanged.
+for _disabled_beat in (
+    "launch-pad-maintain",
+    "capture-pattern-embeddings",
+    "train-pattern-clusters",
+    "candle-online-train",
+    "prediction-refresh",
+    "update-pattern-registry",
+    "calibration-drift-check",
+    "auto-arm-prediction-gate",
+    "shadow-ablation",
+):
+    app.conf.beat_schedule.pop(_disabled_beat, None)
+
+# cont. 74 — ANTI-BACKLOG: auto-expire stale periodic tasks. The producers above
+# are idempotent "refresh-latest" jobs; when the worker is briefly outrun, beat
+# keeps enqueuing and without an expiry each task accumulates one stale copy per
+# missed cycle → unbounded pileup (measured: default 11k, predict_all 7k, micro 6k;
+# netflow starved ~29h). With expires, Celery DROPS any copy not consumed within
+# ~2.5× its cadence, so every queue self-caps regardless of load — running 1 fresh
+# refresh beats running 150 stale ones. Clamp [45s, 3600s] so high-frequency
+# producers expire fast while daily/6h jobs are never nuked before they can run.
+from celery.schedules import crontab as _crontab_t  # noqa: E402
+for _bname, _bentry in app.conf.beat_schedule.items():
+    _bopts = _bentry.setdefault("options", {})
+    if "expires" in _bopts:
+        continue
+    _bsched = _bentry.get("schedule")
+    if isinstance(_bsched, (int, float)):
+        _bint = float(_bsched)
+    elif isinstance(_bsched, _crontab_t):
+        _bint = 60.0  # minute-granularity crontab → treat as ~60s cadence
+    else:
+        _bint = 300.0
+    _bopts["expires"] = max(45.0, min(3600.0, _bint * 2.5))
 
 # Phase-0 self-modification FREEZE reverted (cont. 71, owner request) — the 10
 # autonomous self-mod beat tasks (feature-governance, bayes-threshold, GA evolve,
 # DGM code-rewrite, ai-scientist, pair-list decoder, metacog, F9/F12 decoders,
 # strategy-pool evolution) are RESTORED to beat_schedule above. Background returned
 # to its pre-professor autonomous state. Context: PROFESSOR_AUDIT.md F-023.
+
+
+@app.task(queue="airllm")
+def scibrain_audit_drain():
+    """Phase 4: drain the post-trade audit queue on the worker (airllm). Single-flight via a
+    self-expiring Redis lock so two drains never hit Ollama at once (would jam worker slots).
+    The slow dual-brain interrogation + remediation run here, never on the brain hot loop."""
+    import redis_client
+    r = redis_client.get()
+    if not r.set("scibrain:audit_drain_lock", "1", nx=True, ex=900):
+        return {"skipped": "locked"}
+    try:
+        from signals.scibrain import audit
+        try:
+            limit = int(r.get("scibrain:audit_drain_limit") or 2)
+        except (TypeError, ValueError):
+            limit = 2
+        return audit.drain(r, limit=limit)
+    finally:
+        try:
+            r.delete("scibrain:audit_drain_lock")
+        except Exception:
+            pass
+
+
+@app.task(queue="default")
+def scibrain_sleep_cycle() -> dict:
+    """Phase-7e isolated SLEEP cycle (design §3.6/§9) — runs the replay/consolidation-check/calibration/
+    adversarial/homeostasis/pruning jobs OFF the brain hot loop (this worker), single-flight + load-aware,
+    pure read + ephemeral bookkeeping (NO live trading state mutated)."""
+    import sys
+    if "/app" not in sys.path:
+        sys.path.insert(0, "/app")
+    import redis_client
+    from signals.scibrain import sleep
+    return sleep.run_sleep_cycle(redis_client.get())
+
+
+@app.task(queue="default")
+def scibrain_world_model_train() -> dict:
+    """Phase-7f WORLD MODEL (design §3.6/§3.9) — retrain the RSSM on RICH cross-trade sequences from the
+    immutable ledger (full multimodal obs + typed action + reward + continue), evaluate open-loop multi-step
+    imagination with the honest calibration metric, and refresh the diagnosed health faculty. Heavy (~45s,
+    CPU-bound) → single-flight (redis lock) + load-aware (skip when the box is saturated). Shadow/read-only:
+    nothing here touches live trading state; the trained weights only inform the planning-authority gate."""
+    import os
+    import sys
+    import time
+    if "/app" not in sys.path:
+        sys.path.insert(0, "/app")
+    import redis_client
+    r = redis_client.get()
+    # load-aware: don't pile a 45s BLAS job onto an already-saturated box (10 vCPU)
+    try:
+        load1 = os.getloadavg()[0]
+        if load1 > 9.0:
+            return {"skipped": "high_load", "load1": round(load1, 2)}
+    except Exception:
+        pass
+    # single-flight: a 20-min lock so overlapping beats can't stack training jobs
+    lock = "scibrain:world_model:train_lock"
+    try:
+        if not r.set(lock, str(time.time()), nx=True, ex=1200):
+            return {"skipped": "already_running"}
+    except Exception:
+        pass
+    try:
+        from ml.world_model_train import main as wm_main
+        rc = wm_main()                       # trains + writes report + refreshes health
+        return {"ran": True, "rc": rc}
+    except Exception as exc:
+        return {"error": str(exc)[:200]}
+    finally:
+        try:
+            r.delete(lock)
+        except Exception:
+            pass
+
+
+@app.task(queue="default")
+def scibrain_controllers_train() -> dict:
+    """Phase-7f HIERARCHICAL CONTROLLERS (design §3.7/§8-417) — reframe the day/minute PPO bandits as a
+    DAY→HOUR→MINUTE hierarchy on real trajectories with shared belief, and MEASURE the coordination gain +
+    ablation vs the flat baseline. Fast (~1s, deterministic). SHADOW/read-only: it does NOT touch the live
+    PPO agents (capital scaling / skip veto); it only writes a shadow report + diagnosed health (Rule 21)."""
+    import sys
+    if "/app" not in sys.path:
+        sys.path.insert(0, "/app")
+    try:
+        from ml.hierarchical_controllers import main as hc_main
+        return {"ran": True, "rc": hc_main()}
+    except Exception as exc:
+        return {"error": str(exc)[:200]}
+
+
+@app.task(queue="default")
+def scibrain_offline_rl_train() -> dict:
+    """Phase-7f OFFLINE RL CHALLENGERS (design §3.7/§8-416) — CQL + IQL over abstain/enter/manage/exit with a
+    support-aware baseline fallback, scored off-policy on the digital twin. Fast (~1s, deterministic).
+    SHADOW/read-only: no live authority; the live agents/funnel are untouched (Rule 21)."""
+    import sys
+    if "/app" not in sys.path:
+        sys.path.insert(0, "/app")
+    try:
+        from ml.offline_rl_challengers import main as orl_main
+        return {"ran": True, "rc": orl_main()}
+    except Exception as exc:
+        return {"error": str(exc)[:200]}
+
+
+@app.task(queue="default")
+def scibrain_risk_policy_train() -> dict:
+    """Phase-7f RISK-SENSITIVE POLICY (design §3.7/§3.10/§8-416) — distributional CVaR objective + turnover
+    cost + CBF safety projection, twin-evaluated on the mean-vs-tail tradeoff. Fast (~1s, deterministic).
+    SHADOW/read-only: no live authority; the live agents/funnel are untouched (Rule 21)."""
+    import sys
+    if "/app" not in sys.path:
+        sys.path.insert(0, "/app")
+    try:
+        from ml.risk_sensitive_policy import main as rp_main
+        return {"ran": True, "rc": rp_main()}
+    except Exception as exc:
+        return {"error": str(exc)[:200]}
+
+
+@app.task(queue="default")
+def scibrain_meta_learning_train() -> dict:
+    """Phase-7f META-LEARNING (design §3.7/§5.4-7/§5.5 stage-6/§8-419) — real regime×VPIN cohort tasks with
+    real belief states + twin-utility targets, few-shot Reptile adaptation, and a protected-competence test vs
+    sequential fine-tune. Upgrades ml/maml.py's synthetic per-pair path. Fast (~1.5s, deterministic).
+    SHADOW/read-only: no live authority; ml/maml.py + world-model weights are untouched (Rule 21)."""
+    import sys
+    if "/app" not in sys.path:
+        sys.path.insert(0, "/app")
+    try:
+        from ml.meta_regime_tasks import main as ml_main
+        return {"ran": True, "rc": ml_main()}
+    except Exception as exc:
+        return {"error": str(exc)[:200]}
+
+
+@app.task(queue="default")
+def scibrain_cerebellum_train() -> dict:
+    """Phase-7f task-8 CEREBELLUM (design §3.8/§5.5 step-12) — fit the three bounded residual heads
+    (calibration/timing/slippage) on real matured trade labels with hard OUT-OF-SAMPLE earns-gates, and
+    refresh the authority-health view. Fast (~1s, deterministic). Holds the FIRST limited canary authority:
+    each head moves a real trade only when armed (owner flag, default ON) AND it provably helps OOS, bounded
+    and reversible (scibrain:cerebellum:canary=0 disarms instantly) — Rule 21."""
+    import sys
+    if "/app" not in sys.path:
+        sys.path.insert(0, "/app")
+    try:
+        from signals.scibrain.cerebellum import train_cerebellum
+        rep = train_cerebellum()
+        return {"ran": True, "armed": rep.get("armed"), "live_heads": rep.get("live_heads"),
+                "earned": rep.get("earned"), "n_labels": rep.get("n_labels")}
+    except Exception as exc:
+        return {"error": str(exc)[:200]}
+
+
+@app.task(queue="airllm")
+def scibrain_prewarm():
+    """Phase 4: keep the SciBrain interrogation models warm. Only pays the warmup while the
+    Scientist is the live trade-origin (else it's wasted GPU/CPU)."""
+    import redis_client
+    r = redis_client.get()
+    try:
+        from signals.scibrain import gate, audit
+        if not gate.enabled(r):
+            return {"skipped": "scibrain_disabled"}
+        return audit.prewarm(r)
+    except Exception as exc:
+        return {"error": str(exc)[:140]}
+
+
+@app.task
+def scibrain_calibration_grade():
+    """Phase 7a: grade the ex-ante decision-risk forecaster at close (Brier + reliability bins).
+
+    Pure DB/Redis — NO LLM — so it runs on the default queue, not airllm. Single-flight via a
+    self-expiring lock. Idempotent: per-trade grades are immutable on the row and the aggregate is
+    a recompute, so a dropped/duplicate beat is harmless."""
+    import redis_client
+    r = redis_client.get()
+    if not r.set("scibrain:calibration_grade_lock", "1", nx=True, ex=600):
+        return {"skipped": "locked"}
+    try:
+        from signals.scibrain import audit
+        try:
+            limit = int(r.get("scibrain:calibration_grade_limit") or 50)
+        except (TypeError, ValueError):
+            limit = 50
+        return audit.grade_calibration(r, limit=limit)
+    finally:
+        try:
+            r.delete("scibrain:calibration_grade_lock")
+        except Exception:
+            pass
+
+
+@app.task
+def scibrain_outcome_harvest():
+    """Phase 7a: build the bounded LifeTrace + OutcomePacket for closed scibrain trades and backfill
+    standardized forward horizons as they mature (Brier/calibration's sibling on the outcome side).
+
+    Pure DB/Redis — NO LLM — so it runs on the default queue, not airllm. Single-flight via a
+    self-expiring lock. Idempotent: per-trade artifacts are immutable on the row and the aggregate
+    is a recompute, so a dropped/duplicate beat is harmless."""
+    import redis_client
+    r = redis_client.get()
+    if not r.set("scibrain:outcome_harvest_lock", "1", nx=True, ex=300):
+        return {"skipped": "locked"}
+    try:
+        from signals.scibrain import outcome
+        try:
+            limit = int(r.get("scibrain:outcome_harvest_limit") or 50)
+        except (TypeError, ValueError):
+            limit = 50
+        return outcome.harvest_outcomes(r, limit=limit)
+    finally:
+        try:
+            r.delete("scibrain:outcome_harvest_lock")
+        except Exception:
+            pass
+
+
+@app.task
+def scibrain_embed_decisions():
+    """Phase 7a: build module-state embeddings for closed scibrain trades + recompute the matched-
+    cohort retrieval-quality aggregate (Brier/outcome's structural sibling on the decision side).
+
+    Pure DB/Redis — NO LLM — so it runs on the default queue, not airllm. Single-flight via a
+    self-expiring lock. Idempotent: per-trade embeddings are immutable on the row and the aggregate
+    is a recompute, so a dropped/duplicate beat is harmless."""
+    import redis_client
+    r = redis_client.get()
+    if not r.set("scibrain:embed_lock", "1", nx=True, ex=300):
+        return {"skipped": "locked"}
+    try:
+        from signals.scibrain import cohort
+        try:
+            limit = int(r.get("scibrain:embed_limit") or 100)
+        except (TypeError, ValueError):
+            limit = 100
+        return cohort.embed_decisions(r, limit=limit)
+    finally:
+        try:
+            r.delete("scibrain:embed_lock")
+        except Exception:
+            pass
+
+
+@app.task
+def scibrain_evaluate_compiled():
+    """Phase 7b: evaluate every COMPILED ChangeSpec hypothesis against its fresh matched cohort
+    (deterministic fusion-replay + twin-grounded Δutility + bootstrap LCB). Pure DB/Redis, NO LLM.
+    Single-flight via a self-expiring lock. Tier-0: records verdicts/evidence + advances the lifecycle;
+    it NEVER applies a change to a live parameter (that is the Phase-7c gate)."""
+    import redis_client
+    r = redis_client.get()
+    if not r.set("scibrain:evaluate_lock", "1", nx=True, ex=540):
+        return {"skipped": "locked"}
+    try:
+        from signals.scibrain import evaluator
+        return evaluator.evaluate_pending(r, limit=50)
+    finally:
+        try:
+            r.delete("scibrain:evaluate_lock")
+        except Exception:
+            pass
+
+
+@app.task
+def scibrain_canary_monitor():
+    """Phase 7c: monitor the ONE active bounded canary and AUTO-ROLLBACK on failure (live LCB below the
+    guard, master switch off, owner trigger, or max-duration elapsed). Pure DB/Redis, NO LLM. No-op when
+    no canary is active (the default). The canary only ever applies after explicit owner approval."""
+    import redis_client
+    from signals.scibrain import canary
+    return canary.monitor_canary(redis_client.get())
+
+
+@app.task(queue="airllm")
+def scibrain_council():
+    """Phase 7b: run the LLM scientific council on the most-recent wrong-direction-flagged trades to
+    PRODUCE grounded bounded ChangeSpec hypotheses (then auto-evaluated). Cloud-primary LLM (local
+    fallback). Single-flight via a self-expiring lock. Tier-0: produces+grades proposals, applies none."""
+    import redis_client
+    r = redis_client.get()
+    if not r.set("scibrain:council_lock", "1", nx=True, ex=1500):
+        return {"skipped": "locked"}
+    try:
+        from signals.scibrain import council
+        try:
+            limit = int(r.get("scibrain:council_limit") or 3)
+        except (TypeError, ValueError):
+            limit = 3
+        return council.propose_from_flagged(r, limit=limit)
+    finally:
+        try:
+            r.delete("scibrain:council_lock")
+        except Exception:
+            pass
 
 
 @app.task(bind=True, max_retries=3, default_retry_delay=300, queue="airllm")
@@ -695,6 +1169,13 @@ def opro_optimize(self, prompt: str, window_scores: list) -> dict:
         except Exception:
             pass
         r.delete("opro:queued_lock")
+        try:
+            from signals.scibrain import producers as _producers
+            _producers.apply_model_change(r, "opro_prompts", kind="prompt", target="opro:prompt_addendum",
+                                          summary="reverted to previous good prompt",
+                                          reason=f"regression {current_score:.1f} < {prev_score:.1f}-{REGRESSION_MARGIN}")
+        except Exception:
+            pass
         return {"status": "reverted",
                 "prev_score": prev_score, "current_score": current_score}
 
@@ -769,6 +1250,15 @@ def opro_optimize(self, prompt: str, window_scores: list) -> dict:
     # Release dedup lock so the next trade window can queue another opro task.
     r.delete("opro:queued_lock")
 
+    # Phase-7c §11 no-bypass: record this prompt change as a ModelChangeSpec under the unified kernel.
+    try:
+        from signals.scibrain import producers as _producers
+        _producers.apply_model_change(r, "opro_prompts", kind="prompt", target="opro:prompt_addendum",
+                                      summary=f"new prompt section; weak_step={str(parsed.get('weak_step',''))[:70]}",
+                                      reason=f"OPRO score {current_score:.1f} vs prev {prev_score:.1f}")
+    except Exception:
+        pass
+
     return {"status": "applied",
             "current_score": current_score,
             "prev_score": prev_score,
@@ -827,6 +1317,17 @@ def dgm_rewrite_weakest() -> dict:
             _r.incr("dgm:run_count")
             _r.set("dgm:last_run_ts", str(int(_t.time())))
             _r.set("dgm:last_submitted_count", str(len(task_ids)))
+        except Exception:
+            pass
+        # Phase-7c §11 no-bypass: record this code-rewrite dispatch as a ModelChangeSpec.
+        try:
+            import redis_client as _rc2
+            from signals.scibrain import producers as _producers
+            _producers.apply_model_change(_rc2.get(), "dgm_code_rewrite", kind="code",
+                                          target="strategy_source",
+                                          summary=f"submitted {len(task_ids)} weakest-strategy rewrite task(s)",
+                                          evidence_ids=[t.get("strategy_id") for t in task_ids][:10],
+                                          reason=f"paper_closed={paper_closed}")
         except Exception:
             pass
         return {"status": "ok", "submitted": task_ids, "paper_closed": paper_closed}
@@ -888,6 +1389,16 @@ def ai_scientist_run() -> dict:
             _r.set("ai_scientist:last_run_ts", str(int(_t.time())))
             _r.set("ai_scientist:last_task_id", str(task_id))
             _r.set("ai_scientist:last_gaps", str(gaps)[:200])
+        except Exception:
+            pass
+        # Phase-7c §11 no-bypass: record this hypothesis-generation dispatch as a ModelChangeSpec.
+        try:
+            import redis_client as _rc2
+            from signals.scibrain import producers as _producers
+            _producers.apply_model_change(_rc2.get(), "ai_scientist", kind="hypothesis",
+                                          target="ai_scientist:hypothesis",
+                                          summary=f"hypothesis-gen task {task_id}; gaps={str(gaps)[:80]}",
+                                          reason=f"paper_closed={paper_closed}")
         except Exception:
             pass
         return {"status": "ok", "task_id": task_id, "gaps": gaps,
@@ -2640,6 +3151,15 @@ def evolve_strategy_pool_task() -> dict:
 
     if not created:
         return _skip("all_candidates_failed_create")
+    # Phase-7c §11 no-bypass: record the evolved child strategies as a ModelChangeSpec.
+    try:
+        from signals.scibrain import producers as _producers
+        _producers.apply_model_change(r, "strategy_pool", kind="strategy", target="strategies",
+                                      summary=f"created {len(created)} evolved child strateg(ies)",
+                                      evidence_ids=[str(c.get("id")) for c in created][:10],
+                                      reason="pool GA evolution (experimental children)")
+    except Exception:
+        pass
     return {"status": "ok", "created": created}
 
 
@@ -2757,7 +3277,6 @@ def sweep_pending_counterfactuals() -> dict:
             "matured_band": len(pending), "stale_retired": stale_cleared}
 
 
-@app.task(queue="default")
 import functools as _functools
 
 
@@ -3537,6 +4056,23 @@ def bulk_topup_corpus_task() -> dict:
         sys.path.insert(0, "/app")
     import structlog
     log = structlog.get_logger()
+    # Manual kill-switch (owner-controlled pause). Set corpus:bulk_topup_enabled="0" to
+    # durably pause this heavy full-universe backfill (the beat keeps re-dispatching it,
+    # so a flag is the clean way to hold it); set back to "1" to resume. The daily
+    # data.binance.vision bulk keeps the corpus current to ~T-1, so a pause loses nothing.
+    # Silent-rejection rule (Rule 12): log + counter on every skip.
+    try:
+        import redis_client
+        _r = redis_client.get()
+        if (_r.get("corpus:bulk_topup_enabled") or "1") != "1":
+            _r.incr("corpus:bulk_topup_skipped_disabled")
+            log.warning("bulk_topup_corpus_skipped", reason="disabled_flag",
+                        note="corpus:bulk_topup_enabled=0; bulk corpus current to ~T-1")
+            return {"status": "skipped", "reason": "disabled_flag",
+                    "skipped_total": int(_r.get("corpus:bulk_topup_skipped_disabled") or 0)}
+    except Exception as exc:
+        # never let the gate itself break the task — fall through to the run
+        log.warning("bulk_topup_gate_check_failed", error=str(exc)[:120])
     try:
         from ml.klines_corpus import update_corpus
         rep = update_corpus(mode="bulk_topup", which="active")
@@ -3653,6 +4189,19 @@ def netflow_refresh_all_task() -> dict:
 
 
 @app.task(queue="default")
+def oi_ls_taker_refresh_task() -> dict:
+    """Priority 2 (cont. 74) — refresh OI velocity + Long/Short + Taker ratio
+    for top-N active pairs from the free production /futures/data Binance
+    endpoints. Every 5 minutes. Additive: writes new Redis keys only, does NOT
+    touch FEATURE_COLUMNS or trade decisions (Steps B/C are Rule-14-gated)."""
+    import sys
+    if "/app" not in sys.path:
+        sys.path.insert(0, "/app")
+    from data.oi_ls_taker import refresh_all
+    return refresh_all()
+
+
+@app.task(queue="default")
 def qlib_alpha_compute_task() -> dict:
     """F53 — per-minute Alpha-158 factor compute for every active pair."""
     import sys
@@ -3711,7 +4260,21 @@ def llm_dsl_mining_run_task(self) -> dict:
         pass
     try:
         from ml.llm_alpha_dsl import run_mining
-        return run_mining()
+        res = run_mining()
+        # Phase-7c §11 no-bypass: record promoted DSL factors as a ModelChangeSpec.
+        try:
+            import redis_client as _rc2
+            from signals.scibrain import producers as _producers
+            promoted = (res or {}).get("promoted") if isinstance(res, dict) else None
+            n_prom = len(promoted) if isinstance(promoted, (list, tuple)) else (res or {}).get("promoted_count", 0)
+            if n_prom:
+                _producers.apply_model_change(_rc2.get(), "dsl_miner", kind="factor",
+                                              target="dsl:promoted_factors",
+                                              summary=f"promoted {n_prom} DSL alpha factor(s)",
+                                              reason="weekly LLM-DSL mining run")
+        except Exception:
+            pass
+        return res
     except Exception as exc:
         log.error("llm_dsl_mining_run_failed", error=str(exc)[:300])
         # Don't retry — weekly cadence, next Wed will retry naturally.
@@ -3992,11 +4555,20 @@ def update_pair_lists_from_decoder() -> dict:
                     del probation[pair]
                     log.info("pair_probation_graduated", pair=pair)
 
+    # Phase-7c §11 no-bypass: route the live probation-list write THROUGH the unified producer-bus kernel.
+    # producers.apply_set performs the bounded write (max_size runaway cap) + records an added/removed audit
+    # diff instead of a direct self-apply. In-cap writes are byte-identical. Falls back if the bus is absent.
     try:
-        r.set(redis_keys.BRAIN_PAIR_PROBATION, _json.dumps(probation))
-        r.set("pair:probation:count", len(probation))
+        from signals.scibrain import producers as _producers
+        _producers.apply_set(r, "f9f12_decoder", redis_key=redis_keys.BRAIN_PAIR_PROBATION,
+                             mapping=probation, max_size=200, count_key="pair:probation:count",
+                             reason="F9 misses >=3/24h add; graduate >=50 trades & >=50% wr")
     except Exception:
-        pass
+        try:
+            r.set(redis_keys.BRAIN_PAIR_PROBATION, _json.dumps(probation))
+            r.set("pair:probation:count", len(probation))
+        except Exception:
+            pass
 
     susp_raw = r.get(redis_keys.BRAIN_PAIR_SUSPENSION)
     suspension = _json.loads(susp_raw) if susp_raw else {}
@@ -4021,11 +4593,18 @@ def update_pair_lists_from_decoder() -> dict:
             "added_ts":        now,
         }
 
+    # Phase-7c §11 no-bypass: route the live suspension-list write THROUGH the kernel (see probation above).
     try:
-        r.set(redis_keys.BRAIN_PAIR_SUSPENSION, _json.dumps(suspension))
-        r.set("pair:suspension:count", len(suspension))
+        from signals.scibrain import producers as _producers
+        _producers.apply_set(r, "f9f12_decoder", redis_key=redis_keys.BRAIN_PAIR_SUSPENSION,
+                             mapping=suspension, max_size=200, count_key="pair:suspension:count",
+                             reason="F12 losers >=3/24h suspend (+5), >=6 block (+10); auto-lift 6h")
     except Exception:
-        pass
+        try:
+            r.set(redis_keys.BRAIN_PAIR_SUSPENSION, _json.dumps(suspension))
+            r.set("pair:suspension:count", len(suspension))
+        except Exception:
+            pass
 
     log.info("pair_lists_updated",
              probation_count=len(probation),
@@ -4083,6 +4662,30 @@ def capture_pattern_embeddings() -> dict:
         sys.path.insert(0, "/app")
     from pattern.live_capture import capture_for_active_pairs
     return capture_for_active_pairs()
+
+
+@app.task(queue="default")
+def train_pattern_clusters() -> dict:
+    """cont. 73 (Priority 1 Step 4) — refit HDBSCAN pattern clusters from the live
+    embedding stream and persist models/pattern_clusters.pkl. The per-minute
+    capture task feeds the stream; clusterer.load() is mtime-cached so the new
+    model is picked up on the next assignment without a restart. Skips (no-op) if
+    the stream has < MIN_TRAIN_SAMPLES live captures."""
+    import sys
+    if "/app" not in sys.path:
+        sys.path.insert(0, "/app")
+    from pretrainer.pattern_cluster_train import train_and_persist
+    res = train_and_persist()
+    try:
+        import json as _json
+        import time as _time
+        import redis_client
+        r = redis_client.get()
+        r.set("pattern:cluster_train:last", _json.dumps(res))
+        r.set("pattern:cluster_train:last_ts", int(_time.time()))
+    except Exception:
+        pass
+    return res
 
 
 @app.task(queue="predict_all")
@@ -4274,6 +4877,8 @@ def update_pattern_registry_task() -> dict:
     import sys
     if "/app" not in sys.path:
         sys.path.insert(0, "/app")
+    import structlog as _sl
+    _log = _sl.get_logger()  # cont.74 fix — was referenced (×3 below) but never defined → NameError every run
     from db import db_conn
     from pattern.registry import update_on_close
     updated = 0

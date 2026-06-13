@@ -414,8 +414,8 @@ def pick_direction_cascade(pair: str, ofi: float,
         conf = 50.0
 
     # Regime concurrence bumps confidence by +10 (cap 100).
-    if (regime == "bull" and direction == "long") or \
-       (regime == "bear" and direction == "short"):
+    # bear+short excluded: empirically -$3,507 on 4,173 trades (audit 2026-06-06).
+    if regime == "bull" and direction == "long":
         conf = min(100.0, conf + 10.0)
 
     audit = {

@@ -58,6 +58,39 @@ def generate_candidate_signals(pair: str, brain_state: dict) -> list[dict]:
             if forecast and mark > 0:
                 q50 = float(forecast.get("q50", mark))
                 tft_bias = (q50 - mark) / mark  # positive = bullish, negative = bearish
+            # cont. 74 TASK 2 — MULTI-TF blend, comparison candidate by default. The data_feed
+            # producer now pre-warms TFT q50 across timeframes; blend their per-TF biases
+            # (longer horizons weighted heavier — more stable). Toggle tft:multi_tf_enabled
+            # (default 0): when 0, the 1h bias above stays LIVE and the blend is only
+            # comparison-logged for the A/B; when 1, the blend feeds tft_bias. Either way we
+            # record the divergence so the blend can be validated before any cutover.
+            if mark > 0:
+                _tf_w = {"5m": 0.2, "15m": 0.3, "1h": 0.5}
+                _bsum = 0.0; _wsum = 0.0
+                for _tf, _w in _tf_w.items():
+                    try:
+                        _fc = get_price_forecast(pair, _tf)
+                        if _fc:
+                            _q = float(_fc.get("q50", mark))
+                            _bsum += _w * ((_q - mark) / mark); _wsum += _w
+                    except Exception:
+                        pass
+                if _wsum > 0:
+                    _tft_bias_multitf = _bsum / _wsum
+                    try:
+                        _mtf_on = (r.get("tft:multi_tf_enabled") or "0")
+                        _mtf_on = (_mtf_on.decode() if isinstance(_mtf_on, bytes) else str(_mtf_on)) == "1"
+                    except Exception:
+                        _mtf_on = False
+                    if abs(_tft_bias_multitf - tft_bias) > 1e-9:
+                        try:
+                            r.incr("signals:tft_mtf_shadow:count")
+                            r.setex(f"signals:tft_mtf_shadow:{pair}", 300,
+                                    f"mtf={round(_tft_bias_multitf*100,4)} h1={round(tft_bias*100,4)} tfs={_wsum:.1f}")
+                        except Exception:
+                            pass
+                    if _mtf_on:
+                        tft_bias = _tft_bias_multitf   # promoted to LIVE only when toggled
     except Exception:
         pass
 
@@ -276,10 +309,9 @@ def generate_candidate_signals(pair: str, brain_state: dict) -> list[dict]:
         except Exception as _mexc:
             log.debug("micro_veto_skipped", error=str(_mexc)[:120])
 
-        regime_bonus = 15 if (
-            (regime == "bull" and direction == "long") or
-            (regime == "bear" and direction == "short")
-        ) else 0
+        # bear+short excluded from regime bonus: empirically -$3,507 on 4,173 trades
+        # (audit 2026-06-06). Bear squeezes punish shorts; only bull+long gets the bonus.
+        regime_bonus = 15 if (regime == "bull" and direction == "long") else 0
         tft_bonus = 0
         if tft_bias != 0:
             agrees = (direction == "long" and tft_bias > 0) or (direction == "short" and tft_bias < 0)
@@ -659,6 +691,19 @@ def generate_candidate_signals(pair: str, brain_state: dict) -> list[dict]:
         except Exception:
             pass
 
+        # Priority 2 (cont. 74) — OI×price divergence (audit Gate 3) + Long/Short
+        # crowding (Gate 4) from data/oi_ls_taker.py. SOFT ±4/±6 nudges, well below
+        # the model bonuses; each gate is Redis-toggleable inside the helper
+        # (oils:oi_gate_enabled / oils:ls_gate_enabled, default ON) and 0 on
+        # cold-start / disabled / missing keys. Rule 14 requires evidence proportional
+        # to authority before changing live capital. Reversible: SET the toggles to 0.
+        oils_bonus = 0
+        try:
+            from data.oi_ls_taker import get_oi_bonus, get_ls_bonus
+            oils_bonus = get_oi_bonus(pair, direction) + get_ls_bonus(pair, direction)
+        except Exception:
+            pass
+
         # Blueprint Section 7 / Feature 11 — Trade Potential Score as a
         # multi-source confluence, NOT a single-factor read on sentiment.
         # Pre-cont.22 this line was: `abs(sentiment - 0.5) * 2 * 100` which gave
@@ -695,49 +740,204 @@ def generate_candidate_signals(pair: str, brain_state: dict) -> list[dict]:
             r.setex(_ofi_ewma_key, 3600, _new_ewma)  # 1h TTL bridges short outages
         except Exception:
             _new_ewma = _ofi_abs
-        if _new_ewma > 0:
-            _ofi_mag_score = min(100.0, (_ofi_abs / _new_ewma) * 50.0)
-        else:
-            _ofi_mag_score = 50.0
-        ofi_score = round(_ofi_mag_score * _ofi_align, 2)
+        # cont. 71 — rolling z-score (Cont, Cucuringu, Zhang 2023). The old
+        # magnitude×binary-align mapping saturated easily and discarded the sign
+        # of deviation. Track an EWMA std alongside the mean and score the
+        # DIRECTIONAL z-score: positive when flow matches direction, negative
+        # against. 3σ aligned → ~95, on-mean → 50, 3σ against → ~5.
+        _ofi_std_key = f"{pair}:ofi_abs_std_ewma"
+        try:
+            _prev_std_raw = r.get(_ofi_std_key)
+            _prev_std = float(_prev_std_raw) if _prev_std_raw else _ofi_abs
+            _variance_new = 0.1 * (_ofi_abs - _new_ewma) ** 2 + 0.9 * (_prev_std ** 2)
+            _ofi_std_new = max(1e-10, _variance_new ** 0.5)
+            r.setex(_ofi_std_key, 3600, _ofi_std_new)
+        except Exception:
+            _ofi_std_new = _ofi_abs + 1e-10
+        _ofi_z = (_ofi_abs - _new_ewma) / max(1e-10, _ofi_std_new)
+        _ofi_dir_z = min(3.0, max(-3.0, _ofi_z)) * (
+            1.0 if _ofi_align == 1.0 else -1.0 if _ofi_align == 0.0 else 0.0)
+        ofi_score = round(max(0.0, min(100.0, 50.0 + _ofi_dir_z * 15.0)), 2)
         # Sentiment distance from neutral (low weight today — input is
         # global-shared per cont.22; weight rises automatically once web_intel
         # starts emitting per-pair tagged articles).
-        sent_score = round(min(100, abs(sentiment - 0.5) * 200), 2)
+        # cont. 71 — direction-aligned. The old abs(sentiment-0.5) scored a
+        # bullish 0.9 reading identically on a long OR a short. Sentiment ∈ [0,1]
+        # (1=max bullish, 0=max bearish). For a long, bullish helps → use it
+        # directly; for a short, bearish helps → use 1-sentiment. Neutral 0.5 →
+        # 50 either way.
+        _sent_aligned = sentiment if direction == "long" else (1.0 - sentiment)
+        sent_score = round(max(0.0, min(100.0, _sent_aligned * 100.0)), 2)
         # Regime confluence with chosen direction.
-        if regime == "bull" and direction == "long":
-            regime_score = 100.0
-        elif regime == "bear" and direction == "short":
-            regime_score = 100.0
-        elif regime in ("unknown", "turbulent"):
-            regime_score = 50.0
-        else:
-            regime_score = 0.0
+        # bear+short demoted from 100.0 to 20.0: -$3,507 on 4,173 trades (audit 2026-06-06).
+        # Bear bounces squeeze shorts; treat as mildly counter-regime, not with-regime.
+        # Runtime-tunable: set Redis key "signals:bear_short_regime_score" to override.
+        # cont. 71 — empirically calibrated from the 10,641-trade audit (2026-06-06).
+        # THEORY (research) says bear+short scores high (regime-aligned). CRYPTO
+        # EMPIRICAL REALITY overrides: bear bounces squeeze leveraged shorts.
+        #   bear+short = -$3,507 on 4,173 trades  → HARD ZERO (below min threshold)
+        #   bull+short = +$1,098 on 2,372 trades  → profitable, was under-signalled
+        #   turbulent+short = +$796 (good) vs turbulent+long = -$185 (bad)
+        _REGIME_SCORES = {
+            ("bull",      "long"):  88.0,   # primary edge: regime+direction+trend aligned
+            ("bull",      "short"): 60.0,   # counter-trend but empirically profitable
+            ("bear",      "long"):  40.0,   # mean-reversion opportunity; cautious allow
+            ("bear",      "short"):  0.0,   # HARD ZERO: crypto bear squeezes destroy shorts
+            ("turbulent", "short"): 55.0,   # empirically +$796; vol helps short entries
+            ("turbulent", "long"):  25.0,   # empirically -$185; turbulence favors shorts
+            ("unknown",   "long"):  42.0,   # slight caution in unknown regime
+            ("unknown",   "short"): 42.0,   # symmetric for unknown
+        }
+        regime_score = _REGIME_SCORES.get((regime, direction), 40.0)
+        # Per-cell Redis override (back-compat: legacy bear:short key still honored).
+        try:
+            _r_ovrd = r.get(f"signals:regime_score:{regime}:{direction}")
+            if _r_ovrd is None and regime == "bear" and direction == "short":
+                _r_ovrd = r.get("signals:bear_short_regime_score")
+            if _r_ovrd is not None:
+                regime_score = float(_r_ovrd)
+        except Exception:
+            pass
         # TFT (F19) short-horizon forecast agreement.
+        # cont. 71 — EWMA-std z-score (Cont et al.). The old abs(tft_bias)*5000
+        # saturated at 100 for any bias > 0.02%, throwing away all gradient. Now
+        # normalize by the pair's own bias scale: 3σ aligned → 100, 3σ against → ~14.
         if tft_bias != 0:
-            _tft_mag = min(100.0, abs(tft_bias) * 5000)  # 2% predicted move → 100
+            _tft_std_key = f"{pair}:tft_bias_std_ewma"
+            _tft_abs = abs(tft_bias)
+            try:
+                _tft_std_raw = r.get(_tft_std_key)
+                _tft_std = float(_tft_std_raw) if _tft_std_raw else _tft_abs
+                _tft_std_new = max(1e-8, 0.1 * _tft_abs + 0.9 * _tft_std)
+                r.setex(_tft_std_key, 7200, _tft_std_new)
+            except Exception:
+                _tft_std_new = max(1e-8, _tft_abs)
+            _tft_mag_z = min(3.0, _tft_abs / _tft_std_new)
             _tft_agrees = (direction == "long" and tft_bias > 0) or \
                           (direction == "short" and tft_bias < 0)
-            tft_score = _tft_mag if _tft_agrees else max(0.0, 50.0 - _tft_mag / 2)
+            if _tft_agrees:
+                tft_score = round(min(100.0, 50.0 + _tft_mag_z * 16.7), 2)
+            else:
+                tft_score = round(max(0.0, 50.0 - _tft_mag_z * 12.0), 2)
         else:
             tft_score = 50.0
-        # PatchTST (F20) long-horizon agreement — reuse the bonus already
-        # computed above which encodes direction-agreement (+5/-3) or absence (0).
-        if patchtst_bonus > 0:
-            patchtst_score = min(100.0, 50.0 + patchtst_bonus * 10)
-        elif patchtst_bonus < 0:
-            patchtst_score = max(0.0, 50.0 + patchtst_bonus * 10)
-        else:
-            patchtst_score = 50.0
+        # PatchTST (F20) long-horizon agreement.
+        # cont. 71 — use the continuous predicted change_pct (z-scored by EWMA
+        # std) instead of the discrete {+5/-3/0} bonus, which hit 100 immediately.
+        # change_pct is set above only when F20 active + forecast present, so guard.
+        try:
+            _ptst_std_key = f"{pair}:ptst_chg_std_ewma"
+            _ptst_abs = abs(change_pct) if 'change_pct' in dir() else 0.0
+            if _ptst_abs > 0:
+                _ptst_std_raw = r.get(_ptst_std_key)
+                _ptst_std = float(_ptst_std_raw) if _ptst_std_raw else _ptst_abs
+                _ptst_std_new = max(1e-8, 0.1 * _ptst_abs + 0.9 * _ptst_std)
+                r.setex(_ptst_std_key, 7200, _ptst_std_new)
+                _ptst_z = min(3.0, _ptst_abs / _ptst_std_new)
+                _ptst_agrees = (direction == "long" and change_pct > 0) or \
+                               (direction == "short" and change_pct < 0)
+                if _ptst_agrees:
+                    patchtst_score = round(min(100.0, 50.0 + _ptst_z * 16.7), 2)
+                else:
+                    patchtst_score = round(max(0.0, 50.0 - _ptst_z * 12.0), 2)
+            else:
+                patchtst_score = 50.0
+        except Exception:
+            if patchtst_bonus > 0:
+                patchtst_score = min(100.0, 50.0 + patchtst_bonus * 6)
+            elif patchtst_bonus < 0:
+                patchtst_score = max(0.0, 50.0 + patchtst_bonus * 6)
+            else:
+                patchtst_score = 50.0
         # CandleNet (F46) short-horizon score — 1min/5min agreement mapped to [0,100].
-        if candlenet_bonus > 0:
-            candlenet_score = min(100.0, 50.0 + candlenet_bonus * 3)
-        elif candlenet_bonus < 0:
-            candlenet_score = max(0.0, 50.0 + candlenet_bonus * 3)
+        # cont. 71 — use the model's actual dir3 probabilities (the same signal
+        # behind candlenet_bonus) with temperature scaling T=2.0 to correct deep-net
+        # overconfidence (Guo et al. 2017), instead of the discrete vote→score map.
+        # _forecasts is populated in the candlenet block above (guard: may be absent).
+        _cn_aligned_probs = []
+        if '_forecasts' in dir():
+            for _fc_v in _forecasts.values():
+                _d3 = _fc_v.get("dir3", _fc_v.get("dir1"))
+                if _d3 is not None:
+                    _prob = float(_d3)
+                    _aligned = _prob if direction == "long" else (1.0 - _prob)
+                    _cn_aligned_probs.append(_aligned)
+        if _cn_aligned_probs:
+            import math as _math
+            _cn_avg = sum(_cn_aligned_probs) / len(_cn_aligned_probs)
+            _cn_logit = _math.log(max(1e-6, _cn_avg) / max(1e-6, 1.0 - _cn_avg))
+            _cn_cal = 1.0 / (1.0 + _math.exp(-_cn_logit / 2.0))  # T=2.0
+            candlenet_score = round(max(0.0, min(100.0, _cn_cal * 100.0)), 2)
         else:
-            candlenet_score = 50.0
-        # Bot's historical directional accuracy on this pair.
-        hist_score = _safe_dir_accuracy(r, pair, default=50.0)
+            candlenet_score = round(max(0.0, min(100.0, 50.0 + candlenet_bonus * 2.5)), 2)
+        # cont. 74 — KURAMOTO ENSEMBLE-COHERENCE replaces the past-trades win-rate.
+        # OLD (`hist_acc`): bot's historical directional accuracy on this pair
+        # (Beta-Binomial win rate). BACKWARD-LOOKING + circular — trade outcomes fed
+        # back into the score that PICKS trades, a self-reinforcing bias (same family
+        # that froze the adaptive threshold, cont.74). REPLACED with a forward-looking
+        # measure of how strongly the bot's INDEPENDENT forecasters AGREE on this
+        # direction RIGHT NOW: the Kuramoto synchronization order parameter
+        # (statistical physics — Kuramoto 1975; r = |mean resultant of phase vectors|).
+        # Each direction-aligned sub-score s_j∈[0,100] (100=for the trade, 0=against,
+        # 50=neutral) maps to a phase on the directional axis φ_j=(s_j-50)/50·(π/2);
+        # the order parameter's DIRECTIONAL projection Σw_j·sinφ_j / Σw_j ∈[-1,1] is the
+        # net coherent conviction (+1 = all synchronized in favour, ~0 = scattered/noise,
+        # -1 = synchronized against). The pure coherence r=|Σw_j·e^{iφ_j}|/Σw_j ∈[0,1] is
+        # logged for telemetry. Weights w_j = each forecaster's composite reliability
+        # (so a trusted predictor pulls the consensus harder). NO past-PnL input ⇒
+        # cannot deadlock or overfit thin samples. PHASE 2 (deferred): scale by a slow
+        # per-pair transfer-entropy reliability gate (trust consensus only when the
+        # pair is actually predictable). Toggle: signals:coherence_enabled (default 1);
+        # legacy win-rate kept behind the toggle + computed for the counterfactual A/B.
+        import math as _kmath
+        _coh_pairs = [
+            (ofi_score, 0.25), (regime_score, 0.22), (tft_score, 0.15),
+            (candlenet_score, 0.12), (patchtst_score, 0.08), (sent_score, 0.04),
+        ]
+        _coh_W = sum(w for _, w in _coh_pairs) or 1.0
+        _coh_X = sum(w * _kmath.cos(((s - 50.0) / 50.0) * (_kmath.pi / 2.0))
+                     for s, w in _coh_pairs)
+        _coh_Y = sum(w * _kmath.sin(((s - 50.0) / 50.0) * (_kmath.pi / 2.0))
+                     for s, w in _coh_pairs)
+        _coh_dir = _coh_Y / _coh_W                                   # conviction [-1,1]
+        _coh_r = (_coh_X * _coh_X + _coh_Y * _coh_Y) ** 0.5 / _coh_W  # Kuramoto r [0,1]
+        coherence_score = round(max(0.0, min(100.0, 50.0 * (1.0 + _coh_dir))), 2)
+        try:
+            r.setex(f"{pair}:coherence_r", 120, round(_coh_r, 4))
+        except Exception:
+            pass
+        # Legacy past-trades win-rate (Beta-Binomial) — retained ONLY for the toggle
+        # fallback + the counterfactual A/B comparison; no longer the default source.
+        try:
+            _da_raw = r.get(f"brain:directional_accuracy:{pair}")
+            if _da_raw:
+                _da = json.loads(_da_raw)
+                _n = max(0, int(_da.get("total") or 0))
+                if _da.get("correct") is not None and _n > 0:
+                    _n_wins = int(_da["correct"])
+                elif _da.get("rate") is not None:
+                    _n_wins = round(float(_da["rate"]) / 100.0 * _n)
+                else:
+                    _n_wins = round(0.5 * _n)
+            else:
+                _n, _n_wins = 0, 0
+            _legacy_hist = round(max(0.0, min(100.0,
+                ((_n_wins + 10.0) / (_n + 20)) * 100.0)), 2)
+        except Exception:
+            _legacy_hist = 50.0
+        # Live select (default = new coherence) + comparison-log the divergence (Rule 14).
+        _coh_raw = r.get("signals:coherence_enabled")
+        _coh_on = (_coh_raw is None) or (
+            (_coh_raw.decode() if isinstance(_coh_raw, bytes) else str(_coh_raw)) != "0")
+        hist_score = coherence_score if _coh_on else _legacy_hist
+        try:
+            if abs(coherence_score - _legacy_hist) >= 1.0:
+                r.incr("signals:strength_shadow:count")
+                r.setex(f"signals:strength_shadow:{pair}", 300,
+                        f"coherence={coherence_score} legacy_winrate={_legacy_hist} "
+                        f"r={round(_coh_r, 3)} dir={direction}")
+        except Exception:
+            pass
         # VPIN — informed flow magnitude. Same per-pair normalization as OFI
         # (cont. 23): track an EWMA per pair and score relative to that scale.
         # The old `vpin * 30000` constant similarly biased against pairs whose
@@ -750,8 +950,13 @@ def generate_candidate_signals(pair: str, brain_state: dict) -> list[dict]:
             r.setex(_vpin_ewma_key, 3600, _v_new)
         except Exception:
             _v_new = vpin
+        # cont. 71 — VPIN is a regime-agnostic toxicity/informed-flow magnitude,
+        # NOT a directional signal. Center at the pair baseline: baseline→50,
+        # 2×→~75, 0.5×→~25. It does NOT get direction-multiplied; its weight is
+        # reduced (see weight table) so it modulates rather than double-counts OFI.
         if _v_new > 0:
-            vpin_score = min(100.0, (vpin / _v_new) * 50.0)
+            _vpin_ratio = vpin / _v_new
+            vpin_score = round(max(0.0, min(100.0, 50.0 * _vpin_ratio)), 2)
         else:
             vpin_score = 50.0
 
@@ -761,8 +966,15 @@ def generate_candidate_signals(pair: str, brain_state: dict) -> list[dict]:
         # normalization handles shifted-sum gracefully — adding +0.04 to
         # regime_weight just shifts the relative emphasis, not the score
         # magnitude.
+        # cont. 71 — rebalanced base weights (total = 1.00):
+        #   regime 0.20→0.22 (formula now correct), hist_acc 0.13→0.08 (Bayesian
+        #   shrinkage cuts noise), vpin 0.10→0.06 (toxicity modifier, no longer
+        #   directional → was double-counting OFI's order-flow signal).
+        # The F12 metacognition actuator deltas are STILL applied to ofi/regime/tft
+        # (cont.71 deliberately preserves this consumer — dropping it would silently
+        # orphan metacognition/actuator.py's live writeback, a Rule-12 violation).
         _w_ofi    = 0.25
-        _w_regime = 0.20
+        _w_regime = 0.22
         _w_tft    = 0.15
         try:
             from metacognition.actuator import get_scorer_overrides
@@ -773,14 +985,14 @@ def generate_candidate_signals(pair: str, brain_state: dict) -> list[dict]:
         except Exception:
             pass
         _components = [
-            ("ofi",        ofi_score,       _w_ofi),   # primary directional signal
+            ("ofi",        ofi_score,       _w_ofi),   # primary directional signal (z-scored)
             ("regime",     regime_score,    _w_regime), # confluence with macro regime
-            ("tft",        tft_score,       _w_tft),   # short-horizon ML
-            ("patchtst",   patchtst_score,  0.08),     # long-horizon ML (reduced to make room for candlenet)
-            ("candlenet",  candlenet_score, 0.12),     # F48 1min/5min next-candle
-            ("hist_acc",   hist_score,      0.13),     # bot's past on this pair
-            ("vpin",       vpin_score,      0.10),     # informed flow strength
-            ("sentiment",  sent_score,      0.05),     # narrative — low weight while global-shared
+            ("tft",        tft_score,       _w_tft),   # short-horizon ML (z-scored)
+            ("candlenet",  candlenet_score, 0.12),     # F48 next-candle (temp-calibrated prob)
+            ("coherence",  hist_score,      0.10),     # cont.74 Kuramoto ensemble-coherence (replaced past-trades win-rate)
+            ("patchtst",   patchtst_score,  0.08),     # long-horizon ML (z-scored)
+            ("vpin",       vpin_score,      0.06),     # informed-flow toxicity modifier (non-directional)
+            ("sentiment",  sent_score,      0.04),     # narrative — direction-aligned, low weight
         ]
         _total_w = sum(w for _, _, w in _components)
         trade_potential = round(
@@ -811,7 +1023,7 @@ def generate_candidate_signals(pair: str, brain_state: dict) -> list[dict]:
                 + candlenet_bonus + mamba_bonus + foundation_bonus
                 + gnn_multiscale_bonus
                 + netflow_bonus + qlib_bonus + dsl_bonus
-                + cascade_bonus
+                + cascade_bonus + oils_bonus
             )), 2)
 
         # F51b (cont. 51): Funding-rate extremes gate. In crypto perps,
@@ -1021,6 +1233,56 @@ def generate_candidate_signals(pair: str, brain_state: dict) -> list[dict]:
         for tf, vote in _cascade_votes.items():
             _full_fv[f"cascade_{tf}"] = vote
 
+    # Rule 14 Evidence/Authority/Influence Gate: expose every persisted legacy
+    # component with its honest authority. Scores below are aligned-to-picked-direction
+    # inputs to the live composite. The inactive historical selector remains visible as
+    # counterfactual-only and must never be described as a cause of the open.
+    _legacy_influences = []
+    for _name, _score, _weight in _components:
+        _source = ("coherence" if _coh_on else "legacy_winrate") if _name == "coherence" else _name
+        _legacy_influences.append({
+            "source": _source, "authority": "live", "status": "applied",
+            "role": "toxicity_modifier" if _name == "vpin" else "direction_score",
+            "score": _score, "weight": round(float(_weight), 6),
+            "actual_effect": round(float(_score * _weight / _total_w), 6),
+            "effect_kind": "normalized_composite_points",
+        })
+    _legacy_influences.append(
+        {
+            "source": "legacy_winrate" if _coh_on else "coherence",
+            "authority": "observe", "status": "counterfactual_only",
+            "role": "history_selector_candidate",
+            "score": _legacy_hist if _coh_on else coherence_score,
+            "actual_effect": 0.0,
+            "effect_kind": "not_selected",
+        }
+    )
+    if "_tft_bias_multitf" in locals():
+        _legacy_influences.append({
+            "source": "tft_multi_tf",
+            "authority": "live" if _mtf_on else "observe",
+            "status": "applied" if _mtf_on else "counterfactual_only",
+            "role": "tft_input_selector",
+            "raw_signal": round(float(_tft_bias_multitf), 8),
+            "actual_effect": "feeds_tft_score" if _mtf_on else 0.0,
+            "effect_kind": "selected_bias" if _mtf_on else "not_selected",
+        })
+    _legacy_counts = {
+        status: sum(1 for item in _legacy_influences if item["status"] == status)
+        for status in ("applied", "gate_applied", "suppressed", "abstained",
+                       "advised", "counterfactual_only")
+    }
+    _legacy_manifest = {
+        "schema_version": 1,
+        "origin": "legacy_engine",
+        "decision": {
+            "direction": direction, "conviction": direction_conf,
+            "composite": trade_potential, "regime": regime,
+        },
+        "summary": _legacy_counts,
+        "influences": _legacy_influences,
+    }
+
     return [{
         "pair": pair,
         "direction": direction,
@@ -1033,6 +1295,31 @@ def generate_candidate_signals(pair: str, brain_state: dict) -> list[dict]:
         "mark_price": mark,
         "entry_decision": entry_decision,   # F48 §Idea C — "enter" | "wait"
         "feature_vector": json.dumps(_full_fv),
+        # cont. 74 — DECISION SNAPSHOT persisted into trades.signals_at_entry at open.
+        # (a) coherence-vs-legacy counterfactual A/B (does coherence predict wins better?).
+        # (b) the full per-component sub-score vector — the meta-labeling training
+        #     substrate (gates→metalabeling redesign): the engine's 8 internal scores
+        #     are NOT in feature_vector, yet they are the most decision-relevant inputs
+        #     for the future Layer-2 P(profit) model. Capturing them now starts the
+        #     labeled-data clock so the model can train on rich features, not just the
+        #     ~48 live_features columns. Additive snapshot only — changes no decision.
+        "shadow_scores": {
+            "coherence_score": coherence_score,
+            "legacy_winrate_score": _legacy_hist,
+            "coherence_live": bool(_coh_on),
+            "coherence_r": round(_coh_r, 4),
+            # full component vector @ decision time (meta-label features)
+            "ofi_score": ofi_score,
+            "regime_score": regime_score,
+            "tft_score": tft_score,
+            "candlenet_score": candlenet_score,
+            "patchtst_score": patchtst_score,
+            "vpin_score": vpin_score,
+            "sent_score": sent_score,
+            "composite": trade_potential,
+            "direction_conf": direction_conf,
+            "influence_manifest": _legacy_manifest,
+        },
     }]
 
 
@@ -1739,6 +2026,21 @@ async def process_signals(pairs: list[str], brain_state: dict, engine) -> list[s
     opened_trade_ids = []
     max_open = int(r.get("bot:max_open_trades") or 999)
 
+    # 2026-06-08 — SciBrain funnel. The AI Scientist REPLACES the launch_pad funnel +
+    # the legacy gauntlet for trade ORIGINATION: when scibrain:enabled=1 it scores the
+    # whole scanner universe through the PhD math/physics/quantum circuit, picks
+    # symbol+direction, and OWNS the open (sizing/leverage/SL/open_trade). It fully
+    # bypasses generate_candidate_signals + the ~40 gates below. Kill switch off →
+    # this is a no-op and the legacy flow runs unchanged. PAPER only.
+    try:
+        from signals.scibrain import gate as _sb_gate, opener as _sb_opener
+        if _sb_gate.enabled(r):
+            _sb_ids = _sb_opener.run_open(r, engine, brain_state)
+            log.info("scibrain_funnel_active", opened=len(_sb_ids))
+            return _sb_ids
+    except Exception as _sb_exc:
+        log.warning("scibrain_funnel_skipped", error=str(_sb_exc)[:200])
+
     # cont. 70 — Launch-Pad P5 funnel. When launchpad:enabled=1 the buffer is the
     # SOLE source of opens (owner D1): qualified-green slots only, in movement
     # order, up to max_open. If nothing qualifies the engine WAITS (no forcing).
@@ -1850,6 +2152,11 @@ async def process_signals(pairs: list[str], brain_state: dict, engine) -> list[s
             except Exception:
                 pass
             continue
+        if _lp_mode and pair in _lp_slot:
+            try:
+                r.setex(f"launchpad:deciding:{pair}", 30, "1")
+            except Exception:
+                pass
         candidates = generate_candidate_signals(pair, brain_state)
         for signal in candidates:
             # cont. 70 — Launch-Pad owns direction (D1/D2): in funnel mode a
@@ -2953,6 +3260,9 @@ async def process_signals(pairs: list[str], brain_state: dict, engine) -> list[s
                         "trailing_sl_level": initial_sl,
                         "average_entry": None,
                         "feature_vector": signal.get("feature_vector"),
+                        # cont. 74 — coherence-vs-legacy shadow snapshot for the scoreboard
+                        "signals_at_entry": (json.dumps(signal["shadow_scores"])
+                                             if signal.get("shadow_scores") else None),
                     }
                     # cont. 69: predicted-entry-offset LIMIT entry (default OFF).
                     # When enabled AND the model emits a meaningful per-pair
@@ -2992,6 +3302,9 @@ async def process_signals(pairs: list[str], brain_state: dict, engine) -> list[s
                         "trailing_sl_level": initial_sl,
                         "average_entry": None,
                         "feature_vector": signal.get("feature_vector"),
+                        # cont. 74 — coherence-vs-legacy shadow snapshot for the scoreboard
+                        "signals_at_entry": (json.dumps(signal["shadow_scores"])
+                                             if signal.get("shadow_scores") else None),
                     })
                     opened_trade_ids.append(trade_id)
 
@@ -3150,9 +3463,9 @@ async def process_signals(pairs: list[str], brain_state: dict, engine) -> list[s
                     log.debug("replay_pool_push_call_failed",
                               pair=pair,
                               error=str(_replay_push_exc)[:200])
-                # cont. 69s — F9/F12 §4.3 EV-override (SHADOW). For recoverable
+                # cont. 69s — F9/F12 §4.3 EV-override (counterfactual-only). For recoverable
                 # rejects, evaluate at decision time whether taking at reduced
-                # size is positive-EV (bayes p_win × CF peak/dd). In shadow mode
+                # size is positive-EV (bayes p_win × CF peak/dd). In comparison mode
                 # this only measures + audits — it takes NO trade. Live-take is
                 # gated behind ev_override:live (default 0) pending the full-deploy
                 # capital decision (predicted_profit_loop.md §7.5).

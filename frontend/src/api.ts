@@ -46,6 +46,19 @@ export const getSystemHealth   = () => api.get('/system/health').then(r => r.dat
 export const getStrategies     = () => api.get('/strategies').then(r => r.data);
 export const getActivePairs    = () => api.get('/pairs/active').then(r => r.data);
 export const getLaunchPad      = () => api.get('/launchpad').then(r => r.data);
+export const getSciBrain       = () => api.get('/scibrain').then(r => r.data);
+export const getSciBrainAutopsy = (limit = 12) =>
+  api.get('/scibrain/autopsy', { params: { limit } }).then(r => r.data);
+export const getSciBrainLearning = (limit = 50) =>
+  api.get('/scibrain/learning', { params: { limit } }).then(r => r.data);
+export const getSciBrainUniverse = () =>
+  api.get('/scibrain/universe').then(r => r.data);
+export const getSciBrainBrain = () =>
+  api.get('/scibrain/brain').then(r => r.data);
+// Versioned BrainGraphSnapshot (design §8) — the live cognitive circuit for ONE symbol, built
+// backend-side with typed nodes/edges + immutable evidence_ids (frontend no longer infers from prose).
+export const getSciBrainGraph = (symbol: string) =>
+  api.get('/scibrain/graph', { params: { symbol } }).then(r => r.data);
 export const getWebIntelFeed   = () => api.get('/web_intel/feed').then(r => r.data);
 export const exportClosedCSV      = () => api.get('/trades/closed/export', { responseType: 'blob' });
 export const getEquityCurve       = () => api.get('/analytics/equity_curve').then(r => r.data);

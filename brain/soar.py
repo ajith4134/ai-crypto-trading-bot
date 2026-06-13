@@ -31,6 +31,12 @@ log = structlog.get_logger()
 class MasterBrain:
 
     def __init__(self) -> None:
+        try:
+            _r = redis_client.get()
+            _r.set("bot:actual_trading_mode", config.TRADING_MODE)
+            _r.set("bot:actual_engine", "initializing")
+        except Exception:
+            pass
         self._engine = get_engine()
         self._stage = 1
         self._paper_closed = 0
@@ -47,6 +53,10 @@ class MasterBrain:
                      engine=type(self._engine).__name__)
         except Exception as exc:
             log.warning("actual_mode_publish_failed", error=str(exc))
+
+    @property
+    def engine(self):
+        return self._engine
 
     # ------------------------------------------------------------------
     # X-02: Global Workspace — shared market snapshot
@@ -442,7 +452,22 @@ class MasterBrain:
         # don't open anything. Better to wait for an SL to fire and return capital.
         # With DCA off the reserve is just the entry; with DCA on it's entry × 2.
         MIN_TRADE_USDT = 5.0
-        if capital_per_trade < MIN_TRADE_USDT or balance < capital_per_trade * reserve_mult:
+        # cont. 75 — the per-slot auto-scale above reserves free balance across ALL
+        # max_open slots, so it starves at high max_open + modest balance (e.g. 60 slots,
+        # $172 free -> $3.4/slot < $5 floor -> pause). That fair-share sizing is
+        # LEGACY-engine logic. When SciBrain owns origination (scibrain:enabled=1) it sizes
+        # each trade itself within bot:min/max_position_usdt against the live free balance
+        # (opener._plan_open floors at max(min_cap,5) and the PAPER executor re-checks
+        # atomically), so the legacy starvation pause must NOT gate it — otherwise the bot
+        # can't open even with ample balance for a min-size trade. Legacy mode keeps the
+        # original guard verbatim. Reversible via scibrain:enabled=0.
+        try:
+            _scibrain_owns_opens = (r.get("scibrain:enabled") == "1")
+        except Exception:
+            _scibrain_owns_opens = False
+        if (not _scibrain_owns_opens
+                and (capital_per_trade < MIN_TRADE_USDT
+                     or balance < capital_per_trade * reserve_mult)):
             log.warning("capital_starved",
                         free_balance=round(balance, 2),
                         capital_per_trade=round(capital_per_trade, 2),
